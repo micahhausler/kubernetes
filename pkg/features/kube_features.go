@@ -248,6 +248,12 @@ const (
 	// intended to be used for service account token verification.
 	ServiceAccountIssuerDiscovery featuregate.Feature = "ServiceAccountIssuerDiscovery"
 
+	// owner: @micahhausler
+	// alpha: v1.16
+	//
+	// External signing of projected service account tokens
+	ExternalKeyService featuregate.Feature = "ExternalKeyService"
+
 	// owner: @Random-Liu
 	// beta: v1.11
 	//
@@ -598,6 +604,7 @@ var defaultKubernetesFeatureGates = map[featuregate.Feature]featuregate.FeatureS
 	TokenRequestProjection:         {Default: true, PreRelease: featuregate.Beta},
 	BoundServiceAccountTokenVolume: {Default: false, PreRelease: featuregate.Alpha},
 	ServiceAccountIssuerDiscovery:  {Default: false, PreRelease: featuregate.Alpha},
+	ExternalKeyService:             {Default: false, PreRelease: featuregate.Alpha},
 	CRIContainerLogRotation:        {Default: true, PreRelease: featuregate.Beta},
 	CSIMigration:                   {Default: true, PreRelease: featuregate.Beta},
 	CSIMigrationGCE:                {Default: false, PreRelease: featuregate.Beta}, // Off by default (requires GCE PD CSI Driver)

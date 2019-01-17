@@ -83,6 +83,7 @@ type ServiceAccountAuthenticationOptions struct {
 	Issuer        string
 	JWKSURI       string
 	MaxExpiration time.Duration
+	KeyServiceURL string
 }
 
 type TokenFileAuthenticationOptions struct {
@@ -313,6 +314,9 @@ func (s *BuiltInAuthenticationOptions) AddFlags(fs *pflag.FlagSet) {
 			"API server's external (as auto-detected or overridden with external-hostname). "+
 			"Only valid if the ServiceAccountIssuerDiscovery feature gate is enabled.")
 
+		fs.StringVar(&s.ServiceAccounts.KeyServiceURL, "key-service-url", s.ServiceAccounts.KeyServiceURL, ""+
+			"Path to a unix socket for external signing of service account tokens. (Requires the 'TokenRequest' and 'ExternalKeyService' feature gates.)")
+
 		// Deprecated in 1.13
 		fs.StringSliceVar(&s.APIAudiences, "service-account-api-audiences", s.APIAudiences, ""+
 			"Identifiers of the API. The service account token authenticator will validate that "+
@@ -397,6 +401,7 @@ func (s *BuiltInAuthenticationOptions) ToAuthenticationConfig() (kubeauthenticat
 		ret.ServiceAccountKeyFiles = s.ServiceAccounts.KeyFiles
 		ret.ServiceAccountIssuer = s.ServiceAccounts.Issuer
 		ret.ServiceAccountLookup = s.ServiceAccounts.Lookup
+		ret.KeyServiceURL = s.ServiceAccounts.KeyServiceURL
 	}
 
 	if s.TokenFile != nil {

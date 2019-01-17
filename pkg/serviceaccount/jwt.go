@@ -172,7 +172,11 @@ func signerFromECDSAPrivateKey(keyPair *ecdsa.PrivateKey) (jose.Signer, error) {
 			Algorithm: alg,
 			Key:       privateJWK,
 		},
-		nil,
+		&jose.SignerOptions{
+			ExtraHeaders: map[jose.HeaderKey]interface{}{
+				jose.HeaderKey("kid"): keyID,
+			},
+		},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create signer: %v", err)
@@ -182,7 +186,9 @@ func signerFromECDSAPrivateKey(keyPair *ecdsa.PrivateKey) (jose.Signer, error) {
 }
 
 func signerFromOpaqueSigner(opaqueSigner jose.OpaqueSigner) (jose.Signer, error) {
-	alg := jose.SignatureAlgorithm(opaqueSigner.Public().Algorithm)
+	publicKey := opaqueSigner.Public()
+	alg := jose.SignatureAlgorithm(publicKey.Algorithm)
+	keyID := publicKey.KeyID
 
 	signer, err := jose.NewSigner(
 		jose.SigningKey{
@@ -190,11 +196,15 @@ func signerFromOpaqueSigner(opaqueSigner jose.OpaqueSigner) (jose.Signer, error)
 			Key: &jose.JSONWebKey{
 				Algorithm: string(alg),
 				Key:       opaqueSigner,
-				KeyID:     opaqueSigner.Public().KeyID,
+				KeyID:     keyID,
 				Use:       "sig",
 			},
 		},
-		nil,
+		&jose.SignerOptions{
+			ExtraHeaders: map[jose.HeaderKey]interface{}{
+				jose.HeaderKey("kid"): keyID,
+			},
+		},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create signer: %v", err)
