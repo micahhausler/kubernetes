@@ -42,6 +42,12 @@ const (
 	// PodUIDKey is the key used in a user's "extra" to specify the pod UID of
 	// the authenticating request.
 	PodUIDKey = "authentication.kubernetes.io/pod-uid"
+	// NodeNameKey is the key used in a user's "extra" to specify the pod's node name of
+	// the authenticating request.
+	NodeNameKey = "authentication.kubernetes.io/node-name"
+	// NodeUIDKey is the key used in a user's "extra" to specify the pod's node's UID of
+	// the authenticating request.
+	NodeUIDKey = "authentication.kubernetes.io/node-uid"
 )
 
 // MakeUsername generates a username from the given namespace and ServiceAccount name.
@@ -119,6 +125,7 @@ func UserInfo(namespace, name, uid string) user.Info {
 type ServiceAccountInfo struct {
 	Name, Namespace, UID string
 	PodName, PodUID      string
+	NodeName, NodeUID    string
 }
 
 func (sa *ServiceAccountInfo) UserInfo() user.Info {
@@ -129,8 +136,10 @@ func (sa *ServiceAccountInfo) UserInfo() user.Info {
 	}
 	if sa.PodName != "" && sa.PodUID != "" {
 		info.Extra = map[string][]string{
-			PodNameKey: {sa.PodName},
-			PodUIDKey:  {sa.PodUID},
+			PodNameKey:  {sa.PodName},
+			PodUIDKey:   {sa.PodUID},
+			NodeNameKey: {sa.NodeName},
+			NodeUIDKey:  {sa.NodeUID},
 		}
 	}
 	return info

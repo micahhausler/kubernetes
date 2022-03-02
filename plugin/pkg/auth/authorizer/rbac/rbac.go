@@ -185,7 +185,8 @@ func RuleAllows(requestAttributes authorizer.Attributes, rule *rbacv1.PolicyRule
 		return rbacv1helpers.VerbMatches(rule, requestAttributes.GetVerb()) &&
 			rbacv1helpers.APIGroupMatches(rule, requestAttributes.GetAPIGroup()) &&
 			rbacv1helpers.ResourceMatches(rule, combinedResource, requestAttributes.GetSubresource()) &&
-			rbacv1helpers.ResourceNameMatches(rule, requestAttributes.GetName())
+			rbacv1helpers.ResourceNameMatches(rule, requestAttributes.GetName()) &&
+			rbacv1helpers.ConditionMatches(requestAttributes, rule)
 	}
 
 	return rbacv1helpers.VerbMatches(rule, requestAttributes.GetVerb()) &&

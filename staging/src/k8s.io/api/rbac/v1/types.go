@@ -66,6 +66,57 @@ type PolicyRule struct {
 	// Rules can either apply to API resources (such as "pods" or "secrets") or non-resource URL paths (such as "/api"),  but not both.
 	// +optional
 	NonResourceURLs []string `json:"nonResourceURLs,omitempty" protobuf:"bytes,5,rep,name=nonResourceURLs"`
+
+	// Conditions is an optional set of AND-joined conditions on the rule
+	// +optional
+	Conditions []Condition `json:"conditions,omitempty" protobuf:"bytes,6,rep,name=conditions"`
+}
+
+/**
+
+Valid Operators are
+* "StringEquals"
+* "StringNotEquals"
+
+Valid Mapping Keys
+* "request:user:name"
+* "request:user:uid"
+* "request:user:extra:{key}"
+
+Valid Mapping Values
+* "request:name"
+* "request:namespace"
+* "request:resource"
+* "request:subresource"
+* "request:apiGroup"
+* "request:apiVersion"
+* "request:path"
+
+This facilitates attribute-based conditions in RBAC:
+
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRole
+  metadata:
+    name: NodeBoundClusterRole
+  rules:
+  - apiGroups: [""]
+    resources: ["node/status"]
+    verbs: ["patch"]
+    conditions:
+    - operator: "StringEquals"
+      mappings:
+        "request:user:extra:authentication.kubernetes.io/node-name": "request:name"
+*/
+
+// Condition is an optional extension that
+type Condition struct {
+	// Operation is a logical comparison for the mapping
+	// +optional
+	Operator string `json:"operator" protobuf:"bytes,1,opt,name=operator"`
+
+	// Map is a set of comparisons using the defined Operator
+	// +optional
+	Mapping map[string]string `json:"mapping" protobuf:"bytes,2,opt,name=mapping"`
 }
 
 // Subject contains a reference to the object or user identities a role binding applies to.  This can either hold a direct API object reference,

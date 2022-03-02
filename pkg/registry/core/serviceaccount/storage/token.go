@@ -46,6 +46,7 @@ func (r *TokenREST) New() runtime.Object {
 type TokenREST struct {
 	svcaccts             getter
 	pods                 getter
+	nodes                getter
 	secrets              getter
 	issuer               token.TokenGenerator
 	auds                 authenticator.Audiences
@@ -121,6 +122,7 @@ func (r *TokenREST) Create(ctx context.Context, name string, obj runtime.Object,
 
 	var (
 		pod    *api.Pod
+		node   *api.Node
 		secret *api.Secret
 	)
 
@@ -140,6 +142,13 @@ func (r *TokenREST) Create(ctx context.Context, name string, obj runtime.Object,
 				return nil, errors.NewBadRequest(fmt.Sprintf("cannot bind token for serviceaccount %q to pod running with different serviceaccount name.", name))
 			}
 			uid = pod.UID
+
+			nodeObj, err := r.nodes.Get(ctx, pod.Spec.NodeName, &metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			node = nodeObj.(*api.Node)
+
 		case gvk.Group == "" && gvk.Kind == "Secret":
 			newCtx := newContext(ctx, "secrets", ref.Name, gvk)
 			secretObj, err := r.secrets.Get(newCtx, ref.Name, &metav1.GetOptions{})
@@ -173,7 +182,7 @@ func (r *TokenREST) Create(ctx context.Context, name string, obj runtime.Object,
 		exp = token.ExpirationExtensionSeconds
 	}
 
-	sc, pc := token.Claims(*svcacct, pod, secret, exp, warnAfter, req.Spec.Audiences)
+	sc, pc := token.Claims(*svcacct, pod, node, secret, exp, warnAfter, out.Spec.Audiences)
 	tokdata, err := r.issuer.GenerateToken(sc, pc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %v", err)

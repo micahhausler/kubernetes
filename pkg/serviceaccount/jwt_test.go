@@ -341,6 +341,9 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 			v1listers.NewPodLister(newIndexer(func(namespace, name string) (interface{}, error) {
 				return tc.Client.CoreV1().Pods(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 			})),
+			v1listers.NewNodeLister(newIndexer(func(_, name string) (interface{}, error) {
+				return tc.Client.CoreV1().Nodes().Get(context.TODO(), name, metav1.GetOptions{})
+			})),
 		)
 		authn := serviceaccount.JWTTokenAuthenticator([]string{serviceaccount.LegacyIssuer, "bar"}, tc.Keys, auds, serviceaccount.NewLegacyValidator(tc.Client != nil, getter))
 

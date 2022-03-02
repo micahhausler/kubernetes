@@ -107,6 +107,9 @@ func TestServiceAccountTokenCreate(t *testing.T) {
 				v1listers.NewPodLister(newIndexer(func(namespace, name string) (interface{}, error) {
 					return gcs.CoreV1().Pods(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 				})),
+				v1listers.NewNodeLister(newIndexer(func(_, name string) (interface{}, error) {
+					return gcs.CoreV1().Nodes().Get(context.TODO(), name, metav1.GetOptions{})
+				})),
 			)),
 		),
 	)
@@ -430,7 +433,7 @@ func TestServiceAccountTokenCreate(t *testing.T) {
 		coresa := core.ServiceAccount{
 			ObjectMeta: sa.ObjectMeta,
 		}
-		_, pc := serviceaccount.Claims(coresa, nil, nil, 0, 0, nil)
+		_, pc := serviceaccount.Claims(coresa, nil, nil, nil, 0, 0, nil)
 		tok, err := controlPlaneConfig.ExtraConfig.ServiceAccountIssuer.GenerateToken(sc, pc)
 		if err != nil {
 			t.Fatalf("err signing expired token: %v", err)

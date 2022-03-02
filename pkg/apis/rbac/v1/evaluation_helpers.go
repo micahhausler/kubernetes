@@ -22,6 +22,7 @@ import (
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 )
 
 func RoleRefGroupKind(roleRef rbacv1.RoleRef) schema.GroupKind {
@@ -39,6 +40,66 @@ func VerbMatches(rule *rbacv1.PolicyRule, requestedVerb string) bool {
 	}
 
 	return false
+}
+
+type OperatorFunc func(key, value string) bool
+
+func GetStringOperatorFunc(operator string) OperatorFunc {
+	switch operator {
+	case "StringEquals":
+		return func(k, v string) bool {
+			return k == v
+		}
+	case "StringNotEquals":
+		return func(k, v string) bool {
+			return k != v
+		}
+	}
+	return func(_, _ string) bool { return false }
+}
+
+func ExtractMapping(mapping string, attributes authorizer.Attributes) string {
+	switch mapping {
+	case "request:user:name":
+		return attributes.GetUser().GetName()
+	case "request:user:uid":
+		return attributes.GetUser().GetUID()
+	case "request:name":
+		return attributes.GetName()
+	case "request:namespace":
+		return attributes.GetNamespace()
+	case "request:resource":
+		return attributes.GetResource()
+	case "request:subresource":
+		return attributes.GetSubresource()
+	case "request:apiGroup":
+		return attributes.GetAPIGroup()
+	case "request:apiVersion":
+		return attributes.GetAPIVersion()
+	case "request:path":
+		return attributes.GetPath()
+	}
+	if strings.HasPrefix(mapping, "request:user:extra:") {
+		return attributes.GetUser().GetExtra()[mapping[19:]][0]
+	}
+	return ""
+}
+
+func ConditionMatches(attributes authorizer.Attributes, rule *rbacv1.PolicyRule) bool {
+	result := true
+	for _, condition := range rule.Conditions {
+		opFunc := GetStringOperatorFunc(condition.Operator)
+		for k, v := range condition.Mapping {
+			mappingKey := ExtractMapping(k, attributes)
+			mappingValue := ExtractMapping(v, attributes)
+			if !opFunc(mappingKey, mappingValue) || len(mappingKey) == 0 || len(mappingValue) == 0 {
+				result = false
+				goto cont
+			}
+		}
+	}
+cont:
+	return result
 }
 
 func APIGroupMatches(rule *rbacv1.PolicyRule, requestedGroup string) bool {

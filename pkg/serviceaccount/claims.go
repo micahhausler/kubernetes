@@ -49,6 +49,7 @@ type kubernetes struct {
 	Namespace string          `json:"namespace,omitempty"`
 	Svcacct   ref             `json:"serviceaccount,omitempty"`
 	Pod       *ref            `json:"pod,omitempty"`
+	Node      *ref            `json:"node,omitempty"`
 	Secret    *ref            `json:"secret,omitempty"`
 	WarnAfter jwt.NumericDate `json:"warnafter,omitempty"`
 }
@@ -58,7 +59,7 @@ type ref struct {
 	UID  string `json:"uid,omitempty"`
 }
 
-func Claims(sa core.ServiceAccount, pod *core.Pod, secret *core.Secret, expirationSeconds, warnafter int64, audience []string) (*jwt.Claims, interface{}) {
+func Claims(sa core.ServiceAccount, pod *core.Pod, node *core.Node, secret *core.Secret, expirationSeconds, warnafter int64, audience []string) (*jwt.Claims, interface{}) {
 	now := now()
 	sc := &jwt.Claims{
 		Subject:   apiserverserviceaccount.MakeUsername(sa.Namespace, sa.Name),
@@ -81,6 +82,10 @@ func Claims(sa core.ServiceAccount, pod *core.Pod, secret *core.Secret, expirati
 		pc.Kubernetes.Pod = &ref{
 			Name: pod.Name,
 			UID:  string(pod.UID),
+		}
+		pc.Kubernetes.Node = &ref{
+			Name: node.Name,
+			UID:  string(node.UID),
 		}
 	case secret != nil:
 		pc.Kubernetes.Secret = &ref{
@@ -143,6 +148,7 @@ func (v *validator) Validate(ctx context.Context, _ string, public *jwt.Claims, 
 	namespace := private.Kubernetes.Namespace
 	saref := private.Kubernetes.Svcacct
 	podref := private.Kubernetes.Pod
+	noderef := private.Kubernetes.Node
 	secref := private.Kubernetes.Secret
 	// Make sure service account still exists (name and UID)
 	serviceAccount, err := v.getter.GetServiceAccount(namespace, saref.Name)
@@ -177,6 +183,7 @@ func (v *validator) Validate(ctx context.Context, _ string, public *jwt.Claims, 
 	}
 
 	var podName, podUID string
+	var nodeName, nodeUID string
 	if podref != nil {
 		// Make sure token hasn't been invalidated by deletion of the pod
 		pod, err := v.getter.GetPod(namespace, podref.Name)
@@ -194,6 +201,23 @@ func (v *validator) Validate(ctx context.Context, _ string, public *jwt.Claims, 
 		}
 		podName = podref.Name
 		podUID = podref.UID
+	}
+	if noderef != nil {
+		node, err := v.getter.GetPodNode(namespace, podref.Name)
+		if err != nil {
+			klog.V(4).Infof("Could not retrieve bound node %s for service account %s/%s: %v", noderef.Name, namespace, saref.Name, err)
+			return nil, errors.New("service account token has been invalidated")
+		}
+		if node.DeletionTimestamp != nil && node.DeletionTimestamp.Time.Before(invalidIfDeletedBefore) {
+			klog.V(4).Infof("Bound node is deleted and awaiting removal: %s for service account %s/%s", noderef.Name, namespace, saref.Name)
+			return nil, errors.New("service account token has been invalidated")
+		}
+		if noderef.UID != string(node.UID) {
+			klog.V(4).Infof("Node UID no longer matches %s: %q != %q", node.Name, string(node.UID), noderef.UID)
+			return nil, fmt.Errorf("node UID (%s) does not match service account node ref claim (%s)", node.UID, noderef.UID)
+		}
+		nodeName = noderef.Name
+		nodeUID = noderef.UID
 	}
 
 	// Check special 'warnafter' field for projected service account token transition.
@@ -215,6 +239,8 @@ func (v *validator) Validate(ctx context.Context, _ string, public *jwt.Claims, 
 		UID:       private.Kubernetes.Svcacct.UID,
 		PodName:   podName,
 		PodUID:    podUID,
+		NodeName:  nodeName,
+		NodeUID:   nodeUID,
 	}, nil
 }
 

@@ -489,6 +489,7 @@ func (o *BuiltInAuthenticationOptions) ApplyTo(authInfo *genericapiserver.Authen
 		versionedInformer.Core().V1().Secrets().Lister(),
 		versionedInformer.Core().V1().ServiceAccounts().Lister(),
 		versionedInformer.Core().V1().Pods().Lister(),
+		versionedInformer.Core().V1().Nodes().Lister(),
 	)
 
 	authenticatorConfig.BootstrapTokenAuthenticator = bootstrap.NewTokenAuthenticator(

@@ -18,7 +18,8 @@ package serviceaccount
 
 import (
 	"context"
-	"k8s.io/api/core/v1"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	v1listers "k8s.io/client-go/listers/core/v1"
@@ -31,14 +32,15 @@ type clientGetter struct {
 	secretLister         v1listers.SecretLister
 	serviceAccountLister v1listers.ServiceAccountLister
 	podLister            v1listers.PodLister
+	nodeLister           v1listers.NodeLister
 }
 
 // NewGetterFromClient returns a ServiceAccountTokenGetter that
 // uses the specified client to retrieve service accounts and secrets.
 // The client should NOT authenticate using a service account token
 // the returned getter will be used to retrieve, or recursion will result.
-func NewGetterFromClient(c clientset.Interface, secretLister v1listers.SecretLister, serviceAccountLister v1listers.ServiceAccountLister, podLister v1listers.PodLister) serviceaccount.ServiceAccountTokenGetter {
-	return clientGetter{c, secretLister, serviceAccountLister, podLister}
+func NewGetterFromClient(c clientset.Interface, secretLister v1listers.SecretLister, serviceAccountLister v1listers.ServiceAccountLister, podLister v1listers.PodLister, nodeLister v1listers.NodeLister) serviceaccount.ServiceAccountTokenGetter {
+	return clientGetter{c, secretLister, serviceAccountLister, podLister, nodeLister}
 }
 
 func (c clientGetter) GetServiceAccount(namespace, name string) (*v1.ServiceAccount, error) {
@@ -60,4 +62,19 @@ func (c clientGetter) GetSecret(namespace, name string) (*v1.Secret, error) {
 		return secret, nil
 	}
 	return c.client.CoreV1().Secrets(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+}
+
+func (c clientGetter) GetNode(name string) (*v1.Node, error) {
+	if node, err := c.nodeLister.Get(name); err == nil {
+		return node, nil
+	}
+	return c.client.CoreV1().Nodes().Get(context.TODO(), name, metav1.GetOptions{})
+}
+
+func (c clientGetter) GetPodNode(namespace, name string) (*v1.Node, error) {
+	pod, err := c.GetPod(namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	return c.GetNode(pod.Spec.NodeName)
 }
