@@ -277,6 +277,7 @@ func TestConfigToExecClusterRoundtrip(t *testing.T) {
 		expected.AuthProvider = nil
 		expected.AuthConfigPersister = nil
 		expected.ExecProvider = &clientcmdapi.ExecConfig{} // ConfigToExecCluster assumes != nil.
+		expected.HTTPSignature = nil
 		expected.TLSClientConfig.CertFile = ""
 		expected.TLSClientConfig.KeyFile = ""
 		expected.TLSClientConfig.CAFile = ""

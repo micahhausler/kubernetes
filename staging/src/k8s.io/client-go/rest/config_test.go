@@ -36,6 +36,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/transport"
+	transporthttpsig "k8s.io/client-go/transport/httpsig"
 	"k8s.io/client-go/util/flowcontrol"
 
 	"github.com/google/go-cmp/cmp"
@@ -380,6 +381,9 @@ func TestAnonymousAuthConfig(t *testing.T) {
 		expected.AuthProvider = nil
 		expected.AuthConfigPersister = nil
 		expected.ExecProvider = nil
+		// A signing key identifies the user as much as a token does, so an
+		// anonymous client must not sign.
+		expected.HTTPSignature = nil
 		expected.TLSClientConfig.CertData = nil
 		expected.TLSClientConfig.CertFile = ""
 		expected.TLSClientConfig.KeyData = nil
@@ -563,12 +567,18 @@ func TestConfigStringer(t *testing.T) {
 					Env:    []clientcmdapi.ExecEnvVar{{Name: "secret", Value: "s3cr3t"}},
 					Config: &runtime.Unknown{Raw: []byte("here is some config data")},
 				},
+				HTTPSignature: &transporthttpsig.Config{
+					Algorithm:      "ed25519",
+					CredentialFile: "a-credential.yaml",
+					SignedHeaders:  []transporthttpsig.Header{{Name: "X-Session-Token"}},
+				},
 			},
 			expectContent: []string{
 				"localhost:8080",
 				"gopher",
 				"a.crt",
 				"a.key",
+				"a-credential.yaml",
 				"--- REDACTED ---",
 				formatBytes([]byte("--- REDACTED ---")),
 				formatBytes([]byte("--- TRUNCATED ---")),
@@ -632,6 +642,14 @@ func TestConfigSprint(t *testing.T) {
 			ProvideClusterInfo: true,
 			Config:             &runtime.Unknown{Raw: []byte("super secret password")},
 		},
+		HTTPSignature: &transporthttpsig.Config{
+			Algorithm:      "ed25519",
+			KeyID:          "gopher-key",
+			KeyFile:        "a-signing.key",
+			SignedHeaders:  []transporthttpsig.Header{{Name: "X-Session-Token"}},
+			CredentialFile: "a-credential.yaml",
+			TTL:            30 * time.Second,
+		},
 		TLSClientConfig: TLSClientConfig{
 			CertFile:   "a.crt",
 			KeyFile:    "a.key",
@@ -652,13 +670,51 @@ func TestConfigSprint(t *testing.T) {
 		Proxy:                     fakeProxyFunc,
 	}
 	want := fmt.Sprintf(
-		`&rest.Config{Host:"localhost:8080", APIPath:"v1", ContentConfig:rest.ContentConfig{AcceptContentTypes:"application/json", ContentType:"application/json", GroupVersion:(*schema.GroupVersion)(nil), NegotiatedSerializer:runtime.NegotiatedSerializer(nil)}, Username:"gopher", Password:"--- REDACTED ---", BearerToken:"--- REDACTED ---", BearerTokenFile:"", Impersonate:rest.ImpersonationConfig{UserName:"gopher2", UID:"uid123", Groups:[]string(nil), Extra:map[string][]string(nil)}, AuthProvider:api.AuthProviderConfig{Name: "gopher", Config: map[string]string{--- REDACTED ---}}, AuthConfigPersister:rest.AuthProviderConfigPersister(--- REDACTED ---), ExecProvider:api.ExecConfig{Command: "sudo", Args: []string{"--- REDACTED ---"}, Env: []ExecEnvVar{--- REDACTED ---}, APIVersion: "", ProvideClusterInfo: true, Config: runtime.Object(--- REDACTED ---), StdinUnavailable: false}, TLSClientConfig:rest.sanitizedTLSClientConfig{Insecure:false, ServerName:"", CertFile:"a.crt", KeyFile:"a.key", CAFile:"", CertData:[]uint8{0x2d, 0x2d, 0x2d, 0x20, 0x54, 0x52, 0x55, 0x4e, 0x43, 0x41, 0x54, 0x45, 0x44, 0x20, 0x2d, 0x2d, 0x2d}, KeyData:[]uint8{0x2d, 0x2d, 0x2d, 0x20, 0x52, 0x45, 0x44, 0x41, 0x43, 0x54, 0x45, 0x44, 0x20, 0x2d, 0x2d, 0x2d}, CAData:[]uint8(nil), NextProtos:[]string{"h2", "http/1.1"}}, UserAgent:"gobot", DisableCompression:false, Transport:(*rest.fakeRoundTripper)(%p), WrapTransport:(transport.WrapperFunc)(%p), QPS:1, Burst:2, RateLimiter:(*rest.fakeLimiter)(%p), WarningHandler:rest.fakeWarningHandler{}, WarningHandlerWithContext:rest.fakeWarningHandlerWithContext{}, Timeout:3000000000, Dial:(func(context.Context, string, string) (net.Conn, error))(%p), Proxy:(func(*http.Request) (*url.URL, error))(%p)}`,
+		`&rest.Config{Host:"localhost:8080", APIPath:"v1", ContentConfig:rest.ContentConfig{AcceptContentTypes:"application/json", ContentType:"application/json", GroupVersion:(*schema.GroupVersion)(nil), NegotiatedSerializer:runtime.NegotiatedSerializer(nil)}, Username:"gopher", Password:"--- REDACTED ---", BearerToken:"--- REDACTED ---", BearerTokenFile:"", Impersonate:rest.ImpersonationConfig{UserName:"gopher2", UID:"uid123", Groups:[]string(nil), Extra:map[string][]string(nil)}, AuthProvider:api.AuthProviderConfig{Name: "gopher", Config: map[string]string{--- REDACTED ---}}, AuthConfigPersister:rest.AuthProviderConfigPersister(--- REDACTED ---), ExecProvider:api.ExecConfig{Command: "sudo", Args: []string{"--- REDACTED ---"}, Env: []ExecEnvVar{--- REDACTED ---}, APIVersion: "", ProvideClusterInfo: true, Config: runtime.Object(--- REDACTED ---), StdinUnavailable: false}, HTTPSignature:httpsig.Config{Algorithm: "ed25519", KeyID: "gopher-key", Credential: <nil>, KeyFile: "a-signing.key", CredentialFile: "a-credential.yaml", KeyDerivation: <none>, SignedHeaders: [X-Session-Token], TTL: 30s, MaxBodyBytes: 0}, TLSClientConfig:rest.sanitizedTLSClientConfig{Insecure:false, ServerName:"", CertFile:"a.crt", KeyFile:"a.key", CAFile:"", CertData:[]uint8{0x2d, 0x2d, 0x2d, 0x20, 0x54, 0x52, 0x55, 0x4e, 0x43, 0x41, 0x54, 0x45, 0x44, 0x20, 0x2d, 0x2d, 0x2d}, KeyData:[]uint8{0x2d, 0x2d, 0x2d, 0x20, 0x52, 0x45, 0x44, 0x41, 0x43, 0x54, 0x45, 0x44, 0x20, 0x2d, 0x2d, 0x2d}, CAData:[]uint8(nil), NextProtos:[]string{"h2", "http/1.1"}}, UserAgent:"gobot", DisableCompression:false, Transport:(*rest.fakeRoundTripper)(%p), WrapTransport:(transport.WrapperFunc)(%p), QPS:1, Burst:2, RateLimiter:(*rest.fakeLimiter)(%p), WarningHandler:rest.fakeWarningHandler{}, WarningHandlerWithContext:rest.fakeWarningHandlerWithContext{}, Timeout:3000000000, Dial:(func(context.Context, string, string) (net.Conn, error))(%p), Proxy:(func(*http.Request) (*url.URL, error))(%p)}`,
 		c.Transport, fakeWrapperFunc, c.RateLimiter, fakeDialFunc, fakeProxyFunc,
 	)
 
 	for _, f := range []string{"%s", "%v", "%+v", "%#v"} {
 		if got := fmt.Sprintf(f, c); want != got {
 			t.Errorf("fmt.Sprintf(%q, c)\ngot:  %q\nwant: %q\ndiff: %s", f, got, want, cmp.Diff(want, got))
+		}
+	}
+}
+
+// TestConfigStringRedactsSigningCredential covers the credential a Config can
+// hold inline. TestConfigSprint above pins the whole rendering, but with the
+// credential unset, so the material that reaches this method by value rather
+// than by path needs its own check.
+func TestConfigStringRedactsSigningCredential(t *testing.T) {
+	const (
+		secret       = "SUPERSECRETHMAC"
+		headerSecret = "SESSIONTOKENSECRET"
+	)
+	c := &Config{
+		Host: "localhost:8080",
+		HTTPSignature: &transporthttpsig.Config{
+			Algorithm:     "hmac-sha256",
+			SignedHeaders: []transporthttpsig.Header{{Name: "X-Session-Token"}},
+			Credential: &transporthttpsig.Material{
+				KeyID:         "gopher-key",
+				Secret:        secret,
+				SignedHeaders: map[string]string{"x-session-token": headerSecret},
+			},
+		},
+	}
+	for _, f := range []string{"%s", "%v", "%+v", "%#v"} {
+		got := fmt.Sprintf(f, c)
+		for what, want := range map[string]string{"secret": secret, "header value": headerSecret} {
+			// The byte-slice form matters as much as the string: a secret
+			// reached through an interface field prints as the bytes behind it.
+			for _, form := range []string{want, strings.Trim(fmt.Sprintf("%v", []byte(want)), "[]")} {
+				if strings.Contains(got, form) {
+					t.Errorf("fmt.Sprintf(%q, c) leaks the %s: %s", f, what, got)
+				}
+			}
+		}
+		if !strings.Contains(got, "gopher-key") {
+			t.Errorf("fmt.Sprintf(%q, c) names no key ID, so it is useless in a log: %s", f, got)
 		}
 	}
 }

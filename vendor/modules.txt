@@ -401,6 +401,14 @@ github.com/mdlayher/netlink/nltest
 # github.com/mdlayher/socket v0.6.1
 ## explicit; go 1.25.0
 github.com/mdlayher/socket
+# github.com/micahhausler/httpsig v0.3.2
+## explicit; go 1.26.0
+github.com/micahhausler/httpsig
+github.com/micahhausler/httpsig/contentdigest
+github.com/micahhausler/httpsig/keyscope
+# github.com/micahhausler/sfv v0.2.0
+## explicit; go 1.26.0
+github.com/micahhausler/sfv
 # github.com/mitchellh/go-wordwrap v1.0.1
 ## explicit; go 1.14
 github.com/mitchellh/go-wordwrap

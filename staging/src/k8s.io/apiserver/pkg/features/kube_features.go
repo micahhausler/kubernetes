@@ -227,6 +227,13 @@ const (
 	// Enables APF to use size of objects for estimating request cost.
 	SizeBasedListCostEstimate featuregate.Feature = "SizeBasedListCostEstimate"
 
+	// owner: @micahhausler
+	//
+	// Enables authenticating requests by HTTP message signature (RFC 9421),
+	// configured by the httpSignature section of the authentication
+	// configuration file.
+	HTTPSignatureAuthentication featuregate.Feature = "HTTPSignatureAuthentication"
+
 	// owner: @caesarxuchao @roycaihw
 	//
 	// Enable the storage version API.
@@ -445,6 +452,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 
 	SizeBasedListCostEstimate: {
 		{Version: version.MustParse("1.34"), Default: true, PreRelease: featuregate.Beta},
+	},
+
+	HTTPSignatureAuthentication: {
+		{Version: version.MustParse("1.37"), Default: false, PreRelease: featuregate.Alpha},
 	},
 
 	StorageVersionAPI: {

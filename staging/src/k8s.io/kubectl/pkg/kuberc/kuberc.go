@@ -155,6 +155,9 @@ func (p *Preferences) applyPluginPolicy(kubeConfigFlags *genericclioptions.Confi
 			c = wrapConfigFn(c)
 		}
 
+		// One policy application covers both credential kinds: a plugin that
+		// returns signing key material is the same program, named in the same
+		// field, as one that returns a token.
 		if c.ExecProvider != nil {
 			c.ExecProvider.PluginPolicy = p.policy
 		}

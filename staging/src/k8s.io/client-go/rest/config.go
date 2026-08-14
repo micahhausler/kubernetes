@@ -39,6 +39,7 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/metrics"
 	"k8s.io/client-go/transport"
+	transporthttpsig "k8s.io/client-go/transport/httpsig"
 	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/klog/v2"
@@ -91,6 +92,10 @@ type Config struct {
 
 	// Exec-based authentication provider.
 	ExecProvider *clientcmdapi.ExecConfig
+
+	// HTTPSignature signs every request with an HTTP message signature
+	// (RFC 9421) instead of sending a credential.
+	HTTPSignature *transporthttpsig.Config
 
 	// TLSClientConfig contains settings to enable transport layer security
 	TLSClientConfig
@@ -678,6 +683,7 @@ func CopyConfig(config *Config) *Config {
 		AuthProvider:        config.AuthProvider,
 		AuthConfigPersister: config.AuthConfigPersister,
 		ExecProvider:        config.ExecProvider,
+		HTTPSignature:       config.HTTPSignature.DeepCopy(),
 		TLSClientConfig: TLSClientConfig{
 			Insecure:   config.TLSClientConfig.Insecure,
 			ServerName: config.TLSClientConfig.ServerName,

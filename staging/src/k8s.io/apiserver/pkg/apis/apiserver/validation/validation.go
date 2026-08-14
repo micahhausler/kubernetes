@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	api "k8s.io/apiserver/pkg/apis/apiserver"
 	authenticationcel "k8s.io/apiserver/pkg/authentication/cel"
+	"k8s.io/apiserver/pkg/authentication/request/httpsig"
 	authorizationcel "k8s.io/apiserver/pkg/authorization/cel"
 	"k8s.io/apiserver/pkg/cel"
 	"k8s.io/apiserver/pkg/features"
@@ -83,6 +84,87 @@ func ValidateAuthenticationConfiguration(compiler authenticationcel.Compiler, c 
 		}
 	}
 
+	allErrs = append(allErrs, validateHTTPSignatureAuthenticator(c.HTTPSignature, field.NewPath("httpSignature"),
+		utilfeature.DefaultFeatureGate.Enabled(features.HTTPSignatureAuthentication))...)
+
+	return allErrs
+}
+
+// maxHTTPSignatureKeys bounds the static key list. Every key gets a nonce cache,
+// so the list size sets a memory floor, and a list this long is a sign the
+// deployment needs a key directory rather than a longer file.
+const maxHTTPSignatureKeys = 64
+
+func validateHTTPSignatureAuthenticator(c *api.HTTPSignatureAuthenticator, fldPath *field.Path, featureEnabled bool) field.ErrorList {
+	var allErrs field.ErrorList
+	if c == nil {
+		return allErrs
+	}
+	if !featureEnabled {
+		return append(allErrs, field.Forbidden(fldPath, "httpSignature is not supported when the HTTPSignatureAuthentication feature gate is disabled"))
+	}
+
+	if len(c.Keys) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("keys"), "at least one key is required for the httpSignature authenticator to authenticate anything"))
+	}
+	if len(c.Keys) > maxHTTPSignatureKeys {
+		return append(allErrs, field.TooMany(fldPath.Child("keys"), len(c.Keys), maxHTTPSignatureKeys))
+	}
+
+	if c.MaxAge != nil && c.MaxAge.Duration <= 0 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("maxAge"), c.MaxAge.Duration.String(), "must be positive: it is the bound on how long a captured request can be replayed"))
+	}
+	if c.Tolerance != nil && c.Tolerance.Duration < 0 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("tolerance"), c.Tolerance.Duration.String(), "must not be negative"))
+	}
+	if c.MaxNoncesPerKey != nil && *c.MaxNoncesPerKey <= 0 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("maxNoncesPerKey"), *c.MaxNoncesPerKey, "must be positive: a key that remembers no nonces detects no replay"))
+	}
+	if c.Scheme != "" && c.Scheme != "http" && c.Scheme != "https" {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("scheme"), c.Scheme, "must be http or https"))
+	}
+
+	seenKeyIDs := sets.New[string]()
+	seenUsernames := sets.New[string]()
+	for i, k := range c.Keys {
+		keyPath := fldPath.Child("keys").Index(i)
+		if len(k.KeyID) == 0 {
+			allErrs = append(allErrs, field.Required(keyPath.Child("keyID"), ""))
+		} else if seenKeyIDs.Has(k.KeyID) {
+			allErrs = append(allErrs, field.Duplicate(keyPath.Child("keyID"), k.KeyID))
+		}
+		seenKeyIDs.Insert(k.KeyID)
+
+		if len(k.User.Username) == 0 {
+			allErrs = append(allErrs, field.Required(keyPath.Child("user", "username"), ""))
+		} else {
+			// system: names are issued by Kubernetes itself. A static key that
+			// claimed one would let a configuration file mint an identity the
+			// cluster's own authorization rules are written around.
+			if strings.HasPrefix(k.User.Username, "system:") {
+				allErrs = append(allErrs, field.Invalid(keyPath.Child("user", "username"), k.User.Username, "may not start with system:, which is reserved for identities Kubernetes issues"))
+			}
+			if seenUsernames.Has(k.User.Username) {
+				allErrs = append(allErrs, field.Duplicate(keyPath.Child("user", "username"), k.User.Username))
+			}
+			seenUsernames.Insert(k.User.Username)
+		}
+		for j, group := range k.User.Groups {
+			if len(group) == 0 {
+				allErrs = append(allErrs, field.Required(keyPath.Child("user", "groups").Index(j), ""))
+			}
+			if strings.HasPrefix(group, "system:") {
+				allErrs = append(allErrs, field.Invalid(keyPath.Child("user", "groups").Index(j), group, "may not start with system:, which is reserved for groups Kubernetes issues"))
+			}
+		}
+
+		// The algorithm registry and the key encodings live in the verifier, so
+		// they are checked by building the verifier rather than by a second copy
+		// of the rules here. This also rejects a key file that cannot be read.
+		if err := httpsig.ValidateKey(k, c.KeyDerivation); err != nil {
+			allErrs = append(allErrs, field.Invalid(keyPath, "", err.Error()))
+		}
+	}
 	return allErrs
 }
 

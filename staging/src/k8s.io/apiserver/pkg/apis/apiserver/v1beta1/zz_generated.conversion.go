@@ -152,6 +152,66 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}); err != nil {
 		return err
 	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureAuthenticator)(nil), (*apiserver.HTTPSignatureAuthenticator)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureAuthenticator_To_apiserver_HTTPSignatureAuthenticator(a.(*HTTPSignatureAuthenticator), b.(*apiserver.HTTPSignatureAuthenticator), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureAuthenticator)(nil), (*HTTPSignatureAuthenticator)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_apiserver_HTTPSignatureAuthenticator_To_v1beta1_HTTPSignatureAuthenticator(a.(*apiserver.HTTPSignatureAuthenticator), b.(*HTTPSignatureAuthenticator), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureKey)(nil), (*apiserver.HTTPSignatureKey)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureKey_To_apiserver_HTTPSignatureKey(a.(*HTTPSignatureKey), b.(*apiserver.HTTPSignatureKey), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureKey)(nil), (*HTTPSignatureKey)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_apiserver_HTTPSignatureKey_To_v1beta1_HTTPSignatureKey(a.(*apiserver.HTTPSignatureKey), b.(*HTTPSignatureKey), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureKeyDerivation)(nil), (*apiserver.HTTPSignatureKeyDerivation)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureKeyDerivation_To_apiserver_HTTPSignatureKeyDerivation(a.(*HTTPSignatureKeyDerivation), b.(*apiserver.HTTPSignatureKeyDerivation), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureKeyDerivation)(nil), (*HTTPSignatureKeyDerivation)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_apiserver_HTTPSignatureKeyDerivation_To_v1beta1_HTTPSignatureKeyDerivation(a.(*apiserver.HTTPSignatureKeyDerivation), b.(*HTTPSignatureKeyDerivation), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureKeyDerivationStep)(nil), (*apiserver.HTTPSignatureKeyDerivationStep)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureKeyDerivationStep_To_apiserver_HTTPSignatureKeyDerivationStep(a.(*HTTPSignatureKeyDerivationStep), b.(*apiserver.HTTPSignatureKeyDerivationStep), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureKeyDerivationStep)(nil), (*HTTPSignatureKeyDerivationStep)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_apiserver_HTTPSignatureKeyDerivationStep_To_v1beta1_HTTPSignatureKeyDerivationStep(a.(*apiserver.HTTPSignatureKeyDerivationStep), b.(*HTTPSignatureKeyDerivationStep), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureKeyStage)(nil), (*apiserver.HTTPSignatureKeyStage)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureKeyStage_To_apiserver_HTTPSignatureKeyStage(a.(*HTTPSignatureKeyStage), b.(*apiserver.HTTPSignatureKeyStage), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureKeyStage)(nil), (*HTTPSignatureKeyStage)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_apiserver_HTTPSignatureKeyStage_To_v1beta1_HTTPSignatureKeyStage(a.(*apiserver.HTTPSignatureKeyStage), b.(*HTTPSignatureKeyStage), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureUser)(nil), (*apiserver.HTTPSignatureUser)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureUser_To_apiserver_HTTPSignatureUser(a.(*HTTPSignatureUser), b.(*apiserver.HTTPSignatureUser), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureUser)(nil), (*HTTPSignatureUser)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_apiserver_HTTPSignatureUser_To_v1beta1_HTTPSignatureUser(a.(*apiserver.HTTPSignatureUser), b.(*HTTPSignatureUser), scope)
+	}); err != nil {
+		return err
+	}
 	if err := s.AddGeneratedConversionFunc((*Issuer)(nil), (*apiserver.Issuer)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_v1beta1_Issuer_To_apiserver_Issuer(a.(*Issuer), b.(*apiserver.Issuer), scope)
 	}); err != nil {
@@ -333,6 +393,7 @@ func autoConvert_v1beta1_AuthenticationConfiguration_To_apiserver_Authentication
 		out.JWT = nil
 	}
 	out.Anonymous = (*apiserver.AnonymousAuthConfig)(unsafe.Pointer(in.Anonymous))
+	out.HTTPSignature = (*apiserver.HTTPSignatureAuthenticator)(unsafe.Pointer(in.HTTPSignature))
 	return nil
 }
 
@@ -354,6 +415,7 @@ func autoConvert_apiserver_AuthenticationConfiguration_To_v1beta1_Authentication
 		out.JWT = nil
 	}
 	out.Anonymous = (*AnonymousAuthConfig)(unsafe.Pointer(in.Anonymous))
+	out.HTTPSignature = (*HTTPSignatureAuthenticator)(unsafe.Pointer(in.HTTPSignature))
 	return nil
 }
 
@@ -601,6 +663,126 @@ func autoConvert_apiserver_ExtraMapping_To_v1beta1_ExtraMapping(in *apiserver.Ex
 // Convert_apiserver_ExtraMapping_To_v1beta1_ExtraMapping is an autogenerated conversion function.
 func Convert_apiserver_ExtraMapping_To_v1beta1_ExtraMapping(in *apiserver.ExtraMapping, out *ExtraMapping, s conversion.Scope) error {
 	return autoConvert_apiserver_ExtraMapping_To_v1beta1_ExtraMapping(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureAuthenticator_To_apiserver_HTTPSignatureAuthenticator(in *HTTPSignatureAuthenticator, out *apiserver.HTTPSignatureAuthenticator, s conversion.Scope) error {
+	*out = *(*apiserver.HTTPSignatureAuthenticator)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureAuthenticator_To_apiserver_HTTPSignatureAuthenticator is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureAuthenticator_To_apiserver_HTTPSignatureAuthenticator(in *HTTPSignatureAuthenticator, out *apiserver.HTTPSignatureAuthenticator, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureAuthenticator_To_apiserver_HTTPSignatureAuthenticator(in, out, s)
+}
+
+func autoConvert_apiserver_HTTPSignatureAuthenticator_To_v1beta1_HTTPSignatureAuthenticator(in *apiserver.HTTPSignatureAuthenticator, out *HTTPSignatureAuthenticator, s conversion.Scope) error {
+	*out = *(*HTTPSignatureAuthenticator)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_apiserver_HTTPSignatureAuthenticator_To_v1beta1_HTTPSignatureAuthenticator is an autogenerated conversion function.
+func Convert_apiserver_HTTPSignatureAuthenticator_To_v1beta1_HTTPSignatureAuthenticator(in *apiserver.HTTPSignatureAuthenticator, out *HTTPSignatureAuthenticator, s conversion.Scope) error {
+	return autoConvert_apiserver_HTTPSignatureAuthenticator_To_v1beta1_HTTPSignatureAuthenticator(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureKey_To_apiserver_HTTPSignatureKey(in *HTTPSignatureKey, out *apiserver.HTTPSignatureKey, s conversion.Scope) error {
+	*out = *(*apiserver.HTTPSignatureKey)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureKey_To_apiserver_HTTPSignatureKey is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureKey_To_apiserver_HTTPSignatureKey(in *HTTPSignatureKey, out *apiserver.HTTPSignatureKey, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureKey_To_apiserver_HTTPSignatureKey(in, out, s)
+}
+
+func autoConvert_apiserver_HTTPSignatureKey_To_v1beta1_HTTPSignatureKey(in *apiserver.HTTPSignatureKey, out *HTTPSignatureKey, s conversion.Scope) error {
+	*out = *(*HTTPSignatureKey)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_apiserver_HTTPSignatureKey_To_v1beta1_HTTPSignatureKey is an autogenerated conversion function.
+func Convert_apiserver_HTTPSignatureKey_To_v1beta1_HTTPSignatureKey(in *apiserver.HTTPSignatureKey, out *HTTPSignatureKey, s conversion.Scope) error {
+	return autoConvert_apiserver_HTTPSignatureKey_To_v1beta1_HTTPSignatureKey(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureKeyDerivation_To_apiserver_HTTPSignatureKeyDerivation(in *HTTPSignatureKeyDerivation, out *apiserver.HTTPSignatureKeyDerivation, s conversion.Scope) error {
+	*out = *(*apiserver.HTTPSignatureKeyDerivation)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureKeyDerivation_To_apiserver_HTTPSignatureKeyDerivation is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureKeyDerivation_To_apiserver_HTTPSignatureKeyDerivation(in *HTTPSignatureKeyDerivation, out *apiserver.HTTPSignatureKeyDerivation, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureKeyDerivation_To_apiserver_HTTPSignatureKeyDerivation(in, out, s)
+}
+
+func autoConvert_apiserver_HTTPSignatureKeyDerivation_To_v1beta1_HTTPSignatureKeyDerivation(in *apiserver.HTTPSignatureKeyDerivation, out *HTTPSignatureKeyDerivation, s conversion.Scope) error {
+	*out = *(*HTTPSignatureKeyDerivation)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_apiserver_HTTPSignatureKeyDerivation_To_v1beta1_HTTPSignatureKeyDerivation is an autogenerated conversion function.
+func Convert_apiserver_HTTPSignatureKeyDerivation_To_v1beta1_HTTPSignatureKeyDerivation(in *apiserver.HTTPSignatureKeyDerivation, out *HTTPSignatureKeyDerivation, s conversion.Scope) error {
+	return autoConvert_apiserver_HTTPSignatureKeyDerivation_To_v1beta1_HTTPSignatureKeyDerivation(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureKeyDerivationStep_To_apiserver_HTTPSignatureKeyDerivationStep(in *HTTPSignatureKeyDerivationStep, out *apiserver.HTTPSignatureKeyDerivationStep, s conversion.Scope) error {
+	*out = *(*apiserver.HTTPSignatureKeyDerivationStep)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureKeyDerivationStep_To_apiserver_HTTPSignatureKeyDerivationStep is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureKeyDerivationStep_To_apiserver_HTTPSignatureKeyDerivationStep(in *HTTPSignatureKeyDerivationStep, out *apiserver.HTTPSignatureKeyDerivationStep, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureKeyDerivationStep_To_apiserver_HTTPSignatureKeyDerivationStep(in, out, s)
+}
+
+func autoConvert_apiserver_HTTPSignatureKeyDerivationStep_To_v1beta1_HTTPSignatureKeyDerivationStep(in *apiserver.HTTPSignatureKeyDerivationStep, out *HTTPSignatureKeyDerivationStep, s conversion.Scope) error {
+	*out = *(*HTTPSignatureKeyDerivationStep)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_apiserver_HTTPSignatureKeyDerivationStep_To_v1beta1_HTTPSignatureKeyDerivationStep is an autogenerated conversion function.
+func Convert_apiserver_HTTPSignatureKeyDerivationStep_To_v1beta1_HTTPSignatureKeyDerivationStep(in *apiserver.HTTPSignatureKeyDerivationStep, out *HTTPSignatureKeyDerivationStep, s conversion.Scope) error {
+	return autoConvert_apiserver_HTTPSignatureKeyDerivationStep_To_v1beta1_HTTPSignatureKeyDerivationStep(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureKeyStage_To_apiserver_HTTPSignatureKeyStage(in *HTTPSignatureKeyStage, out *apiserver.HTTPSignatureKeyStage, s conversion.Scope) error {
+	*out = *(*apiserver.HTTPSignatureKeyStage)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureKeyStage_To_apiserver_HTTPSignatureKeyStage is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureKeyStage_To_apiserver_HTTPSignatureKeyStage(in *HTTPSignatureKeyStage, out *apiserver.HTTPSignatureKeyStage, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureKeyStage_To_apiserver_HTTPSignatureKeyStage(in, out, s)
+}
+
+func autoConvert_apiserver_HTTPSignatureKeyStage_To_v1beta1_HTTPSignatureKeyStage(in *apiserver.HTTPSignatureKeyStage, out *HTTPSignatureKeyStage, s conversion.Scope) error {
+	*out = *(*HTTPSignatureKeyStage)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_apiserver_HTTPSignatureKeyStage_To_v1beta1_HTTPSignatureKeyStage is an autogenerated conversion function.
+func Convert_apiserver_HTTPSignatureKeyStage_To_v1beta1_HTTPSignatureKeyStage(in *apiserver.HTTPSignatureKeyStage, out *HTTPSignatureKeyStage, s conversion.Scope) error {
+	return autoConvert_apiserver_HTTPSignatureKeyStage_To_v1beta1_HTTPSignatureKeyStage(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureUser_To_apiserver_HTTPSignatureUser(in *HTTPSignatureUser, out *apiserver.HTTPSignatureUser, s conversion.Scope) error {
+	*out = *(*apiserver.HTTPSignatureUser)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureUser_To_apiserver_HTTPSignatureUser is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureUser_To_apiserver_HTTPSignatureUser(in *HTTPSignatureUser, out *apiserver.HTTPSignatureUser, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureUser_To_apiserver_HTTPSignatureUser(in, out, s)
+}
+
+func autoConvert_apiserver_HTTPSignatureUser_To_v1beta1_HTTPSignatureUser(in *apiserver.HTTPSignatureUser, out *HTTPSignatureUser, s conversion.Scope) error {
+	*out = *(*HTTPSignatureUser)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_apiserver_HTTPSignatureUser_To_v1beta1_HTTPSignatureUser is an autogenerated conversion function.
+func Convert_apiserver_HTTPSignatureUser_To_v1beta1_HTTPSignatureUser(in *apiserver.HTTPSignatureUser, out *HTTPSignatureUser, s conversion.Scope) error {
+	return autoConvert_apiserver_HTTPSignatureUser_To_v1beta1_HTTPSignatureUser(in, out, s)
 }
 
 func autoConvert_v1beta1_Issuer_To_apiserver_Issuer(in *Issuer, out *apiserver.Issuer, s conversion.Scope) error {

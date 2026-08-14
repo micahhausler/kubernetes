@@ -55,6 +55,15 @@ const (
 	// "application/json" or "application/apply-patch+yaml", respectively.
 	ClientsAllowCBOR Feature = "ClientsAllowCBOR"
 
+	// owner: @micahhausler
+	// alpha: v1.37
+	//
+	// If enabled, an exec credential plugin may return HTTP message signature
+	// key material instead of a token or a client certificate, and the client
+	// signs each request with it. Off by default: the field it reads is an alpha
+	// addition to a GA API, so a plugin cannot rely on it being understood.
+	ClientsAllowHTTPSignature Feature = "ClientsAllowHTTPSignature"
+
 	// owner: @enj
 	// beta: v1.36
 	//
@@ -117,6 +126,9 @@ var defaultVersionedKubernetesFeatureGates = map[Feature]VersionedSpecs{
 	},
 	ClientsAllowCBOR: {
 		{Version: version.MustParse("1.32"), Default: false, PreRelease: Alpha},
+	},
+	ClientsAllowHTTPSignature: {
+		{Version: version.MustParse("1.37"), Default: false, PreRelease: Alpha},
 	},
 	ClientsAllowTLSCacheGC: {
 		{Version: version.MustParse("1.36"), Default: true, PreRelease: Beta},

@@ -876,6 +876,12 @@
     lockToDefault: false
     preRelease: Beta
     version: "1.37"
+- name: HTTPSignatureAuthentication
+  versionedSpecs:
+  - default: false
+    lockToDefault: false
+    preRelease: Alpha
+    version: "1.37"
 - name: HugepageAwareEviction
   versionedSpecs:
   - default: true

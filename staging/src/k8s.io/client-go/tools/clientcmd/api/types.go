@@ -153,6 +153,10 @@ type AuthInfo struct {
 	// Exec specifies a custom exec-based authentication plugin for the kubernetes cluster.
 	// +optional
 	Exec *ExecConfig `json:"exec,omitempty"`
+	// HTTPSignature specifies that requests are authenticated by signing each one
+	// with an HTTP message signature (RFC 9421).
+	// +optional
+	HTTPSignature *HTTPSignatureConfig `json:"httpSignature,omitempty"`
 	// Extensions holds additional information. This is useful for extenders so that reads and writes don't clobber unknown fields
 	// +optional
 	Extensions map[string]runtime.Object `json:"extensions,omitempty"`
@@ -387,6 +391,157 @@ const (
 	// and an error will be returned by the exec plugin runner.
 	AlwaysExecInteractiveMode ExecInteractiveMode = "Always"
 )
+
+// HTTPSignatureConfig configures signing every request with an HTTP message
+// signature (RFC 9421). The signature covers the request itself, so no
+// credential is sent and a captured request cannot be replayed as a different
+// one.
+//
+// This holds what does not change about a signing identity. What does change,
+// the key and any header values it comes with, is loaded from the file named
+// here and re-read when that file changes, so a client that outlives its
+// credentials keeps working.
+//
+// What a signature covers is not configurable. Kubernetes fixes the covered
+// component set, because the server requires that set independently of what a
+// signature declares it covers, and a client that covers less produces
+// signatures the server rejects. SignedHeaders adds to the covered set; nothing
+// removes from it.
+type HTTPSignatureConfig struct {
+	// APIVersion is the version of this configuration payload. Only
+	// "client.authentication.k8s.io/v1alpha1" is understood. The field is
+	// required, so that the payload shape can change while the httpSignature
+	// field name stays fixed.
+	APIVersion string `json:"apiVersion"`
+
+	// Algorithm is the signing algorithm, named as in the IANA "HTTP Signature
+	// Algorithms" registry: ed25519, ecdsa-p256-sha256, ecdsa-p384-sha384,
+	// rsa-pss-sha512, rsa-v1_5-sha256, or hmac-sha256. Required, and never
+	// inferred from the key, so that a key cannot be used under an algorithm
+	// its holder did not intend.
+	Algorithm string `json:"algorithm"`
+
+	// KeyFile is the path to a PEM-encoded private key, for a key that is
+	// simply present on disk. Exactly one of KeyFile or CredentialFile is
+	// required. The file is re-read when it changes.
+	// +optional
+	KeyFile string `json:"keyFile,omitempty"`
+
+	// KeyID is the name the server knows the key by. Required with KeyFile, and
+	// invalid with CredentialFile, where the key ID rotates with the key.
+	// +optional
+	KeyID string `json:"keyID,omitempty"`
+
+	// CredentialFile is the path to a signing credential document maintained by
+	// something outside Kubernetes: a credential helper, a sidecar, or a
+	// wrapper around some provider's SDK. It carries the key, the key ID, the
+	// values of any signed headers, and an optional expiry, and is re-read when
+	// it changes.
+	//
+	// This is the form to use for anything that rotates, and the only form that
+	// can carry a shared secret or a session token. A shared secret in a file
+	// the client reads is still a secret the server holds a copy of, which
+	// means the server can produce signatures indistinguishable from this
+	// client's; asymmetric keys have no such property.
+	// +optional
+	CredentialFile string `json:"credentialFile,omitempty"`
+
+	// KeyDerivation is a key derivation ladder, stated identically here and in
+	// the server's configuration. When set, the signing key is derived from the
+	// credential's secret through the ladder rather than being the secret
+	// itself, so the secret is scoped to a purpose and, with a date step, to a
+	// day. The credential may carry an intermediate rung of the ladder instead
+	// of the root secret; its stage says which.
+	//
+	// Valid only with the hmac-sha256 algorithm.
+	// +optional
+	KeyDerivation *HTTPSignatureKeyDerivation `json:"keyDerivation,omitempty"`
+
+	// SignedHeaders are the names of headers set on every request and covered
+	// by the signature. Use them to carry material the server needs in order to
+	// resolve the key, such as a session token, so the signature binds that
+	// material to the request.
+	//
+	// Only names appear here. The values come from the credential file, which
+	// is what keeps a rotating token out of the kubeconfig and lets it rotate
+	// without one.
+	// +optional
+	SignedHeaders []HTTPSignatureHeader `json:"signedHeaders,omitempty"`
+
+	// TTL sets the signature expires parameter to the signing time plus this
+	// duration, as a Go duration string such as "30s". Empty omits expires;
+	// the created parameter is always set and the server bounds signature age
+	// regardless. A TTL shorter than the server's bound narrows the replay
+	// window further.
+	// +optional
+	TTL string `json:"ttl,omitempty"`
+}
+
+// HTTPSignatureHeader names a header that is set on each request and covered by
+// the signature. The value comes from the credential file.
+type HTTPSignatureHeader struct {
+	// Name is the header name.
+	Name string `json:"name"`
+}
+
+// HTTPSignatureKeyDerivation is a key derivation ladder: a chain of HMAC steps
+// that turns a root secret into a signing key scoped to a purpose and, with a
+// date step, to a day. A ladder is not a secret and not specific to one party.
+//
+// Every party that derives states the same ladder, so this and the server's
+// copy have to agree. Both log a digest of theirs when they load it, because a
+// disagreement otherwise fails as a bare signature mismatch with nothing in the
+// error to say why.
+type HTTPSignatureKeyDerivation struct {
+	// Kind discriminates the derivation form. Only "hmac-ladder" is defined.
+	Kind string `json:"kind"`
+
+	// Hash is the HMAC hash used to derive: "sha-256" or "sha-512". The
+	// signature algorithm is always hmac-sha256; this governs derivation only.
+	// +optional
+	Hash string `json:"hash,omitempty"`
+
+	// SecretPrefix is prepended to the root secret before the first step. It
+	// applies only when the material is the root secret, never to an
+	// intermediate rung.
+	// +optional
+	SecretPrefix string `json:"secretPrefix,omitempty"`
+
+	// Steps are the rungs, applied in order. Each step's input is fed to HMAC
+	// keyed by the previous step's output, and the last output is the signing
+	// key.
+	Steps []HTTPSignatureKeyDerivationStep `json:"steps"`
+}
+
+// HTTPSignatureKeyDerivationStep is one rung of a ladder. Exactly one of
+// Literal, Scope, or Date supplies the step's input.
+//
+// Step names are arbitrary labels chosen by whoever writes the ladder. Nothing
+// in the implementation treats a name, a prefix, or a literal as meaningful.
+type HTTPSignatureKeyDerivationStep struct {
+	// Name identifies the step. Names are unique within a ladder and key the
+	// scope map each party supplies. A name may not contain "/", because step
+	// values are joined by slashes into the key ID a signature carries.
+	Name string `json:"name"`
+
+	// Literal is a fixed input value, the same for every party.
+	// +optional
+	Literal string `json:"literal,omitempty"`
+
+	// Scope marks the input as a deployment-scoped value, such as a cell or a
+	// purpose name, supplied by each party's stage.
+	// +optional
+	Scope bool `json:"scope,omitempty"`
+
+	// Date names a date format from a closed set: "YYYYMMDD" or "YYYY-MM-DD".
+	// The input is the signature's created timestamp rendered in UTC, so the
+	// signer and the verifier render the same value without consulting their
+	// own clocks. The set is deliberately not a Go layout or a strftime
+	// string: a ladder is read by implementations in any language, and a
+	// format token has to mean the same thing to all of them.
+	// +optional
+	Date string `json:"date,omitempty"`
+}
 
 // NewConfig is a convenience function that returns a new Config object with non-nil maps
 func NewConfig() *Config {

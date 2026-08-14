@@ -260,13 +260,13 @@ func TestCacheKey(t *testing.T) {
 		StdinUnavailable: true,
 	}
 
-	key1 := cacheKey(c1, c1c)
-	key2 := cacheKey(c2, c2c)
-	key3 := cacheKey(c3, c3c)
-	key4 := cacheKey(c4, c4c)
-	key5 := cacheKey(c5, c5c)
-	key6 := cacheKey(c6, nil)
-	key7 := cacheKey(c7, nil)
+	key1 := cacheKey(c1, c1c, nil)
+	key2 := cacheKey(c2, c2c, nil)
+	key3 := cacheKey(c3, c3c, nil)
+	key4 := cacheKey(c4, c4c, nil)
+	key5 := cacheKey(c5, c5c, nil)
+	key6 := cacheKey(c6, nil, nil)
+	key7 := cacheKey(c7, nil, nil)
 	if key1 != key2 {
 		t.Error("key1 and key2 didn't match")
 	}
@@ -808,7 +808,7 @@ func TestRefreshCreds(t *testing.T) {
 				})
 			}
 
-			a, err := newAuthenticator(newCache(), func(_ int) bool { return test.isTerminal }, &c, test.cluster)
+			a, err := newAuthenticator(newCache(), func(_ int) bool { return test.isTerminal }, &c, test.cluster, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -967,7 +967,7 @@ func TestPluginPolicy(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			c := test.config
-			a, err := newAuthenticator(newCache(), func(_ int) bool { return false }, c, &clientauthentication.Cluster{})
+			a, err := newAuthenticator(newCache(), func(_ int) bool { return false }, c, &clientauthentication.Cluster{}, nil)
 			if err != nil {
 				if !test.wantErr {
 					t.Fatalf("unexpected validation error: %v", err)
@@ -1234,7 +1234,7 @@ func TestRoundTripper(t *testing.T) {
 		APIVersion:      "client.authentication.k8s.io/v1beta1",
 		InteractiveMode: api.IfAvailableExecInteractiveMode,
 	}
-	a, err := newAuthenticator(newCache(), func(_ int) bool { return false }, &c, nil)
+	a, err := newAuthenticator(newCache(), func(_ int) bool { return false }, &c, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1347,7 +1347,7 @@ func TestAuthorizationHeaderPresentCancelsExecAction(t *testing.T) {
 			a, err := newAuthenticator(newCache(), func(_ int) bool { return false }, &api.ExecConfig{
 				Command:    "./testdata/test-plugin.sh",
 				APIVersion: "client.authentication.k8s.io/v1beta1",
-			}, nil)
+			}, nil, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1390,7 +1390,7 @@ func TestTLSCredentials(t *testing.T) {
 		Command:         "./testdata/test-plugin.sh",
 		APIVersion:      "client.authentication.k8s.io/v1beta1",
 		InteractiveMode: api.IfAvailableExecInteractiveMode,
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1480,7 +1480,7 @@ func TestConcurrentUpdateTransportConfig(t *testing.T) {
 		Command:    "./testdata/test-plugin.sh",
 		APIVersion: "client.authentication.k8s.io/v1beta1",
 	}
-	a, err := newAuthenticator(newCache(), func(_ int) bool { return false }, &c, nil)
+	a, err := newAuthenticator(newCache(), func(_ int) bool { return false }, &c, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1548,7 +1548,7 @@ func TestInstallHintRateLimit(t *testing.T) {
 				InstallHint:     "some install hint",
 				InteractiveMode: api.IfAvailableExecInteractiveMode,
 			}
-			a, err := newAuthenticator(newCache(), func(_ int) bool { return false }, &c, nil)
+			a, err := newAuthenticator(newCache(), func(_ int) bool { return false }, &c, nil, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

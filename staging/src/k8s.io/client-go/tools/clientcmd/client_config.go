@@ -23,11 +23,13 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 	"unicode"
 
 	restclient "k8s.io/client-go/rest"
 	clientauth "k8s.io/client-go/tools/auth"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	transporthttpsig "k8s.io/client-go/transport/httpsig"
 	"k8s.io/klog/v2"
 )
 
@@ -312,6 +314,13 @@ func (config *DirectClientConfig) getUserIdentificationPartialConfig(configAuthI
 		mergedConfig.ExecProvider.InstallHint = cleanANSIEscapeCodes(mergedConfig.ExecProvider.InstallHint)
 		mergedConfig.ExecProvider.Config = configClusterInfo.Extensions[clusterExtensionKey]
 	}
+	if configAuthInfo.HTTPSignature != nil {
+		signing, err := httpSignatureConfig(configAuthInfo.HTTPSignature)
+		if err != nil {
+			return nil, err
+		}
+		mergedConfig.HTTPSignature = signing
+	}
 
 	// if there still isn't enough information to authenticate the user, try prompting
 	if !canIdentifyUser(*mergedConfig) && (fallbackReader != nil) {
@@ -357,7 +366,53 @@ func canIdentifyUser(config restclient.Config) bool {
 		(len(config.CertFile) > 0 || len(config.CertData) > 0) ||
 		len(config.BearerToken) > 0 ||
 		config.AuthProvider != nil ||
-		config.ExecProvider != nil
+		config.ExecProvider != nil ||
+		config.HTTPSignature != nil
+}
+
+// httpSignatureAPIVersion is the only payload version the httpSignature stanza
+// is understood at. The stanza carries its own version so the payload shape can
+// change while the kubeconfig field name stays fixed.
+const httpSignatureAPIVersion = "client.authentication.k8s.io/v1alpha1"
+
+// httpSignatureConfig converts the kubeconfig stanza into the transport form.
+// Structural checks live in validation.go; the parsing this does, of the
+// duration and of the key material, is repeated here because a config can reach
+// a client without passing through validation.
+func httpSignatureConfig(in *clientcmdapi.HTTPSignatureConfig) (*transporthttpsig.Config, error) {
+	if in.APIVersion != httpSignatureAPIVersion {
+		return nil, fmt.Errorf("httpSignature apiVersion %q is not understood, want %q", in.APIVersion, httpSignatureAPIVersion)
+	}
+	out := &transporthttpsig.Config{
+		Algorithm:      in.Algorithm,
+		KeyID:          in.KeyID,
+		KeyFile:        in.KeyFile,
+		CredentialFile: in.CredentialFile,
+	}
+	if in.KeyDerivation != nil {
+		// The library validates the ladder as it converts, so a bad one is
+		// reported here rather than as a signature failure at the first request.
+		ladder, digest, err := transporthttpsig.DerivationFrom(in.KeyDerivation)
+		if err != nil {
+			return nil, fmt.Errorf("httpSignature keyDerivation: %w", err)
+		}
+		klog.V(2).InfoS("Loaded key derivation ladder from kubeconfig", "sha256", digest)
+		out.KeyDerivation = &ladder
+	}
+	if in.TTL != "" {
+		ttl, err := time.ParseDuration(in.TTL)
+		if err != nil {
+			return nil, fmt.Errorf("httpSignature ttl %q is not a duration: %w", in.TTL, err)
+		}
+		if ttl <= 0 {
+			return nil, fmt.Errorf("httpSignature ttl %q must be positive", in.TTL)
+		}
+		out.TTL = ttl
+	}
+	for _, h := range in.SignedHeaders {
+		out.SignedHeaders = append(out.SignedHeaders, transporthttpsig.Header{Name: h.Name})
+	}
+	return out, nil
 }
 
 // cleanANSIEscapeCodes takes an arbitrary string and ensures that there are no

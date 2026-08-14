@@ -39,7 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
-	"k8s.io/apimachinery/pkg/util/sets"
+	clientfeatures "k8s.io/client-go/features"
 	"k8s.io/client-go/pkg/apis/clientauthentication"
 	"k8s.io/client-go/pkg/apis/clientauthentication/install"
 	clientauthenticationv1 "k8s.io/client-go/pkg/apis/clientauthentication/v1"
@@ -47,7 +47,9 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/client-go/tools/metrics"
 	"k8s.io/client-go/transport"
+	httpsig "k8s.io/client-go/transport/httpsig"
 	"k8s.io/client-go/util/connrotation"
+	"k8s.io/client-go/util/pluginpolicy"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/dump"
@@ -83,13 +85,15 @@ func newCache() *cache {
 	return &cache{m: make(map[string]*Authenticator)}
 }
 
-func cacheKey(conf *api.ExecConfig, cluster *clientauthentication.Cluster) string {
+func cacheKey(conf *api.ExecConfig, cluster *clientauthentication.Cluster, signing *httpsig.Config) string {
 	key := struct {
 		conf    *api.ExecConfig
 		cluster *clientauthentication.Cluster
+		signing *httpsig.Config
 	}{
 		conf:    conf,
 		cluster: cluster,
+		signing: signing,
 	}
 	return dump.Pretty(key)
 }
@@ -160,11 +164,35 @@ func (s *sometimes) Do(f func()) {
 // GetAuthenticator returns an exec-based plugin for providing client credentials.
 func GetAuthenticator(config *api.ExecConfig, cluster *clientauthentication.Cluster) (*Authenticator, error) {
 	metrics.EnsureRegistered()
-	return newAuthenticator(globalCache, term.IsTerminal, config, cluster)
+	return newAuthenticator(globalCache, term.IsTerminal, config, cluster, nil)
 }
 
-func newAuthenticator(c *cache, isTerminalFunc func(int) bool, config *api.ExecConfig, cluster *clientauthentication.Cluster) (*Authenticator, error) {
-	key := cacheKey(config, cluster)
+// GetSigningAuthenticator returns an exec-based plugin that provides HTTP message
+// signature key material rather than a credential that transits.
+//
+// The signing configuration is required because it decides what the plugin is
+// asked for and what its answer has to satisfy: the algorithm, the derivation
+// ladder a plugin needs in order to hand back an intermediate rung, and the
+// headers a credential must supply a value for. It is part of the cache key for
+// the same reason, since two clients naming the same command may cover different
+// headers.
+func GetSigningAuthenticator(config *api.ExecConfig, cluster *clientauthentication.Cluster, signing *httpsig.Config) (*Authenticator, error) {
+	metrics.EnsureRegistered()
+	if signing == nil {
+		return nil, fmt.Errorf("exec plugin: a signing configuration is required")
+	}
+	// The field a plugin answers in is an alpha addition to a GA API, so the
+	// client refuses to ask for it unless the gate is on. Failing here rather
+	// than when the plugin runs means the configuration is rejected while the
+	// client is being built.
+	if !clientfeatures.FeatureGates().Enabled(clientfeatures.ClientsAllowHTTPSignature) {
+		return nil, fmt.Errorf("exec plugin: signing key material from an exec plugin requires the %s feature gate", clientfeatures.ClientsAllowHTTPSignature)
+	}
+	return newAuthenticator(globalCache, term.IsTerminal, config, cluster, signing)
+}
+
+func newAuthenticator(c *cache, isTerminalFunc func(int) bool, config *api.ExecConfig, cluster *clientauthentication.Cluster, signing *httpsig.Config) (*Authenticator, error) {
+	key := cacheKey(config, cluster, signing)
 	if a, ok := c.get(key); ok {
 		return a, nil
 	}
@@ -180,15 +208,12 @@ func newAuthenticator(c *cache, isTerminalFunc func(int) bool, config *api.ExecC
 		connTracker,
 	)
 
-	if err := ValidatePluginPolicy(config.PluginPolicy); err != nil {
+	// Whether a credential program may run is decided in
+	// k8s.io/client-go/util/pluginpolicy, because more than one kind of
+	// credential program answers to the same policy.
+	policyChecker, err := newPolicyChecker(config.Command, config.PluginPolicy)
+	if err != nil {
 		return nil, fmt.Errorf("invalid plugin policy: %w", err)
-	}
-
-	allowlistLookup := sets.New[string]()
-	for _, entry := range config.PluginPolicy.Allowlist {
-		if entry.Command != "" {
-			allowlistLookup.Insert(entry.Command)
-		}
 	}
 
 	a := &Authenticator{
@@ -200,8 +225,10 @@ func newAuthenticator(c *cache, isTerminalFunc func(int) bool, config *api.ExecC
 		cluster:            cluster,
 		provideClusterInfo: config.ProvideClusterInfo,
 
-		allowlistLookup:  allowlistLookup,
-		execPluginPolicy: config.PluginPolicy,
+		signing:         signing,
+		declaredHeaders: declaredSignedHeaders(signing),
+
+		policyChecker: policyChecker,
 
 		installHint: config.InstallHint,
 		sometimes: &sometimes{
@@ -269,8 +296,15 @@ type Authenticator struct {
 	cluster            *clientauthentication.Cluster
 	provideClusterInfo bool
 
-	allowlistLookup  sets.Set[string]
-	execPluginPolicy api.PluginPolicy
+	policyChecker *pluginpolicy.Checker
+
+	// signing is set when the plugin provides signing key material rather than a
+	// credential that transits. It holds what does not change about the signing
+	// identity, which is what the plugin is told in order to produce material
+	// that fits.
+	signing *httpsig.Config
+	// declaredHeaders is signing.SignedHeaders indexed for lookup.
+	declaredHeaders map[string]bool
 
 	// Used to avoid log spew by rate limiting install hint printing. We didn't do
 	// this by interval based rate limiting alone since that way may have prevented
@@ -306,6 +340,9 @@ type Authenticator struct {
 type credentials struct {
 	token string           `datapolicy:"token"`
 	cert  *tls.Certificate `datapolicy:"secret-key"`
+	// signing holds key material the client signs each request with. Unlike the
+	// other two it never leaves this process.
+	signing *httpsig.BoundCredential `datapolicy:"secret-key"`
 }
 
 // UpdateTransportConfig updates the transport.Config to use credentials
@@ -318,6 +355,29 @@ func (a *Authenticator) UpdateTransportConfig(c *transport.Config) error {
 	// use the provided token for authentication. The same can be said for when the
 	// user specifies basic auth or cert auth.
 	if c.HasTokenAuth() || c.HasBasicAuth() || c.HasCertAuth() {
+		return nil
+	}
+
+	if a.signing != nil {
+		// Signing replaces the credential rather than adding to it, so the
+		// bearer token round tripper below is not installed and neither is the
+		// client certificate callback: this plugin returns neither.
+		//
+		// Wrapping here puts the signer closest to the wire, so the impersonation
+		// and user agent round trippers have already set their headers when it
+		// runs and the signature can cover them.
+		names := make([]string, 0, len(a.signing.SignedHeaders))
+		for _, h := range a.signing.SignedHeaders {
+			names = append(names, h.Name)
+		}
+		signing := *a.signing
+		c.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+			signer, err := httpsig.NewRoundTripperWithSource(&signingSource{a}, names, signing.TTL, rt)
+			if err != nil {
+				return errorRoundTripper{err}
+			}
+			return signer
+		})
 		return nil
 	}
 
@@ -446,6 +506,14 @@ func (a *Authenticator) refreshCredsLocked() error {
 	if a.provideClusterInfo {
 		cred.Spec.Cluster = a.cluster
 	}
+	if a.signing != nil {
+		// A plugin cannot produce a usable credential without this: it has to
+		// know which headers to supply values for, and a plugin handing back an
+		// intermediate rung has to derive through the same ladder the client
+		// derives through. None of it is secret, so it is not gated on
+		// provideClusterInfo.
+		cred.Spec.HTTPSignature = signatureRequest(a.signing)
+	}
 
 	env := append(a.environ(), a.env...)
 	data, err := runtime.Encode(codecs.LegacyCodec(a.group), cred)
@@ -487,11 +555,24 @@ func (a *Authenticator) refreshCredsLocked() error {
 	if cred.Status == nil {
 		return fmt.Errorf("exec plugin didn't return a status field")
 	}
-	if cred.Status.Token == "" && cred.Status.ClientCertificateData == "" && cred.Status.ClientKeyData == "" {
-		return fmt.Errorf("exec plugin didn't return a token or cert/key pair")
+	if cred.Status.Token == "" && cred.Status.ClientCertificateData == "" && cred.Status.ClientKeyData == "" && cred.Status.HTTPSignature == nil {
+		return fmt.Errorf("exec plugin didn't return a token, a cert/key pair, or signing key material")
 	}
 	if (cred.Status.ClientCertificateData == "") != (cred.Status.ClientKeyData == "") {
 		return fmt.Errorf("exec plugin returned only certificate or key, not both")
+	}
+	// A credential that transits alongside one that does not would leave the
+	// server to authenticate whichever its authenticator chain reached first, so
+	// the identity would depend on server ordering rather than on this
+	// configuration.
+	if cred.Status.HTTPSignature != nil && (cred.Status.Token != "" || cred.Status.ClientCertificateData != "") {
+		return fmt.Errorf("exec plugin returned signing key material alongside a token or certificate, which are alternatives rather than additions")
+	}
+	if cred.Status.HTTPSignature != nil && a.signing == nil {
+		return fmt.Errorf("exec plugin returned signing key material, but this client is not configured to sign requests")
+	}
+	if cred.Status.HTTPSignature == nil && a.signing != nil {
+		return fmt.Errorf("exec plugin returned no signing key material, which this client is configured to require")
 	}
 
 	if cred.Status.ExpirationTimestamp != nil {
@@ -502,6 +583,17 @@ func (a *Authenticator) refreshCredsLocked() error {
 
 	newCreds := &credentials{
 		token: cred.Status.Token,
+	}
+	if sig := cred.Status.HTTPSignature; sig != nil {
+		// Validating here means a plugin that returns material the client cannot
+		// use fails when the plugin runs, naming what is wrong with the
+		// credential, rather than as a signature the server rejects.
+		bound, err := httpsig.NewBoundCredential(signatureMaterial(sig, cred.Status.ExpirationTimestamp),
+			"exec plugin "+a.cmd, alg(a.signing), a.signing.KeyDerivation, a.declaredHeaders)
+		if err != nil {
+			return err
+		}
+		newCreds.signing = bound
 	}
 	if cred.Status.ClientKeyData != "" && cred.Status.ClientCertificateData != "" {
 		cert, err := tls.X509KeyPair([]byte(cred.Status.ClientCertificateData), []byte(cred.Status.ClientKeyData))
@@ -574,130 +666,46 @@ func (a *Authenticator) wrapCmdRunErrorLocked(err error) error {
 	}
 }
 
-// `updateCommandAndCheckAllowlistLocked` determines whether or not the specified executable may run
-// according to the credential plugin policy. If the plugin is allowed, `nil`
-// is returned. If the plugin is not allowed, an error must be returned
-// explaining why.
+// `updateCommandAndCheckAllowlistLocked` determines whether or not the specified
+// executable may run according to the credential plugin policy. If the plugin is
+// allowed, `nil` is returned. If the plugin is not allowed, an error must be
+// returned explaining why. When the policy is an allowlist and the command
+// matches only after path resolution, cmd.Path is updated, so the program that
+// was checked is the program that runs.
 func (a *Authenticator) updateCommandAndCheckAllowlistLocked(cmd *exec.Cmd) error {
-	switch a.execPluginPolicy.PolicyType {
-	case "", api.PluginPolicyAllowAll:
-		return nil
-	case api.PluginPolicyDenyAll:
-		return fmt.Errorf("plugin %q not allowed: policy set to %q", a.cmd, api.PluginPolicyDenyAll)
-	case api.PluginPolicyAllowlist:
-		return a.checkAllowlistLocked(cmd)
-	default:
-		return fmt.Errorf("unknown plugin policy %q", a.execPluginPolicy.PolicyType)
-	}
+	return a.policyChecker.Check(cmd)
 }
 
-// `checkAllowlistLocked` checks the specified plugin against the allowlist,
-// and may update the Authenticator's allowlistLookup set.
-func (a *Authenticator) checkAllowlistLocked(cmd *exec.Cmd) error {
-	// a.cmd is the original command as specified in the configuration, then filepath.Clean().
-	// cmd.Path is the possibly-resolved command.
-	// If either are an exact match in the allowlist, return success.
-	if a.allowlistLookup.Has(a.cmd) || a.allowlistLookup.Has(cmd.Path) {
-		return nil
-	}
-
-	var cmdResolvedPath string
-	var cmdResolvedErr error
-	if cmd.Path != a.cmd {
-		// cmd.Path changed, use the already-resolved LookPath results
-		cmdResolvedPath = cmd.Path
-		cmdResolvedErr = cmd.Err
-	} else {
-		// cmd.Path is unchanged, do LookPath ourselves
-		cmdResolvedPath, cmdResolvedErr = exec.LookPath(cmd.Path)
-		// update cmd.Path to cmdResolvedPath so we only run the resolved path
-		if cmdResolvedPath != "" {
-			cmd.Path = cmdResolvedPath
-		}
-	}
-
-	if cmdResolvedErr != nil {
-		return fmt.Errorf("plugin path %q cannot be resolved for credential plugin allowlist check: %w", cmd.Path, cmdResolvedErr)
-	}
-
-	// cmdResolvedPath may have changed, and the changed value may be in the allowlist
-	if a.allowlistLookup.Has(cmdResolvedPath) {
-		return nil
-	}
-
-	// There is no verbatim match
-	a.resolveAllowListEntriesLocked(cmd.Path)
-
-	// allowlistLookup may have changed, recheck
-	if a.allowlistLookup.Has(cmdResolvedPath) {
-		return nil
-	}
-
-	return fmt.Errorf("plugin path %q is not permitted by the credential plugin allowlist", cmd.Path)
+// newPolicyChecker converts the configured policy into a checker.
+func newPolicyChecker(command string, policy api.PluginPolicy) (*pluginpolicy.Checker, error) {
+	return pluginpolicy.New(command, pluginpolicy.Type(policy.PolicyType), allowlistCommands(policy))
 }
 
-// resolveAllowListEntriesLocked tries to resolve allowlist entries with LookPath,
-// and adds successfully resolved entries to allowlistLookup.
-// The optional commandHint can be used to limit which entries are resolved to ones which match the hint basename.
-func (a *Authenticator) resolveAllowListEntriesLocked(commandHint string) {
-	hintName := filepath.Base(commandHint)
-	for _, entry := range a.execPluginPolicy.Allowlist {
-		entryBasename := filepath.Base(entry.Command)
-		if hintName != "" && hintName != entryBasename {
-			// we got a hint, and this allowlist entry does not match it
-			continue
-		}
-		entryResolvedPath, err := exec.LookPath(entry.Command)
-		if err != nil {
-			klog.V(5).ErrorS(err, "resolving credential plugin allowlist", "name", entry.Command)
-			continue
-		}
-		if entryResolvedPath != "" {
-			a.allowlistLookup.Insert(entryResolvedPath)
-		}
+// allowlistCommands flattens the allowlist to the commands it names, preserving
+// nil. An unspecified allowlist under an Allowlist policy is a misconfiguration
+// and is not the same as an empty one, so nil must survive the conversion.
+func allowlistCommands(policy api.PluginPolicy) []string {
+	if policy.Allowlist == nil {
+		return nil
 	}
+	commands := make([]string, 0, len(policy.Allowlist))
+	for _, entry := range policy.Allowlist {
+		commands = append(commands, entry.Command)
+	}
+	return commands
 }
 
 func ValidatePluginPolicy(policy api.PluginPolicy) error {
-	switch policy.PolicyType {
-	// "" is equivalent to "AllowAll"
-	case "", api.PluginPolicyAllowAll, api.PluginPolicyDenyAll:
-		if policy.Allowlist != nil {
-			return fmt.Errorf("misconfigured credential plugin allowlist: plugin policy is %q but allowlist is non-nil", policy.PolicyType)
-		}
-		return nil
-	case api.PluginPolicyAllowlist:
-		return validateAllowlist(policy.Allowlist)
-	default:
-		return fmt.Errorf("unknown plugin policy: %q", policy.PolicyType)
-	}
+	return pluginpolicy.Validate(pluginpolicy.Type(policy.PolicyType), allowlistCommands(policy))
 }
 
-var emptyAllowlistEntry api.AllowlistEntry
+// errorRoundTripper fails every request with the same error. The signing round
+// tripper is built inside a transport wrapper, which has no way to report an
+// error, so the error is carried to the first request instead of being dropped.
+type errorRoundTripper struct {
+	err error
+}
 
-func validateAllowlist(list []api.AllowlistEntry) error {
-	// This will be the case if the user has misspelled the field name for the
-	// allowlist. Because this is a security knob, fail immediately rather than
-	// proceed when the user has made a mistake.
-	if list == nil {
-		return fmt.Errorf("credential plugin policy set to %q, but allowlist is unspecified", api.PluginPolicyAllowlist)
-	}
-
-	if len(list) == 0 {
-		return fmt.Errorf("credential plugin policy set to %q, but allowlist is empty; use %q policy instead", api.PluginPolicyAllowlist, api.PluginPolicyDenyAll)
-	}
-
-	for i, item := range list {
-		if item == emptyAllowlistEntry {
-			return fmt.Errorf("misconfigured credential plugin allowlist: empty allowlist entry #%d", i+1)
-		}
-
-		if cleaned := filepath.Clean(item.Command); cleaned != item.Command {
-			return fmt.Errorf("non-normalized file path: %q vs %q", item.Command, cleaned)
-		} else if item.Command == "" {
-			return fmt.Errorf("empty file path: %q", item.Command)
-		}
-	}
-
-	return nil
+func (rt errorRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return nil, rt.err
 }

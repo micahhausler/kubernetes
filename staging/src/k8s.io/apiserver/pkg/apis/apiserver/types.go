@@ -172,6 +172,9 @@ type AuthenticationConfiguration struct {
 
 	// If present --anonymous-auth must not be set
 	Anonymous *AnonymousAuthConfig
+
+	// HTTPSignature authenticates requests by HTTP message signature.
+	HTTPSignature *HTTPSignatureAuthenticator
 }
 
 // AnonymousAuthConfig provides the configuration for the anonymous authenticator.
@@ -433,4 +436,151 @@ type WebhookMatchCondition struct {
 	//
 	// Documentation on CEL: https://kubernetes.io/docs/reference/using-api/cel/
 	Expression string
+}
+
+// HTTPSignatureAuthenticator provides the configuration for authenticating
+// requests by HTTP message signature (RFC 9421).
+type HTTPSignatureAuthenticator struct {
+	// Keys the verifier accepts, and the identity each one authenticates as.
+	Keys []HTTPSignatureKey
+
+	// KeyDerivation is a key derivation ladder, stated identically here and in
+	// the configuration of every party that derives through it. When set,
+	// signatures from an hmac-sha256 key are verified against a key derived from
+	// its secret through the ladder, using the created timestamp the signature
+	// carries.
+	//
+	// It sits here rather than on each key because a ladder describes a
+	// derivation for a whole deployment. Each key states where its own material
+	// sits on the ladder, in its stage.
+	KeyDerivation *HTTPSignatureKeyDerivation
+
+	// MaxAge bounds how old a signature may be, measured from its created
+	// parameter. Unset means five minutes.
+	MaxAge *metav1.Duration
+
+	// Tolerance is added to time comparisons to allow for clock skew between
+	// the signer and this server. Unset means no tolerance.
+	Tolerance *metav1.Duration
+
+	// Authority and Scheme are the external values clients sign, for a server
+	// behind a TLS-terminating proxy or load balancer. Unset means they are
+	// derived from the connection, which is correct only when clients reach
+	// this server directly. The Forwarded and X-Forwarded-* fields are
+	// unsigned input and are never consulted.
+	Authority string
+	Scheme    string
+
+	// MaxNoncesPerKey caps the nonces remembered per key. Unset means 1024.
+	MaxNoncesPerKey *int32
+}
+
+// HTTPSignatureKey is one verification key and the identity it authenticates.
+type HTTPSignatureKey struct {
+	// KeyID matches the keyid parameter a signature carries.
+	KeyID string
+
+	// Algorithm is the signature algorithm this key verifies, named as in the
+	// IANA "HTTP Signature Algorithms" registry. A signature whose alg
+	// parameter disagrees is rejected, which closes algorithm confusion.
+	Algorithm string
+
+	// PublicKey is a PEM-encoded public key, for asymmetric algorithms. A
+	// public key is not a secret, so it is stated inline.
+	PublicKey string
+
+	// SecretFile is a file holding a shared secret, for hmac-sha256. A secret
+	// is never inline: this file is the only place one appears. When Stage is
+	// set the file must hold base64, because the material is raw bytes.
+	//
+	// A shared secret lets this server produce signatures indistinguishable
+	// from the client's, which asymmetric keys do not.
+	SecretFile string
+
+	// Stage is this key's position on the ladder, when SecretFile holds an
+	// intermediate rung rather than the root secret. A rung bounds what this
+	// server can mint: only within the rung's scope, only until its date rolls.
+	Stage *HTTPSignatureKeyStage
+
+	// User is the identity a request signed by this key authenticates as.
+	User HTTPSignatureUser
+}
+
+// HTTPSignatureKeyDerivation is a key derivation ladder: a chain of HMAC steps
+// that turns a root secret into a signing key scoped to a purpose and, with a
+// Date step, to a day. A ladder is not a secret and not specific to one party.
+//
+// Every party that derives states the same ladder, so this and the client's
+// copy have to agree. Both log a digest of theirs when they load it, because a
+// disagreement otherwise fails as a bare signature mismatch with nothing in the
+// error to say why.
+type HTTPSignatureKeyDerivation struct {
+	// Kind discriminates the derivation form. Only "hmac-ladder" is defined.
+	Kind string
+
+	// Hash is the HMAC hash used to derive: "sha-256" or "sha-512". The
+	// signature algorithm is always hmac-sha256; this governs derivation only.
+	// +optional
+	Hash string
+
+	// SecretPrefix is prepended to the root secret before the first step. It
+	// applies only when the material is the root secret, never to an
+	// intermediate rung.
+	// +optional
+	SecretPrefix string
+
+	// Steps are the rungs, applied in order. Each step's input is fed to HMAC
+	// keyed by the previous step's output, and the last output is the signing
+	// key.
+	Steps []HTTPSignatureKeyDerivationStep
+}
+
+// HTTPSignatureKeyDerivationStep is one rung of a ladder. Exactly one of
+// Literal, Scope, or Date supplies the step's input.
+//
+// Step names are arbitrary labels chosen by whoever writes the ladder. Nothing
+// in the implementation treats a name, a prefix, or a literal as meaningful.
+type HTTPSignatureKeyDerivationStep struct {
+	// Name identifies the step. Names are unique within a ladder and key the
+	// Scope map each party supplies. A name may not contain "/", because step
+	// values are joined by slashes into the key ID a signature carries.
+	Name string
+
+	// Literal is a fixed input value, the same for every party.
+	// +optional
+	Literal string
+
+	// Scope marks the input as a deployment-scoped value, such as a cell or a
+	// purpose name, supplied by each party's stage.
+	// +optional
+	Scope bool
+
+	// Date names a date format from a closed set: "YYYYMMDD" or "YYYY-MM-DD".
+	// The input is the signature's created timestamp rendered in UTC, so the
+	// signer and the verifier render the same value without consulting their
+	// own clocks. The set is deliberately not a Go layout or a strftime
+	// string: a ladder is read by implementations in any language, and a
+	// format token has to mean the same thing to all of them.
+	// +optional
+	Date string
+}
+
+// HTTPSignatureKeyStage is a position on a key derivation ladder.
+type HTTPSignatureKeyStage struct {
+	// From names the ladder step whose output the secret is. Empty means the
+	// secret is the root and the whole ladder is folded per request.
+	From string
+
+	// Scope holds values for the ladder's scope steps, and assertions for date
+	// steps at or before From.
+	Scope map[string]string
+}
+
+// HTTPSignatureUser is the identity a verification key authenticates as. The
+// values are used as given: this server does not prefix them, so an
+// administrator owns avoiding collision with names other authenticators issue.
+type HTTPSignatureUser struct {
+	Username string
+	UID      string
+	Groups   []string
 }

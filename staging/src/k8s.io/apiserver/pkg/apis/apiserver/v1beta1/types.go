@@ -163,6 +163,14 @@ type AuthenticationConfiguration struct {
 
 	// If present --anonymous-auth must not be set
 	Anonymous *AnonymousAuthConfig `json:"anonymous,omitempty"`
+
+	// httpSignature authenticates requests by HTTP message signature
+	// (RFC 9421) rather than by a credential the client sends.
+	//
+	// Requires the HTTPSignatureAuthentication feature gate.
+	// +featureGate=HTTPSignatureAuthentication
+	// +optional
+	HTTPSignature *HTTPSignatureAuthenticator `json:"httpSignature,omitempty"`
 }
 
 // AnonymousAuthConfig provides the configuration for the anonymous authenticator.
@@ -636,4 +644,214 @@ type WebhookMatchCondition struct {
 	//
 	// Documentation on CEL: https://kubernetes.io/docs/reference/using-api/cel/
 	Expression string `json:"expression"`
+}
+
+// HTTPSignatureAuthenticator provides the configuration for authenticating
+// requests by HTTP message signature (RFC 9421). A client signs each request
+// over its method, authority, path, query, body digest, and selected headers,
+// so no credential is sent and a captured request cannot be replayed as a
+// different one.
+//
+// What a signature must cover is not configurable. This server requires a fixed
+// component set, because a signature declares its own covered components: a
+// verifier that accepted whatever a signature claimed to cover would accept one
+// covering nothing.
+type HTTPSignatureAuthenticator struct {
+	// keys are the verification keys this server accepts, and the identity
+	// each one authenticates as. A request is authenticated when one of its
+	// signatures verifies against the key its keyid names.
+	// +required
+	// +listType=atomic
+	Keys []HTTPSignatureKey `json:"keys"`
+
+	// keyDerivation is a key derivation ladder, stated identically here and in
+	// the configuration of every party that derives through it. When set,
+	// signatures from an hmac-sha256 key are verified against a key derived from
+	// its secret through the ladder, using the created timestamp the signature
+	// carries, so the two sides agree even at a date boundary.
+	//
+	// It sits here rather than on each key because a ladder describes a
+	// derivation for a whole deployment. Each key states where its own material
+	// sits on the ladder, in its stage.
+	// +optional
+	KeyDerivation *HTTPSignatureKeyDerivation `json:"keyDerivation,omitempty"`
+
+	// maxAge bounds how old a signature may be, measured from its created
+	// parameter. Signatures without created are rejected. Unset means 5m.
+	//
+	// This is the bound on replay: a captured request can be resent until its
+	// signature ages out. Shorter is safer and less tolerant of client clock
+	// drift, which no other authentication mode in Kubernetes depends on.
+	// +optional
+	MaxAge *metav1.Duration `json:"maxAge,omitempty"`
+
+	// tolerance is added to time comparisons to allow for clock skew between
+	// the signer and this server. It widens the replay window by the same
+	// amount. Unset means no tolerance.
+	// +optional
+	Tolerance *metav1.Duration `json:"tolerance,omitempty"`
+
+	// authority is the external authority clients sign, for a server behind a
+	// TLS-terminating proxy or load balancer that rewrites the Host header.
+	// Unset means the authority is taken from the connection, which is correct
+	// only when clients reach this server directly.
+	//
+	// The Forwarded and X-Forwarded-* fields are unsigned input and are never
+	// consulted. State the deployment fact here instead.
+	// +optional
+	Authority string `json:"authority,omitempty"`
+
+	// scheme is the external scheme clients sign, for the same case as
+	// authority. Unset means the scheme is taken from the connection.
+	// +optional
+	Scheme string `json:"scheme,omitempty"`
+
+	// maxNoncesPerKey caps how many recently seen nonces are remembered for
+	// each key. Unset means 1024.
+	//
+	// Nonces are remembered per key rather than in one shared set. A shared set
+	// keyed on values the client chooses lets one noisy or hostile client evict
+	// every other client's entries, which turns this cache into a replay
+	// enabling mechanism.
+	// +optional
+	MaxNoncesPerKey *int32 `json:"maxNoncesPerKey,omitempty"`
+}
+
+// HTTPSignatureKey is one verification key and the identity it authenticates.
+type HTTPSignatureKey struct {
+	// keyID matches the keyid parameter a signature carries. Must be unique
+	// across keys.
+	// +required
+	KeyID string `json:"keyID"`
+
+	// algorithm is the signature algorithm this key verifies, named as in the
+	// IANA "HTTP Signature Algorithms" registry: ed25519, ecdsa-p256-sha256,
+	// ecdsa-p384-sha384, rsa-pss-sha512, rsa-v1_5-sha256, or hmac-sha256.
+	//
+	// A signature whose alg parameter disagrees with this value is rejected,
+	// which closes the algorithm confusion class of attack.
+	// +required
+	Algorithm string `json:"algorithm"`
+
+	// publicKey is a PEM-encoded public key, required for the asymmetric
+	// algorithms and invalid for hmac-sha256. A public key is not a secret, so
+	// it is stated inline rather than referenced by path.
+	// +optional
+	PublicKey string `json:"publicKey,omitempty"`
+
+	// secretFile is the path to a file holding a shared secret, required for
+	// hmac-sha256 and invalid for the asymmetric algorithms. A secret is never
+	// inline in this configuration. When stage is set the file must hold
+	// base64, because an intermediate rung is raw bytes and the trailing
+	// newline trim applied to a plain secret would corrupt it.
+	//
+	// A shared secret lets this server produce signatures indistinguishable
+	// from the client's, which an asymmetric key does not. Prefer asymmetric
+	// keys unless the same party operates both sides.
+	// +optional
+	SecretFile string `json:"secretFile,omitempty"`
+
+	// stage is this key's position on the ladder, for a secretFile holding an
+	// intermediate rung rather than the root secret. A rung bounds what this
+	// server could mint with the secret: only within the rung's scope, and for
+	// a date-scoped rung, only until the date rolls.
+	// +optional
+	Stage *HTTPSignatureKeyStage `json:"stage,omitempty"`
+
+	// user is the identity a request signed by this key authenticates as. The
+	// values are used as given: this server adds no prefix, so an administrator
+	// owns avoiding collision with names other authenticators issue.
+	// +required
+	User HTTPSignatureUser `json:"user"`
+}
+
+// HTTPSignatureUser is the identity a verification key authenticates as.
+type HTTPSignatureUser struct {
+	// username is the user name. Must not be empty, and must not start with
+	// "system:", which is reserved for identities Kubernetes issues.
+	// +required
+	Username string `json:"username"`
+
+	// uid is a unique identifier for the user.
+	// +optional
+	UID string `json:"uid,omitempty"`
+
+	// groups are the groups the user belongs to. The authenticated group is
+	// added by the server and does not need to be listed.
+	// +optional
+	// +listType=atomic
+	Groups []string `json:"groups,omitempty"`
+}
+
+// HTTPSignatureKeyDerivation is a key derivation ladder: a chain of HMAC steps
+// that turns a root secret into a signing key scoped to a purpose and, with a
+// date step, to a day. A ladder is not a secret and not specific to one party.
+//
+// Every party that derives states the same ladder, so this and the client's
+// copy have to agree. Both log a digest of theirs when they load it, because a
+// disagreement otherwise fails as a bare signature mismatch with nothing in the
+// error to say why.
+type HTTPSignatureKeyDerivation struct {
+	// kind discriminates the derivation form. Only "hmac-ladder" is defined.
+	Kind string `json:"kind"`
+
+	// hash is the HMAC hash used to derive: "sha-256" or "sha-512". The
+	// signature algorithm is always hmac-sha256; this governs derivation only.
+	// +optional
+	Hash string `json:"hash,omitempty"`
+
+	// secretPrefix is prepended to the root secret before the first step. It
+	// applies only when the material is the root secret, never to an
+	// intermediate rung.
+	// +optional
+	SecretPrefix string `json:"secretPrefix,omitempty"`
+
+	// steps are the rungs, applied in order. Each step's input is fed to HMAC
+	// keyed by the previous step's output, and the last output is the signing
+	// key.
+	Steps []HTTPSignatureKeyDerivationStep `json:"steps"`
+}
+
+// HTTPSignatureKeyDerivationStep is one rung of a ladder. Exactly one of
+// literal, scope, or date supplies the step's input.
+//
+// Step names are arbitrary labels chosen by whoever writes the ladder. Nothing
+// in the implementation treats a name, a prefix, or a literal as meaningful.
+type HTTPSignatureKeyDerivationStep struct {
+	// name identifies the step. Names are unique within a ladder and key the
+	// scope map each party supplies. A name may not contain "/", because step
+	// values are joined by slashes into the key ID a signature carries.
+	Name string `json:"name"`
+
+	// literal is a fixed input value, the same for every party.
+	// +optional
+	Literal string `json:"literal,omitempty"`
+
+	// scope marks the input as a deployment-scoped value, such as a cell or a
+	// purpose name, supplied by each party's stage.
+	// +optional
+	Scope bool `json:"scope,omitempty"`
+
+	// date names a date format from a closed set: "YYYYMMDD" or "YYYY-MM-DD".
+	// The input is the signature's created timestamp rendered in UTC, so the
+	// signer and the verifier render the same value without consulting their
+	// own clocks. The set is deliberately not a Go layout or a strftime
+	// string: a ladder is read by implementations in any language, and a
+	// format token has to mean the same thing to all of them.
+	// +optional
+	Date string `json:"date,omitempty"`
+}
+
+// HTTPSignatureKeyStage is a position on a key derivation ladder.
+type HTTPSignatureKeyStage struct {
+	// from names the ladder step whose output the secret is. Empty means the
+	// secret is the root and the whole ladder is folded per request.
+	// +optional
+	From string `json:"from,omitempty"`
+
+	// scope holds values for the ladder's scope steps, and assertions for the
+	// date steps at or before from. It must cover exactly those; a missing key
+	// and an unexpected key are both errors.
+	// +optional
+	Scope map[string]string `json:"scope,omitempty"`
 }

@@ -76,6 +76,66 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}); err != nil {
 		return err
 	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureCredential)(nil), (*clientauthentication.HTTPSignatureCredential)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureCredential_To_clientauthentication_HTTPSignatureCredential(a.(*HTTPSignatureCredential), b.(*clientauthentication.HTTPSignatureCredential), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*clientauthentication.HTTPSignatureCredential)(nil), (*HTTPSignatureCredential)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_clientauthentication_HTTPSignatureCredential_To_v1beta1_HTTPSignatureCredential(a.(*clientauthentication.HTTPSignatureCredential), b.(*HTTPSignatureCredential), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureHeader)(nil), (*clientauthentication.HTTPSignatureHeader)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureHeader_To_clientauthentication_HTTPSignatureHeader(a.(*HTTPSignatureHeader), b.(*clientauthentication.HTTPSignatureHeader), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*clientauthentication.HTTPSignatureHeader)(nil), (*HTTPSignatureHeader)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_clientauthentication_HTTPSignatureHeader_To_v1beta1_HTTPSignatureHeader(a.(*clientauthentication.HTTPSignatureHeader), b.(*HTTPSignatureHeader), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureKeyDerivation)(nil), (*clientauthentication.HTTPSignatureKeyDerivation)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureKeyDerivation_To_clientauthentication_HTTPSignatureKeyDerivation(a.(*HTTPSignatureKeyDerivation), b.(*clientauthentication.HTTPSignatureKeyDerivation), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*clientauthentication.HTTPSignatureKeyDerivation)(nil), (*HTTPSignatureKeyDerivation)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_clientauthentication_HTTPSignatureKeyDerivation_To_v1beta1_HTTPSignatureKeyDerivation(a.(*clientauthentication.HTTPSignatureKeyDerivation), b.(*HTTPSignatureKeyDerivation), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureKeyDerivationStep)(nil), (*clientauthentication.HTTPSignatureKeyDerivationStep)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureKeyDerivationStep_To_clientauthentication_HTTPSignatureKeyDerivationStep(a.(*HTTPSignatureKeyDerivationStep), b.(*clientauthentication.HTTPSignatureKeyDerivationStep), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*clientauthentication.HTTPSignatureKeyDerivationStep)(nil), (*HTTPSignatureKeyDerivationStep)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_clientauthentication_HTTPSignatureKeyDerivationStep_To_v1beta1_HTTPSignatureKeyDerivationStep(a.(*clientauthentication.HTTPSignatureKeyDerivationStep), b.(*HTTPSignatureKeyDerivationStep), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureRequest)(nil), (*clientauthentication.HTTPSignatureRequest)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureRequest_To_clientauthentication_HTTPSignatureRequest(a.(*HTTPSignatureRequest), b.(*clientauthentication.HTTPSignatureRequest), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*clientauthentication.HTTPSignatureRequest)(nil), (*HTTPSignatureRequest)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_clientauthentication_HTTPSignatureRequest_To_v1beta1_HTTPSignatureRequest(a.(*clientauthentication.HTTPSignatureRequest), b.(*HTTPSignatureRequest), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureStage)(nil), (*clientauthentication.HTTPSignatureStage)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1beta1_HTTPSignatureStage_To_clientauthentication_HTTPSignatureStage(a.(*HTTPSignatureStage), b.(*clientauthentication.HTTPSignatureStage), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*clientauthentication.HTTPSignatureStage)(nil), (*HTTPSignatureStage)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_clientauthentication_HTTPSignatureStage_To_v1beta1_HTTPSignatureStage(a.(*clientauthentication.HTTPSignatureStage), b.(*HTTPSignatureStage), scope)
+	}); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -152,6 +212,7 @@ func autoConvert_v1beta1_ExecCredentialSpec_To_clientauthentication_ExecCredenti
 		out.Cluster = nil
 	}
 	out.Interactive = in.Interactive
+	out.HTTPSignature = (*clientauthentication.HTTPSignatureRequest)(unsafe.Pointer(in.HTTPSignature))
 	return nil
 }
 
@@ -171,6 +232,7 @@ func autoConvert_clientauthentication_ExecCredentialSpec_To_v1beta1_ExecCredenti
 	} else {
 		out.Cluster = nil
 	}
+	out.HTTPSignature = (*HTTPSignatureRequest)(unsafe.Pointer(in.HTTPSignature))
 	return nil
 }
 
@@ -197,4 +259,124 @@ func autoConvert_clientauthentication_ExecCredentialStatus_To_v1beta1_ExecCreden
 // Convert_clientauthentication_ExecCredentialStatus_To_v1beta1_ExecCredentialStatus is an autogenerated conversion function.
 func Convert_clientauthentication_ExecCredentialStatus_To_v1beta1_ExecCredentialStatus(in *clientauthentication.ExecCredentialStatus, out *ExecCredentialStatus, s conversion.Scope) error {
 	return autoConvert_clientauthentication_ExecCredentialStatus_To_v1beta1_ExecCredentialStatus(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureCredential_To_clientauthentication_HTTPSignatureCredential(in *HTTPSignatureCredential, out *clientauthentication.HTTPSignatureCredential, s conversion.Scope) error {
+	*out = *(*clientauthentication.HTTPSignatureCredential)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureCredential_To_clientauthentication_HTTPSignatureCredential is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureCredential_To_clientauthentication_HTTPSignatureCredential(in *HTTPSignatureCredential, out *clientauthentication.HTTPSignatureCredential, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureCredential_To_clientauthentication_HTTPSignatureCredential(in, out, s)
+}
+
+func autoConvert_clientauthentication_HTTPSignatureCredential_To_v1beta1_HTTPSignatureCredential(in *clientauthentication.HTTPSignatureCredential, out *HTTPSignatureCredential, s conversion.Scope) error {
+	*out = *(*HTTPSignatureCredential)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_clientauthentication_HTTPSignatureCredential_To_v1beta1_HTTPSignatureCredential is an autogenerated conversion function.
+func Convert_clientauthentication_HTTPSignatureCredential_To_v1beta1_HTTPSignatureCredential(in *clientauthentication.HTTPSignatureCredential, out *HTTPSignatureCredential, s conversion.Scope) error {
+	return autoConvert_clientauthentication_HTTPSignatureCredential_To_v1beta1_HTTPSignatureCredential(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureHeader_To_clientauthentication_HTTPSignatureHeader(in *HTTPSignatureHeader, out *clientauthentication.HTTPSignatureHeader, s conversion.Scope) error {
+	*out = *(*clientauthentication.HTTPSignatureHeader)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureHeader_To_clientauthentication_HTTPSignatureHeader is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureHeader_To_clientauthentication_HTTPSignatureHeader(in *HTTPSignatureHeader, out *clientauthentication.HTTPSignatureHeader, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureHeader_To_clientauthentication_HTTPSignatureHeader(in, out, s)
+}
+
+func autoConvert_clientauthentication_HTTPSignatureHeader_To_v1beta1_HTTPSignatureHeader(in *clientauthentication.HTTPSignatureHeader, out *HTTPSignatureHeader, s conversion.Scope) error {
+	*out = *(*HTTPSignatureHeader)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_clientauthentication_HTTPSignatureHeader_To_v1beta1_HTTPSignatureHeader is an autogenerated conversion function.
+func Convert_clientauthentication_HTTPSignatureHeader_To_v1beta1_HTTPSignatureHeader(in *clientauthentication.HTTPSignatureHeader, out *HTTPSignatureHeader, s conversion.Scope) error {
+	return autoConvert_clientauthentication_HTTPSignatureHeader_To_v1beta1_HTTPSignatureHeader(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureKeyDerivation_To_clientauthentication_HTTPSignatureKeyDerivation(in *HTTPSignatureKeyDerivation, out *clientauthentication.HTTPSignatureKeyDerivation, s conversion.Scope) error {
+	*out = *(*clientauthentication.HTTPSignatureKeyDerivation)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureKeyDerivation_To_clientauthentication_HTTPSignatureKeyDerivation is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureKeyDerivation_To_clientauthentication_HTTPSignatureKeyDerivation(in *HTTPSignatureKeyDerivation, out *clientauthentication.HTTPSignatureKeyDerivation, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureKeyDerivation_To_clientauthentication_HTTPSignatureKeyDerivation(in, out, s)
+}
+
+func autoConvert_clientauthentication_HTTPSignatureKeyDerivation_To_v1beta1_HTTPSignatureKeyDerivation(in *clientauthentication.HTTPSignatureKeyDerivation, out *HTTPSignatureKeyDerivation, s conversion.Scope) error {
+	*out = *(*HTTPSignatureKeyDerivation)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_clientauthentication_HTTPSignatureKeyDerivation_To_v1beta1_HTTPSignatureKeyDerivation is an autogenerated conversion function.
+func Convert_clientauthentication_HTTPSignatureKeyDerivation_To_v1beta1_HTTPSignatureKeyDerivation(in *clientauthentication.HTTPSignatureKeyDerivation, out *HTTPSignatureKeyDerivation, s conversion.Scope) error {
+	return autoConvert_clientauthentication_HTTPSignatureKeyDerivation_To_v1beta1_HTTPSignatureKeyDerivation(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureKeyDerivationStep_To_clientauthentication_HTTPSignatureKeyDerivationStep(in *HTTPSignatureKeyDerivationStep, out *clientauthentication.HTTPSignatureKeyDerivationStep, s conversion.Scope) error {
+	*out = *(*clientauthentication.HTTPSignatureKeyDerivationStep)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureKeyDerivationStep_To_clientauthentication_HTTPSignatureKeyDerivationStep is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureKeyDerivationStep_To_clientauthentication_HTTPSignatureKeyDerivationStep(in *HTTPSignatureKeyDerivationStep, out *clientauthentication.HTTPSignatureKeyDerivationStep, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureKeyDerivationStep_To_clientauthentication_HTTPSignatureKeyDerivationStep(in, out, s)
+}
+
+func autoConvert_clientauthentication_HTTPSignatureKeyDerivationStep_To_v1beta1_HTTPSignatureKeyDerivationStep(in *clientauthentication.HTTPSignatureKeyDerivationStep, out *HTTPSignatureKeyDerivationStep, s conversion.Scope) error {
+	*out = *(*HTTPSignatureKeyDerivationStep)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_clientauthentication_HTTPSignatureKeyDerivationStep_To_v1beta1_HTTPSignatureKeyDerivationStep is an autogenerated conversion function.
+func Convert_clientauthentication_HTTPSignatureKeyDerivationStep_To_v1beta1_HTTPSignatureKeyDerivationStep(in *clientauthentication.HTTPSignatureKeyDerivationStep, out *HTTPSignatureKeyDerivationStep, s conversion.Scope) error {
+	return autoConvert_clientauthentication_HTTPSignatureKeyDerivationStep_To_v1beta1_HTTPSignatureKeyDerivationStep(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureRequest_To_clientauthentication_HTTPSignatureRequest(in *HTTPSignatureRequest, out *clientauthentication.HTTPSignatureRequest, s conversion.Scope) error {
+	*out = *(*clientauthentication.HTTPSignatureRequest)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureRequest_To_clientauthentication_HTTPSignatureRequest is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureRequest_To_clientauthentication_HTTPSignatureRequest(in *HTTPSignatureRequest, out *clientauthentication.HTTPSignatureRequest, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureRequest_To_clientauthentication_HTTPSignatureRequest(in, out, s)
+}
+
+func autoConvert_clientauthentication_HTTPSignatureRequest_To_v1beta1_HTTPSignatureRequest(in *clientauthentication.HTTPSignatureRequest, out *HTTPSignatureRequest, s conversion.Scope) error {
+	*out = *(*HTTPSignatureRequest)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_clientauthentication_HTTPSignatureRequest_To_v1beta1_HTTPSignatureRequest is an autogenerated conversion function.
+func Convert_clientauthentication_HTTPSignatureRequest_To_v1beta1_HTTPSignatureRequest(in *clientauthentication.HTTPSignatureRequest, out *HTTPSignatureRequest, s conversion.Scope) error {
+	return autoConvert_clientauthentication_HTTPSignatureRequest_To_v1beta1_HTTPSignatureRequest(in, out, s)
+}
+
+func autoConvert_v1beta1_HTTPSignatureStage_To_clientauthentication_HTTPSignatureStage(in *HTTPSignatureStage, out *clientauthentication.HTTPSignatureStage, s conversion.Scope) error {
+	*out = *(*clientauthentication.HTTPSignatureStage)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1beta1_HTTPSignatureStage_To_clientauthentication_HTTPSignatureStage is an autogenerated conversion function.
+func Convert_v1beta1_HTTPSignatureStage_To_clientauthentication_HTTPSignatureStage(in *HTTPSignatureStage, out *clientauthentication.HTTPSignatureStage, s conversion.Scope) error {
+	return autoConvert_v1beta1_HTTPSignatureStage_To_clientauthentication_HTTPSignatureStage(in, out, s)
+}
+
+func autoConvert_clientauthentication_HTTPSignatureStage_To_v1beta1_HTTPSignatureStage(in *clientauthentication.HTTPSignatureStage, out *HTTPSignatureStage, s conversion.Scope) error {
+	*out = *(*HTTPSignatureStage)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_clientauthentication_HTTPSignatureStage_To_v1beta1_HTTPSignatureStage is an autogenerated conversion function.
+func Convert_clientauthentication_HTTPSignatureStage_To_v1beta1_HTTPSignatureStage(in *clientauthentication.HTTPSignatureStage, out *HTTPSignatureStage, s conversion.Scope) error {
+	return autoConvert_clientauthentication_HTTPSignatureStage_To_v1beta1_HTTPSignatureStage(in, out, s)
 }

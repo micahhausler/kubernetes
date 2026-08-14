@@ -19,12 +19,15 @@ package rest
 import (
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 
 	"k8s.io/client-go/pkg/apis/clientauthentication"
 	"k8s.io/client-go/plugin/pkg/client/auth/exec"
 	"k8s.io/client-go/tools/metrics"
 	"k8s.io/client-go/transport"
+	transporthttpsig "k8s.io/client-go/transport/httpsig"
 )
 
 // HTTPClientFor returns an http.Client that will provide the authentication
@@ -130,7 +133,17 @@ func (c *Config) TransportConfig() (*transport.Config, error) {
 				return nil, err
 			}
 		}
-		provider, err := exec.GetAuthenticator(c.ExecProvider, cluster)
+		// An exec plugin is a credential source, and httpSignature says what kind
+		// of credential it is asked for. With signing configured the plugin
+		// returns key material rather than a token, and the authenticator
+		// installs the signer instead of a bearer round tripper.
+		var provider *exec.Authenticator
+		var err error
+		if c.HTTPSignature != nil {
+			provider, err = exec.GetSigningAuthenticator(c.ExecProvider, cluster, c.HTTPSignature)
+		} else {
+			provider, err = exec.GetAuthenticator(c.ExecProvider, cluster)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -145,7 +158,62 @@ func (c *Config) TransportConfig() (*transport.Config, error) {
 		}
 		conf.Wrap(provider.WrapTransport)
 	}
+
+	if c.HTTPSignature != nil && c.ExecProvider == nil {
+		if err := c.validateHTTPSignatureExclusive(); err != nil {
+			return nil, err
+		}
+		// Wrapping here puts the signer closest to the wire, so the
+		// impersonation and user agent round trippers have already set their
+		// headers when it runs and the signature can cover them.
+		cfg := *c.HTTPSignature
+		conf.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+			signing, err := transporthttpsig.NewRoundTripper(cfg, rt)
+			if err != nil {
+				return errorRoundTripper{err}
+			}
+			return signing
+		})
+	}
 	return conf, nil
+}
+
+// validateHTTPSignatureExclusive reports a configuration that presents a
+// credential alongside a signature. Both would be sent, the server would
+// authenticate whichever its authenticator chain reached first, and the
+// resulting identity would depend on server ordering rather than on the
+// client's configuration.
+//
+// ExecProvider is deliberately not a conflict: an exec plugin is where signing
+// key material comes from, so the two compose rather than compete. What the
+// plugin may not do is return a token alongside the material, which the exec
+// authenticator rejects when it reads the plugin's answer.
+func (c *Config) validateHTTPSignatureExclusive() error {
+	var conflicts []string
+	if len(c.BearerToken) != 0 || len(c.BearerTokenFile) != 0 {
+		conflicts = append(conflicts, "bearer token")
+	}
+	if len(c.Username) != 0 || len(c.Password) != 0 {
+		conflicts = append(conflicts, "basic auth")
+	}
+	if c.AuthProvider != nil {
+		conflicts = append(conflicts, "authProvider")
+	}
+	if len(conflicts) > 0 {
+		return fmt.Errorf("httpSignature cannot be used in combination with %s", strings.Join(conflicts, " or "))
+	}
+	return nil
+}
+
+// errorRoundTripper fails every request with the same error. Signer construction
+// happens inside a transport wrapper, which cannot report an error, so the error
+// is carried to the first request instead of being dropped.
+type errorRoundTripper struct {
+	err error
+}
+
+func (rt errorRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, rt.err
 }
 
 // Wrap adds a transport middleware function that will give the caller

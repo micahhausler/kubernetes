@@ -34,6 +34,7 @@ import (
 	"k8s.io/apiserver/pkg/authentication/request/anonymous"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	"k8s.io/apiserver/pkg/authentication/request/headerrequest"
+	"k8s.io/apiserver/pkg/authentication/request/httpsig"
 	"k8s.io/apiserver/pkg/authentication/request/union"
 	"k8s.io/apiserver/pkg/authentication/request/websocket"
 	"k8s.io/apiserver/pkg/authentication/request/x509"
@@ -128,6 +129,17 @@ func (config Config) New(serverLifecycle context.Context) (authenticator.Request
 	if config.ClientCAContentProvider != nil {
 		certAuth := x509.NewDynamic(config.ClientCAContentProvider.VerifyOptions, x509.CommonNameUserConversion)
 		authenticators = append(authenticators, certAuth)
+	}
+
+	// HTTP message signatures. This runs before the bearer token authenticator
+	// so that a request presenting both is authenticated as the signer, whose
+	// identity is bound to the request rather than merely presented with it.
+	if config.AuthenticationConfig != nil && config.AuthenticationConfig.HTTPSignature != nil {
+		signatureAuth, err := httpsig.New(config.AuthenticationConfig.HTTPSignature)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		authenticators = append(authenticators, authenticator.WrapAudienceAgnosticRequest(config.APIAudiences, signatureAuth))
 	}
 
 	// Bearer token methods, local first, then remote
