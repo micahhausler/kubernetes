@@ -1,0 +1,50 @@
+# Written for kind v0.32.0 and a source build of this branch (Kubernetes 1.37).
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+name: httpsig
+nodes:
+- role: control-plane
+  # Naming the image here rather than relying on a --image flag. Without it kind
+  # uses its own default node image, which is an older Kubernetes that has never
+  # heard of any of this, and the failure is indirect: the kubelet panics on the
+  # unrecognized feature gate, no static pods are created, and kubeadm reports a
+  # connection refused from an API server that was never started.
+  image: kindest/node:httpsig-dev
+  # A JSON patch rather than a strategic merge patch, because in kubeadm v1beta4
+  # extraArgs is a list of name/value pairs with no merge key. A merge patch would
+  # replace the list and drop the runtime-config argument kind puts there.
+  #
+  # The feature gate goes here rather than in kind's top-level featureGates,
+  # which would also hand it to the kubelet, the scheduler, the controller
+  # manager, and kube-proxy. This gate is read only by the API server, and a
+  # component that does not recognize a gate name does not ignore it, it refuses
+  # to start.
+  kubeadmConfigPatchesJSON6902:
+  - group: kubeadm.k8s.io
+    version: v1beta4
+    kind: ClusterConfiguration
+    patch: |
+      - op: add
+        path: /apiServer/extraArgs/-
+        value:
+          name: feature-gates
+          value: HTTPSignatureAuthentication=true
+      - op: add
+        path: /apiServer/extraArgs/-
+        value:
+          name: authentication-config
+          value: /httpsig/authentication-config.yaml
+      - op: add
+        path: /apiServer/extraVolumes
+        value:
+        - name: httpsig
+          hostPath: /httpsig
+          mountPath: /httpsig
+          readOnly: true
+  # Resolved against the working directory, so run kind from this directory.
+  # This mount is the server's whole view of the key material: the HMAC secret it
+  # shares with the client, and nothing else. The client's private key is not here.
+  extraMounts:
+  - hostPath: ./fixtures/node
+    containerPath: /httpsig
+    readOnly: true
