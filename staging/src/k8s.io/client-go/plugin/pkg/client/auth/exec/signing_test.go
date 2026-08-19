@@ -283,10 +283,13 @@ func TestSigningPluginAnswerIsChecked(t *testing.T) {
 		status:  `"token":"a-bearer-token",` + material,
 		want:    "alternatives rather than additions",
 	}, {
+		// A certificate and key material are both ways of signing, so this is not
+		// the same conflict as a token: it is a request to sign under two keys at
+		// once, and there is no basis for choosing one.
 		name:    "a certificate alongside the material",
 		signing: signing,
 		status:  `"clientCertificateData":"cert","clientKeyData":"key",` + material,
-		want:    "alternatives rather than additions",
+		want:    "a signature is made under one key",
 	}, {
 		// A plugin that answers with signing material for a client that is not
 		// configured to sign has misread what it was asked for.
@@ -295,10 +298,13 @@ func TestSigningPluginAnswerIsChecked(t *testing.T) {
 		status:  material,
 		want:    "not configured to sign requests",
 	}, {
-		name:    "no material when the client requires it",
+		// A signing client asked for a credential it does not send, and got one
+		// that transits. Reported as the token being wrong rather than as material
+		// being absent, because that is the more specific of the two facts.
+		name:    "a token when the client signs",
 		signing: signing,
 		status:  `"token":"a-bearer-token"`,
-		want:    "returned no signing key material",
+		want:    "configured to sign requests rather than to send a credential",
 	}, {
 		name:    "nothing at all",
 		signing: signing,

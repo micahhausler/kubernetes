@@ -199,6 +199,15 @@ func (c *Config) validateHTTPSignatureExclusive() error {
 	if c.AuthProvider != nil {
 		conflicts = append(conflicts, "authProvider")
 	}
+	// A client certificate is the case this function most needs to catch, because
+	// the server's authenticator chain runs its mTLS authenticator ahead of this
+	// one, so a request carrying both authenticates as the certificate subject and
+	// the signature is never consulted. Under httpSignature a certificate and key
+	// belong in HTTPSignature.CertFile and HTTPSignature.KeyFile, where they are
+	// signing material rather than TLS material.
+	if len(c.CertFile) != 0 || len(c.CertData) != 0 {
+		conflicts = append(conflicts, "client certificate; to sign with it, set HTTPSignature.CertFile and HTTPSignature.KeyFile")
+	}
 	if len(conflicts) > 0 {
 		return fmt.Errorf("httpSignature cannot be used in combination with %s", strings.Join(conflicts, " or "))
 	}

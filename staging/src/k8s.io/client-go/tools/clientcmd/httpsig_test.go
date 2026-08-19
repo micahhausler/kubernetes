@@ -195,6 +195,24 @@ func TestValidateHTTPSignature(t *testing.T) {
 	if err := os.WriteFile(credFile, []byte("read by the signer"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	// Validation checks that these are readable and leaves their contents to the
+	// signer, so they hold nothing meaningful.
+	certFile := filepath.Join(t.TempDir(), "tls.crt")
+	if err := os.WriteFile(certFile, []byte("parsed by the signer"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	bundleFile := filepath.Join(t.TempDir(), "bundle.pem")
+	if err := os.WriteFile(bundleFile, []byte("parsed by the signer"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// asCertificate rewrites a stanza into the certificate form, which states
+	// neither an algorithm nor a key identifier because the certificate determines
+	// both.
+	asCertificate := func(a *clientcmdapi.AuthInfo) {
+		a.HTTPSignature.Algorithm = ""
+		a.HTTPSignature.KeyID = ""
+		a.HTTPSignature.CertFile = certFile
+	}
 
 	for _, tc := range []struct {
 		name     string
@@ -338,6 +356,86 @@ func TestValidateHTTPSignature(t *testing.T) {
 			a.Exec = testExec()
 		},
 		want: "exactly one credential source must be specified",
+	}, {
+		name:     "certificate and key",
+		authInfo: asCertificate,
+	}, {
+		name: "credential bundle",
+		authInfo: func(a *clientcmdapi.AuthInfo) {
+			a.HTTPSignature.Algorithm = ""
+			a.HTTPSignature.KeyID = ""
+			a.HTTPSignature.KeyFile = ""
+			a.HTTPSignature.CredentialBundleFile = bundleFile
+		},
+	}, {
+		// The certificate's key type determines the algorithm on both sides, so a
+		// stated one is a second copy of a value with one correct answer.
+		name: "certificate with an algorithm",
+		authInfo: func(a *clientcmdapi.AuthInfo) {
+			asCertificate(a)
+			a.HTTPSignature.Algorithm = "ecdsa-p256-sha256"
+		},
+		want: "algorithm must not be specified",
+	}, {
+		name: "certificate with a key identifier",
+		authInfo: func(a *clientcmdapi.AuthInfo) {
+			asCertificate(a)
+			a.HTTPSignature.KeyID = "alice-key"
+		},
+		want: "keyID must not be specified",
+	}, {
+		name: "certificate with no key",
+		authInfo: func(a *clientcmdapi.AuthInfo) {
+			asCertificate(a)
+			a.HTTPSignature.KeyFile = ""
+		},
+		want: "keyFile must be specified alongside certFile",
+	}, {
+		name: "certificate and bundle together",
+		authInfo: func(a *clientcmdapi.AuthInfo) {
+			asCertificate(a)
+			a.HTTPSignature.CredentialBundleFile = bundleFile
+		},
+		want: "certFile and credentialBundleFile are alternatives",
+	}, {
+		name: "bundle with a key file",
+		authInfo: func(a *clientcmdapi.AuthInfo) {
+			a.HTTPSignature.Algorithm = ""
+			a.HTTPSignature.KeyID = ""
+			a.HTTPSignature.CredentialBundleFile = bundleFile
+		},
+		want: "keyFile must not be specified alongside credentialBundleFile",
+	}, {
+		name: "certificate and credential file together",
+		authInfo: func(a *clientcmdapi.AuthInfo) {
+			asCertificate(a)
+			a.HTTPSignature.CredentialFile = credFile
+		},
+		want: "the certificate is the credential",
+	}, {
+		name: "unreadable certificate",
+		authInfo: func(a *clientcmdapi.AuthInfo) {
+			asCertificate(a)
+			a.HTTPSignature.CertFile = "/nonexistent/tls.crt"
+		},
+		want: "unable to read httpSignature certFile",
+	}, {
+		// A client certificate and a signature are both credentials the server can
+		// authenticate, and the server's chain reaches its mTLS authenticator
+		// first, so the signature would never be consulted.
+		name: "client certificate alongside a signature",
+		authInfo: func(a *clientcmdapi.AuthInfo) {
+			a.ClientCertificate = certFile
+			a.ClientKey = keyFile
+		},
+		want: "client-cert cannot be provided in combination with httpSignature",
+	}, {
+		name: "signed headers with a certificate",
+		authInfo: func(a *clientcmdapi.AuthInfo) {
+			asCertificate(a)
+			a.HTTPSignature.SignedHeaders = []clientcmdapi.HTTPSignatureHeader{{Name: "X-Session-Token"}}
+		},
+		want: "signedHeaders requires credentialFile or exec",
 	}, {
 		name: "derivation with exec",
 		authInfo: func(a *clientcmdapi.AuthInfo) {

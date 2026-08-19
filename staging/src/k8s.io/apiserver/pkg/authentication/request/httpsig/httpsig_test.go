@@ -51,7 +51,7 @@ const (
 )
 
 // signerFor returns a signing round tripper and the matching server config.
-func signerFor(t *testing.T) (http.RoundTripper, *capture, *apiserver.HTTPSignatureAuthenticator) {
+func signerFor(t *testing.T) (http.RoundTripper, *capture, *apiserver.HTTPSignatureConfig) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -69,7 +69,7 @@ func signerFor(t *testing.T) (http.RoundTripper, *capture, *apiserver.HTTPSignat
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := &apiserver.HTTPSignatureAuthenticator{
+	config := keysConfig(apiserver.HTTPSignatureAuthenticator{
 		Keys: []apiserver.HTTPSignatureKey{{
 			KeyID:     testKeyID,
 			Algorithm: string(httpsig.Ed25519),
@@ -80,7 +80,7 @@ func signerFor(t *testing.T) (http.RoundTripper, *capture, *apiserver.HTTPSignat
 				Groups:   []string{testGroup},
 			},
 		}},
-	}
+	})
 	c := &capture{}
 	rt, err := transporthttpsig.NewRoundTripper(transporthttpsig.Config{
 		Algorithm: string(httpsig.Ed25519),
@@ -91,6 +91,36 @@ func signerFor(t *testing.T) (http.RoundTripper, *capture, *apiserver.HTTPSignat
 		t.Fatal(err)
 	}
 	return rt, c, config
+}
+
+// keysConfig wraps one keys-based authenticator in the server-wide configuration
+// that holds it. Most tests here care about one authenticator and nothing about
+// the authority or scheme, so they state the authenticator and let this supply the
+// rest.
+func keysConfig(a apiserver.HTTPSignatureAuthenticator) *apiserver.HTTPSignatureConfig {
+	if a.Name == "" {
+		a.Name = "test"
+	}
+	return &apiserver.HTTPSignatureConfig{Authenticators: []apiserver.HTTPSignatureAuthenticator{a}}
+}
+
+// newKeyAuthenticator builds an authenticator from one keys-based authenticator.
+func newKeyAuthenticator(a apiserver.HTTPSignatureAuthenticator) (*Authenticator, error) {
+	return New(keysConfig(a), nil)
+}
+
+// setPolicyClock moves every resolver's clock forward, so a test can age a
+// signature without sleeping. The policy lives on the resolver rather than on the
+// authenticator because maxAge and tolerance are per authenticator.
+func setPolicyClock(a *Authenticator, now func() time.Time) {
+	for _, r := range a.resolvers {
+		switch res := r.(type) {
+		case *keyResolver:
+			res.policy.Now = now
+		case *certificateResolver:
+			res.policy.Now = now
+		}
+	}
 }
 
 type capture struct {
@@ -131,7 +161,7 @@ func asServerRequest(req *http.Request) *http.Request {
 
 func TestAuthenticatesSignedRequest(t *testing.T) {
 	rt, c, config := signerFor(t)
-	auth, err := New(config)
+	auth, err := New(config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +193,7 @@ func TestAuthenticatesSignedRequest(t *testing.T) {
 
 func TestNoOpinionWithoutSignature(t *testing.T) {
 	_, _, config := signerFor(t)
-	auth, err := New(config)
+	auth, err := New(config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +223,7 @@ func TestRejectsSignatureMissingFloorComponents(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			auth, err := New(&apiserver.HTTPSignatureAuthenticator{
+			auth, err := newKeyAuthenticator(apiserver.HTTPSignatureAuthenticator{
 				Keys: []apiserver.HTTPSignatureKey{{
 					KeyID:     testKeyID,
 					Algorithm: string(httpsig.Ed25519),
@@ -265,7 +295,7 @@ func TestRejectsInjectedProtectedHeader(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			rt, c, config := signerFor(t)
-			auth, err := New(config)
+			auth, err := New(config, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -291,7 +321,7 @@ func TestRejectsInjectedProtectedHeader(t *testing.T) {
 // previous test could pass by rejecting impersonation outright.
 func TestAcceptsCoveredProtectedHeader(t *testing.T) {
 	rt, c, config := signerFor(t)
-	auth, err := New(config)
+	auth, err := New(config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +344,7 @@ func TestBodyDigest(t *testing.T) {
 
 	t.Run("signed body is accepted and readable downstream", func(t *testing.T) {
 		rt, c, config := signerFor(t)
-		auth, err := New(config)
+		auth, err := New(config, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -335,7 +365,7 @@ func TestBodyDigest(t *testing.T) {
 
 	t.Run("altered body is rejected", func(t *testing.T) {
 		rt, c, config := signerFor(t)
-		auth, err := New(config)
+		auth, err := New(config, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -353,7 +383,7 @@ func TestBodyDigest(t *testing.T) {
 
 	t.Run("body added to a bodiless signed request is rejected", func(t *testing.T) {
 		rt, c, config := signerFor(t)
-		auth, err := New(config)
+		auth, err := New(config, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -373,15 +403,15 @@ func TestBodyDigest(t *testing.T) {
 
 func TestRejectsStaleSignature(t *testing.T) {
 	rt, c, config := signerFor(t)
-	config.MaxAge = &metav1.Duration{Duration: time.Second}
-	auth, err := New(config)
+	config.Authenticators[0].MaxAge = &metav1.Duration{Duration: time.Second}
+	auth, err := New(config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
 	// Rather than sleep, move the created parameter into the past by verifying
 	// against a policy whose clock is ahead.
-	auth.policy.Now = func() time.Time { return time.Now().Add(time.Hour) }
+	setPolicyClock(auth, func() time.Time { return time.Now().Add(time.Hour) })
 
 	_, ok, err := auth.AuthenticateRequest(req)
 	if ok {
@@ -426,7 +456,7 @@ func TestRejectsMissingCreated(t *testing.T) {
 	// signature is verified.
 	t.Run("static key", func(t *testing.T) {
 		rt, c, config := signerFor(t)
-		auth, err := New(config)
+		auth, err := New(config, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -450,7 +480,7 @@ func TestRejectsMissingCreated(t *testing.T) {
 		if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		auth, err := New(&apiserver.HTTPSignatureAuthenticator{
+		auth, err := newKeyAuthenticator(apiserver.HTTPSignatureAuthenticator{
 			KeyDerivation: testLadder(),
 			Keys: []apiserver.HTTPSignatureKey{{
 				KeyID:      testKeyID,
@@ -488,16 +518,18 @@ func TestRejectsMissingCreated(t *testing.T) {
 
 func TestRejectsUnknownKeyID(t *testing.T) {
 	rt, c, config := signerFor(t)
-	config.Keys[0].KeyID = "some-other-key"
-	auth, err := New(config)
+	config.Authenticators[0].Keys[0].KeyID = "some-other-key"
+	auth, err := New(config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
 	if _, ok, err := auth.AuthenticateRequest(req); ok {
 		t.Fatal("a signature naming an unconfigured key was accepted")
-	} else if err == nil || !strings.Contains(err.Error(), "unknown keyID") {
-		t.Fatalf("want an unknown keyID error, got %v", err)
+	} else if err == nil || !strings.Contains(err.Error(), "no configured authenticator handles the keyid") {
+		t.Fatalf("want an unhandled keyid error, got %v", err)
+	} else if !strings.Contains(err.Error(), testKeyID) {
+		t.Errorf("the error should name the keyid the signature carried, got %v", err)
 	}
 }
 
@@ -505,7 +537,7 @@ func TestRejectsUnknownKeyID(t *testing.T) {
 // unverified claim from the wire, so naming a key you do not hold must fail.
 func TestRejectsWrongKeyForKeyID(t *testing.T) {
 	_, _, config := signerFor(t)
-	auth, err := New(config)
+	auth, err := New(config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,11 +578,11 @@ func TestRejectsAlgorithmSubstitution(t *testing.T) {
 	_, _, config := signerFor(t)
 	// The configured key is ed25519. Claim hmac-sha256 with the public key bytes
 	// as the shared secret, the classic confusion attack.
-	auth, err := New(config)
+	auth, err := New(config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	signer, err := httpsig.NewSigner(httpsig.HMACSHA256, []byte(config.Keys[0].PublicKey))
+	signer, err := httpsig.NewSigner(httpsig.HMACSHA256, []byte(config.Authenticators[0].Keys[0].PublicKey))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +618,7 @@ func TestAuthorityOverride(t *testing.T) {
 	rt, c, config := signerFor(t)
 	config.Authority = testAuthort
 	config.Scheme = "https"
-	auth, err := New(config)
+	auth, err := New(config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -601,7 +633,7 @@ func TestAuthorityOverride(t *testing.T) {
 
 func TestAuthorityMismatchIsRejected(t *testing.T) {
 	rt, c, config := signerFor(t)
-	auth, err := New(config)
+	auth, err := New(config, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -628,7 +660,7 @@ func TestHMACKeyFromSecretFile(t *testing.T) {
 	if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	auth, err := New(&apiserver.HTTPSignatureAuthenticator{
+	auth, err := newKeyAuthenticator(apiserver.HTTPSignatureAuthenticator{
 		Keys: []apiserver.HTTPSignatureKey{{
 			KeyID:      "AKIAEXAMPLE",
 			Algorithm:  string(httpsig.HMACSHA256),
@@ -717,7 +749,7 @@ func TestNewErrors(t *testing.T) {
 		want: "algorithm is required",
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := New(&apiserver.HTTPSignatureAuthenticator{Keys: tc.keys})
+			_, err := newKeyAuthenticator(apiserver.HTTPSignatureAuthenticator{Keys: tc.keys})
 			if err == nil {
 				t.Fatalf("want an error mentioning %q, got none", tc.want)
 			}
@@ -865,7 +897,7 @@ func TestDerivedKeyVerification(t *testing.T) {
 		{name: "rung at client, rung at server", client: rungCred, server: rungKey},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			auth, err := New(&apiserver.HTTPSignatureAuthenticator{
+			auth, err := newKeyAuthenticator(apiserver.HTTPSignatureAuthenticator{
 				KeyDerivation: testLadder(),
 				Keys:          []apiserver.HTTPSignatureKey{tc.server},
 			})
@@ -896,7 +928,7 @@ func TestDerivedKeyWrongScopeFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	auth, err := New(&apiserver.HTTPSignatureAuthenticator{
+	auth, err := newKeyAuthenticator(apiserver.HTTPSignatureAuthenticator{
 		KeyDerivation: testLadder(),
 		Keys: []apiserver.HTTPSignatureKey{{
 			KeyID:      testKeyID,
@@ -987,7 +1019,7 @@ func TestDateScopedServerRungExpiresDaily(t *testing.T) {
 		User:       apiserver.HTTPSignatureUser{Username: testUser},
 	}
 
-	auth, err := New(&apiserver.HTTPSignatureAuthenticator{
+	auth, err := newKeyAuthenticator(apiserver.HTTPSignatureAuthenticator{
 		KeyDerivation: testLadder(),
 		Keys:          []apiserver.HTTPSignatureKey{serverKey},
 		MaxAge:        &metav1.Duration{Duration: 48 * time.Hour},
@@ -1063,7 +1095,7 @@ func TestDateScopedServerRungExpiresDaily(t *testing.T) {
 	second := serverKey
 	second.SecretFile = tomorrowFile
 	second.Stage = &apiserver.HTTPSignatureKeyStage{From: tomorrowStage.From, Scope: tomorrowStage.Scope}
-	_, err = New(&apiserver.HTTPSignatureAuthenticator{
+	_, err = newKeyAuthenticator(apiserver.HTTPSignatureAuthenticator{
 		KeyDerivation: testLadder(),
 		Keys:          []apiserver.HTTPSignatureKey{serverKey, second},
 	})
@@ -1145,7 +1177,7 @@ func TestLadderShapeIsArbitrary(t *testing.T) {
 			if err := os.WriteFile(secretFile, []byte(secret), 0600); err != nil {
 				t.Fatal(err)
 			}
-			auth, err := New(&apiserver.HTTPSignatureAuthenticator{
+			auth, err := newKeyAuthenticator(apiserver.HTTPSignatureAuthenticator{
 				KeyDerivation: tc.ladder,
 				Keys: []apiserver.HTTPSignatureKey{{
 					KeyID:      testKeyID,

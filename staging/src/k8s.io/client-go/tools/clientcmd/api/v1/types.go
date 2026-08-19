@@ -304,7 +304,13 @@ type HTTPSignatureConfig struct {
 	// rsa-pss-sha512, rsa-v1_5-sha256, or hmac-sha256. Required, and never
 	// inferred from the key, so that a key cannot be used under an algorithm
 	// its holder did not intend.
-	Algorithm string `json:"algorithm"`
+	//
+	// It must be empty with CertFile or CredentialBundleFile. A certificate's
+	// key type determines the algorithm on both sides, so there is no other
+	// algorithm the verifier would accept and nothing for a stated one to
+	// disagree with.
+	// +optional
+	Algorithm string `json:"algorithm,omitempty"`
 
 	// KeyFile is the path to a PEM-encoded private key, for a key that is
 	// simply present on disk. Exactly one of KeyFile or CredentialFile is
@@ -312,8 +318,41 @@ type HTTPSignatureConfig struct {
 	// +optional
 	KeyFile string `json:"keyFile,omitempty"`
 
+	// CertFile is the path to a PEM-encoded X.509 certificate whose key is in
+	// KeyFile. Setting it makes the certificate the assertion of who the client
+	// is: the server validates it against its own trust anchors and derives the
+	// identity from it, rather than looking the key ID up in its configuration.
+	//
+	// This is mutual TLS with the handshake replaced by a message signature, so
+	// the certificate, its issuance, and its subject conventions are the ones
+	// already in use. Unlike mutual TLS, the authentication is in the message and
+	// survives a TLS-terminating hop.
+	//
+	// KeyID and Algorithm must not be set with it. The key ID is the
+	// certificate's digest and the algorithm follows from its key type, so
+	// stating either would be a second copy of a value with one correct answer.
+	//
+	// Both files are re-read when either changes, and a key that does not match
+	// the certificate is rejected rather than used, because that is what reading
+	// two separately written files mid-rotation produces. Prefer
+	// CredentialBundleFile where it is available, which cannot produce that case.
+	// +optional
+	CertFile string `json:"certFile,omitempty"`
+
+	// CredentialBundleFile is the path to one PEM document whose first block is
+	// a private key and whose remaining blocks are the issued certificate chain,
+	// leaf first. This is what a pod certificate projected volume writes.
+	//
+	// It carries the same assertion as CertFile with KeyFile, and it is the
+	// better form wherever it is available: one read returns a consistent key and
+	// certificate, where two files can be read between the two writes of a
+	// rotation.
+	// +optional
+	CredentialBundleFile string `json:"credentialBundleFile,omitempty"`
+
 	// KeyID is the name the server knows the key by. Required with KeyFile, and
-	// invalid with CredentialFile, where the key ID rotates with the key.
+	// invalid with CredentialFile, where the key ID rotates with the key, and
+	// with a certificate, where it is the certificate's digest.
 	// +optional
 	KeyID string `json:"keyID,omitempty"`
 

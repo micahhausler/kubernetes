@@ -1,8 +1,19 @@
 # HTTP message signature authentication on kind
 
-A two-key demo: one shared HMAC secret, one ECDSA P-384 keypair, both delivered
-by the same credential plugin, both verified by the API server, each mapping to a
-different identity. The check at the end is a self subject access review.
+A demo of both ways the API server resolves a signature to an identity.
+
+Two configured keys, a shared HMAC secret and an ECDSA P-384 keypair, delivered by
+the same credential plugin. For these the server holds a key and an identity per
+client, stated in its configuration.
+
+One X.509 certificate, delivered as a certificate and key pair and again as a single
+credential bundle. For this the server holds a certificate authority and nothing per
+client: the identity comes from the certificate the request carries. A fourth
+credential, issued by an authority the server was never given, is there to show what
+that trust boundary is worth.
+
+Which way a signature is resolved is decided by its `keyid`, which every signature
+covers. The check at the end is a self subject access review.
 
 ## What has to be built
 
@@ -35,19 +46,28 @@ and `HTTPSIG_CLUSTER` or `HTTPSIG_NODE_IMAGE` overrides either.
 
 A released kubectl will not work either, and that fails quietly rather than
 loudly: kubeconfig parsing ignores unknown fields, so it drops the
-`httpSignature` block and sends unauthenticated requests. If both keys come back
-unauthorized, suspect the binary before the cluster.
+`httpSignature` block and sends unauthenticated requests. If every credential comes
+back unauthorized, suspect the binary before the cluster.
 
 ## Running it
 
 ```
 ./up.sh          # fixtures, cluster, kubeconfig, RBAC
-./test.sh        # both keys: whoami, access review, tampered key
+./test.sh        # every credential: whoami, access review, and the negative case
 kind delete cluster --name "$(./env.sh cluster)"
 ```
 
-`up.sh` is safe to rerun. It reuses an existing cluster and leaves existing keys
-alone, so the API server's configuration and the client's keys cannot drift.
+`up.sh` is safe to rerun. It reuses an existing cluster and leaves existing keys and
+certificates alone, so the API server's configuration and the client's material
+cannot drift.
+
+`gen-fixtures.sh` and `write-kubeconfig.sh` validate what they write, using the
+API server's own validation and client-go's own kubeconfig loader. Both failure modes
+they catch are otherwise mute: a configuration the server refuses appears as a
+connection refused twenty seconds into `up.sh`, from an API server whose complaint is
+inside a container that no longer exists, and a kubeconfig with a typo in the
+`httpSignature` block is accepted with the block dropped, sending unauthenticated
+requests instead.
 
 ## The pieces
 
@@ -55,10 +75,28 @@ alone, so the API server's configuration and the client's keys cannot drift.
 | --- | --- |
 | `cmd/httpsig-demo` | The demo tool: credential plugin, key broker, and the ladder |
 | `env.sh` | The cluster name and node image tag, derived from the branch, and the one source every script reads them from |
-| `gen-fixtures.sh` | Builds the tool, generates the keys, derives the server's key, writes the authentication configuration |
+| `gen-fixtures.sh` | Builds the tool, generates the keys and certificates, derives the server's key, writes and validates the authentication configuration |
 | `kind.yaml` | Cluster: the feature gate, the configuration file, and the mount. `up.sh` renders it into `fixtures/` with the names from `env.sh` |
-| `write-kubeconfig.sh` | The kubeconfig, one user per key |
+| `write-kubeconfig.sh` | The kubeconfig, one user per credential, validated |
+| `internal/configcheck` | The validation both generators run against what they wrote, and against `../examples` |
 | `up.sh` / `test.sh` | Bring up, then check |
+
+## What the layout is claiming
+
+The directory split is the trust boundary rather than filing, and `test.sh` asserts
+it before it sends a request:
+
+| Under `fixtures/node/`, mounted into the API server | Under `fixtures/client/`, never mounted |
+| --- | --- |
+| the HMAC key folded through the date step | the root HMAC secret |
+| the demo certificate authority's certificate | the certificate authority's private key |
+| the authentication configuration | the ECDSA private key, and the certificate and its key |
+
+Two properties fall out of that. A shared secret normally lets the verifier mint
+signatures indistinguishable from the client's; here it can do so only for the one
+UTC day its rung names. And the API server's configuration names no certificate
+client at all, which is what the certificate flow is for: the identity arrives with
+the request.
 
 `httpsig-demo` has three subcommands because they share a definition that has to
 agree:
@@ -100,7 +138,7 @@ defect rather than a fact of life.
 
 ## What the demo actually demonstrates
 
-One plugin serves both keys. It is told the algorithm in
+One plugin serves both configured keys. The certificate contexts use no plugin: their material is named in the kubeconfig, and the key ID and algorithm come from the certificate. It is told the algorithm in
 `spec.httpSignature.algorithm` and answers with material of that kind, so the
 kubeconfig never names which key it holds. The kubeconfig carries the algorithm
 and the TTL, which do not rotate; the key and the key ID come from the plugin on
@@ -145,7 +183,7 @@ makes the first two mean anything:
 ## When it does not work
 
 These exact fixtures and this plugin were run against an in-process API server
-before the cluster existed, and both keys authenticated. So a failure here is
+before the cluster existed, and every credential authenticated. So a failure here is
 most likely in the kind plumbing rather than in the fixtures or the protocol.
 The in-tree integration tests cover the protocol:
 
@@ -156,10 +194,11 @@ go test ./test/integration/apiserver/httpsig/
 If those pass, look at the API server:
 
 ```
-docker exec httpsig-control-plane \
+node="$(./env.sh cluster)-control-plane"
+docker exec "$node" \
   grep -e authentication-config -e feature-gates /etc/kubernetes/manifests/kube-apiserver.yaml
-docker exec httpsig-control-plane ls -l /httpsig
-kubectl --kubeconfig fixtures/admin.kubeconfig -n kube-system logs kube-apiserver-httpsig-control-plane
+docker exec "$node" ls -l /httpsig
+kubectl --kubeconfig fixtures/admin.kubeconfig -n kube-system logs "kube-apiserver-$node"
 ```
 
 The API server reads `secretFile` while validating its configuration, so a broken

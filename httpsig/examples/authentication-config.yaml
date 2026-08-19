@@ -1,0 +1,162 @@
+# An HTTP message signature authenticator, both ways of resolving a signature to an
+# identity. Pass this to kube-apiserver as --authentication-config, with
+# --feature-gates=HTTPSignatureAuthentication=true.
+#
+# This file is validated on every run of the httpsig test suite, using the same
+# decode and validation kube-apiserver performs at startup. It is a reference to
+# copy from rather than a file to deploy: the key material in it is inert, as noted
+# where it appears.
+apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+httpSignature:
+  # The external authority and scheme clients sign, for a server behind a
+  # TLS-terminating proxy that rewrites Host. Omit both when clients reach the API
+  # server directly, which is when the connection's own values are correct.
+  #
+  # These sit on the section rather than on an authenticator because a request's
+  # signatures are parsed once, before any authenticator has been selected. The
+  # Forwarded and X-Forwarded-* fields are never consulted: they are unsigned input,
+  # and the point of signing @authority is that a signature cannot be replayed
+  # against a different server.
+  #
+  # authority: kubernetes.example.com
+  # scheme: https
+
+  authenticators:
+
+  # Resolution by configured key. The server holds a key and an identity per client,
+  # so adding a client means editing this file, and withdrawing one means editing it
+  # and waiting for the reload. That does not scale past a handful of identities,
+  # which is what the certificate authenticator below is for.
+  - name: operator-keys
+    # How old a signature may be, measured from its created parameter. This is the
+    # replay window: a captured request can be resent until it ages out. Shorter is
+    # safer and less tolerant of client clock drift, which no other authentication
+    # mode in Kubernetes depends on.
+    maxAge: 1m
+    # Added to time comparisons for clock skew, and widens the replay window by the
+    # same amount. Omit it unless skew is a demonstrated problem.
+    # tolerance: 5s
+    keys:
+    # The keyid a signature carries. Must not begin with "x509-sha256:", which is
+    # reserved for signatures whose key is asserted by a certificate.
+    - keyID: release-automation
+      # Named as in the IANA "HTTP Signature Algorithms" registry. A signature whose
+      # alg parameter disagrees is rejected, which closes algorithm confusion in the
+      # wire format rather than in documentation.
+      algorithm: ed25519
+      # Inline because a public key is not a secret. A shared secret is the opposite
+      # case and is referenced by path instead, with secretFile; prefer asymmetric
+      # keys, because a shared secret lets this server produce signatures
+      # indistinguishable from the client's.
+      #
+      # The private half of this key was destroyed when it was generated. It is here
+      # to show the encoding, and it authenticates nobody.
+      publicKey: |
+        -----BEGIN PUBLIC KEY-----
+        MCowBQYDK2VwAyEAWTK9UfWn1t7e1S8awW1gNaTnewqieLjxaDJNG3/lods=
+        -----END PUBLIC KEY-----
+      # Used as given. This server adds no prefix, so avoiding collision with the
+      # names other authenticators issue is the administrator's to own.
+      user:
+        username: release-automation
+        groups:
+        - release-automation
+
+  # Resolution by certificate. The server holds the authority below and nothing per
+  # client: the identity comes from the certificate the request carries. Adding a
+  # client is issuing a certificate, and a certificate's lifetime is the withdrawal
+  # window, because there is no per-client state here to delete.
+  #
+  # This is mutual TLS with the handshake replaced by a message signature. The same
+  # authority, the same issuance, and the same subject conventions apply; only the
+  # point of authentication moves into the message, which is what lets it survive a
+  # TLS-terminating hop.
+  - name: workload-certificates
+    maxAge: 1m
+    x509:
+      # Issue an authority for this purpose and put only that one here.
+      #
+      # Extended key usage is not checked, so this bundle is the only thing saying
+      # who is enlisted. No registered usage means "may sign detached HTTP
+      # messages": requiring clientAuth would make every certificate issued for
+      # connection authentication a signing credential, and requiring a new usage
+      # would mean reissuing for everyone.
+      #
+      # The failure to avoid: putting an organization's general-purpose internal
+      # authority here, because that is the authority to hand. Every certificate it
+      # has ever issued then authenticates to this API server, and with the mapping
+      # below, whoever can request one chooses the identity they get.
+      #
+      # The private key of this example authority was destroyed when it was
+      # generated. It can issue nothing.
+      certificateAuthority: |
+        -----BEGIN CERTIFICATE-----
+        MIIBuDCCAV2gAwIBAgIUDdoSV3eINMqiAGTtL0gyi9zgCmwwCgYIKoZIzj0EAwIw
+        KTEnMCUGA1UEAwweZXhhbXBsZS1hdXRob3JpdHktZG8tbm90LXRydXN0MB4XDTI2
+        MDgxOTE4NDYwMVoXDTM2MDgxNjE4NDYwMVowKTEnMCUGA1UEAwweZXhhbXBsZS1h
+        dXRob3JpdHktZG8tbm90LXRydXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE
+        G85ujx1gMLkg69exKVFR8BIqv9+Ob4tmvXMllNCoKBFTmoihUanWdSQly/H5JO66
+        VAGKNj3N1plaL1GsmJmDiqNjMGEwHQYDVR0OBBYEFJlL2DyESsU2JU3X0vFM16Nh
+        5rZGMB8GA1UdIwQYMBaAFJlL2DyESsU2JU3X0vFM16Nh5rZGMA8GA1UdEwEB/wQF
+        MAMBAf8wDgYDVR0PAQH/BAQDAgKEMAoGCCqGSM49BAMCA0kAMEYCIQDH1eAL0/O9
+        Y7b7iGV2Xv84jcG9W8BZ7R+g3jroRvjf/QIhAI/ch/8OQT1ZYdKjFPLvR8xfHxy0
+        BWl9QP4k28JU+IWm
+        -----END CERTIFICATE-----
+      certificateCache:
+        # How long a successful validation is trusted, which is also the window in
+        # which withdrawing a certificate has no effect. Clamped internally to the
+        # remaining life of every certificate in the validated chain, so this can
+        # never outlive the authority that vouched for it.
+        ttl: 5m
+        # Validated certificates remembered at once. Entries are created only on
+        # success, so occupying one requires a certificate this authority issued.
+        maxEntries: 1024
+
+    # Run before claimMappings, so a mapping never reads a certificate no rule has
+    # vetted.
+    certificateValidationRules:
+    # A certificate's lifetime is the withdrawal window, and this is the only lever
+    # the verifier has over it. There is no dedicated field for this because
+    # subtracting the validity bounds is the general form.
+    - expression: cert.notAfter - cert.notBefore <= duration('24h')
+      message: 'certificate lifetime must not exceed 24 hours'
+
+    # Where the identity comes from. Available on the cert variable: subject and
+    # issuer, each with commonName, organization and organizationalUnit;
+    # serialNumber; notBefore and notAfter; dnsSANs, uriSANs, emailSANs and ipSANs;
+    # sha256Thumbprint; and extendedKeyUsages.
+    #
+    # Test a multi-valued attribute with exists() and never by position. A
+    # multi-valued name attribute is an ASN.1 SET, canonically ordered by encoding,
+    # so the order the issuer supplied is not the order read back.
+    claimMappings:
+      # A URI SAN is where workload identity schemes put their identifier, which
+      # makes it the field that interoperates. A literal prefix keeps these names
+      # from colliding with those another authenticator issues.
+      username:
+        expression: '"spiffe:" + cert.uriSANs[0]'
+      groups:
+        expression: cert.subject.organization
+      # The digest the signature's keyid carries, so the identity names one exact
+      # certificate rather than anything its issuer could reuse.
+      uid:
+        expression: cert.sha256Thumbprint
+      extra:
+      - key: httpsig.example.com/issuer
+        valueExpression: cert.issuer.commonName
+
+    # What an assertion claims is a claim, not a conclusion. These rules are the
+    # cluster's only say over what the authority above may mint.
+    #
+    # Keep this rule unless the deployment means otherwise. The groups mapping
+    # derives from the certificate's subject, which hands the choice of group to
+    # whoever can request a certificate: without this, a requester naming
+    # system:masters in their organization receives cluster administrator.
+    #
+    # Relaxing it is a deliberate decision. Mapping a node's certificate to
+    # system:node:<name> means the node authorizer and the NodeRestriction admission
+    # plugin now trust this authority.
+    userValidationRules:
+    - expression: '!user.username.startsWith("system:") && !user.groups.exists(g, g.startsWith("system:"))'
+      message: 'this authenticator may not assert an identity under the system: prefix'

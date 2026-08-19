@@ -276,6 +276,22 @@ func validateAuthInfo(authInfoName string, authInfo clientcmdapi.AuthInfo) []err
 	}
 	if authInfo.HTTPSignature != nil {
 		methods = append(methods, "httpSignature")
+		// A client certificate is a credential that transits, and a signature is
+		// one that does not. Presenting both leaves the server to authenticate
+		// whichever its authenticator chain reaches first, so the resulting
+		// identity would depend on server ordering rather than on this file.
+		//
+		// This is stated here rather than by adding clientCert to the methods
+		// list above, because that list has never included client certificates
+		// and widening it would newly reject configurations that combine a
+		// certificate with a token. Under httpSignature the certificate and key
+		// belong under httpSignature.certFile and httpSignature.keyFile, where
+		// they are signing material rather than TLS material.
+		if len(authInfo.ClientCertificate) != 0 || len(authInfo.ClientCertificateData) != 0 {
+			validationErrors = append(validationErrors, fmt.Errorf(
+				"client-cert cannot be provided in combination with httpSignature for %v; "+
+					"to sign with that certificate set httpSignature.certFile and httpSignature.keyFile instead", authInfoName))
+		}
 	}
 
 	if len(authInfo.ClientCertificate) != 0 || len(authInfo.ClientCertificateData) != 0 {
@@ -372,7 +388,35 @@ func validateHTTPSignature(authInfoName string, authInfo clientcmdapi.AuthInfo) 
 	if len(sig.APIVersion) == 0 {
 		validationErrors = append(validationErrors, fmt.Errorf("apiVersion must be specified for %v to use httpSignature authentication", authInfoName))
 	}
-	if len(sig.Algorithm) == 0 {
+
+	// A certificate asserts who the client is, so the key ID and the algorithm
+	// both follow from it and neither may be stated. Elsewhere the algorithm is
+	// required and never inferred, so that a key cannot be used under an
+	// algorithm its holder did not intend; a certificate's key type leaves only
+	// one algorithm the server would accept, so there is nothing to infer wrongly.
+	assertsCertificate := len(sig.CertFile) != 0 || len(sig.CredentialBundleFile) != 0
+	if assertsCertificate {
+		if len(sig.Algorithm) != 0 {
+			validationErrors = append(validationErrors, fmt.Errorf(
+				"algorithm must not be specified for %v alongside certFile or credentialBundleFile, because the certificate's key type determines it", authInfoName))
+		}
+		if len(sig.KeyID) != 0 {
+			validationErrors = append(validationErrors, fmt.Errorf(
+				"keyID must not be specified for %v alongside certFile or credentialBundleFile, because it is the certificate's digest", authInfoName))
+		}
+		if len(sig.CertFile) != 0 && len(sig.CredentialBundleFile) != 0 {
+			validationErrors = append(validationErrors, fmt.Errorf(
+				"certFile and credentialBundleFile are alternatives for %v: a bundle already holds the certificate", authInfoName))
+		}
+		if len(sig.CredentialFile) != 0 {
+			validationErrors = append(validationErrors, fmt.Errorf(
+				"credentialFile cannot be combined with a certificate for %v: the certificate is the credential", authInfoName))
+		}
+		if len(sig.SignedHeaders) > 0 {
+			validationErrors = append(validationErrors, fmt.Errorf(
+				"signedHeaders requires credentialFile or exec for %v, because header values come from a credential", authInfoName))
+		}
+	} else if len(sig.Algorithm) == 0 {
 		validationErrors = append(validationErrors, fmt.Errorf("algorithm must be specified for %v to use httpSignature authentication", authInfoName))
 	}
 
@@ -380,19 +424,42 @@ func validateHTTPSignature(authInfoName string, authInfo clientcmdapi.AuthInfo) 
 	// derivation, the covered headers, and the lifetime. What rotates comes from
 	// a credential source, and an exec plugin is one of them, so this stanza
 	// appears alongside exec rather than in conflict with it.
+	//
+	// certFile is not a source of its own: it names the certificate that vouches
+	// for the key in keyFile, so the pair is one source. credentialBundleFile is
+	// one source holding both halves.
 	sources := 0
-	for _, set := range []bool{len(sig.KeyFile) != 0, len(sig.CredentialFile) != 0, authInfo.Exec != nil} {
+	for _, set := range []bool{
+		len(sig.KeyFile) != 0,
+		len(sig.CredentialFile) != 0,
+		len(sig.CredentialBundleFile) != 0,
+		authInfo.Exec != nil,
+	} {
 		if set {
 			sources++
 		}
 	}
 	if sources != 1 {
-		validationErrors = append(validationErrors, fmt.Errorf("exactly one credential source must be specified for %v to use httpSignature authentication: keyFile, credentialFile, or exec", authInfoName))
+		validationErrors = append(validationErrors, fmt.Errorf(
+			"exactly one credential source must be specified for %v to use httpSignature authentication: "+
+				"keyFile, keyFile with certFile, credentialFile, credentialBundleFile, or exec", authInfoName))
+	}
+	if len(sig.CertFile) != 0 {
+		if len(sig.KeyFile) == 0 {
+			validationErrors = append(validationErrors, fmt.Errorf("keyFile must be specified alongside certFile for %v, because a certificate carries no private key", authInfoName))
+		}
+		validationErrors = append(validationErrors, validateReadableFile("certFile", sig.CertFile, authInfoName)...)
+	}
+	if len(sig.CredentialBundleFile) != 0 {
+		if len(sig.KeyFile) != 0 {
+			validationErrors = append(validationErrors, fmt.Errorf("keyFile must not be specified alongside credentialBundleFile for %v, because the bundle holds the key", authInfoName))
+		}
+		validationErrors = append(validationErrors, validateReadableFile("credentialBundleFile", sig.CredentialBundleFile, authInfoName)...)
 	}
 	// A key file carries a key and nothing else. Anything that rotates, and any
 	// header value, has to come from a credential.
 	rotates := len(sig.CredentialFile) != 0 || authInfo.Exec != nil
-	if len(sig.KeyFile) != 0 {
+	if len(sig.KeyFile) != 0 && !assertsCertificate {
 		if len(sig.KeyID) == 0 {
 			validationErrors = append(validationErrors, fmt.Errorf("keyID must be specified alongside keyFile for %v", authInfoName))
 		}

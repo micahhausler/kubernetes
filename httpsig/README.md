@@ -102,51 +102,127 @@ kube-apiserver reads its verification keys from `AuthenticationConfiguration`, t
 already configures JWT and anonymous authentication. The `httpSignature` section is new and sits
 behind the `HTTPSignatureAuthentication` alpha feature gate.
 
+A complete, commented reference covering both ways of resolving a signature is in
+[`examples/authentication-config.yaml`](examples/authentication-config.yaml). It is validated on
+every test run with the same decode and validation kube-apiserver performs at startup, so it is a
+file to copy from rather than a snippet to retype. The key material in it is inert: both private
+keys were destroyed when they were generated.
+
+The trimmed versions below are for reading.
+
 The PoC's demo configuration, trimmed to one asymmetric key:
 
 ```yaml
 apiVersion: apiserver.config.k8s.io/v1
 kind: AuthenticationConfiguration
 httpSignature:
-  # Checked against the created timestamp in the signature, so a captured
-  # request can be replayed only until it ages out of this window.
-  maxAge: 1m
-  keys:
-  - keyID: demo-ecdsa-p384
-    algorithm: ecdsa-p384-sha384
-    publicKey: |
-      -----BEGIN PUBLIC KEY-----
-      MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEXM4XBQ2KMgl9J+F2v3eyB5J8uEsQ+tpg
-      ...
-      -----END PUBLIC KEY-----
-    user:
-      username: ecdsa-demo
-      groups:
-      - httpsig-demo
+  authenticators:
+  - name: demo-keys
+    # Checked against the created timestamp in the signature, so a captured
+    # request can be replayed only until it ages out of this window.
+    maxAge: 1m
+    keys:
+    - keyID: demo-ecdsa-p384
+      algorithm: ecdsa-p384-sha384
+      publicKey: |
+        -----BEGIN PUBLIC KEY-----
+        MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEXM4XBQ2KMgl9J+F2v3eyB5J8uEsQ+tpg
+        ...
+        -----END PUBLIC KEY-----
+      user:
+        username: ecdsa-demo
+        groups:
+        - httpsig-demo
 ```
 
 A key entry names the algorithm, the public key, and the identity that a request signed by that key
 authenticates as. A shared secret is referenced by file path instead, because a public key is not a
 secret and a shared secret is.
 
+## Identity from a certificate instead
+
+The key list above puts an identity per client in server configuration. The alternative is for the
+client to carry an X.509 certificate and for the server to hold only the authority that issued it:
+
+```yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+httpSignature:
+  authenticators:
+  - name: workload-certificates
+    x509:
+      # Issue an authority for this purpose. Pointing this at the cluster's
+      # client CA would let every certificate already issued for connection
+      # authentication sign detached messages, which its issuer never agreed to.
+      certificateAuthority: |
+        -----BEGIN CERTIFICATE-----
+        ...
+        -----END CERTIFICATE-----
+    # Rules run before the mappings, so a mapping never reads a certificate no
+    # rule has vetted.
+    certificateValidationRules:
+    - expression: cert.notAfter - cert.notBefore <= duration('24h')
+      message: certificate lifetime must not exceed 24 hours
+    claimMappings:
+      username:
+        expression: '"cert:" + cert.uriSANs[0]'
+      groups:
+        expression: cert.subject.organization
+    # The mapping above derives groups from the certificate's subject, which hands
+    # the choice of group to whoever can request one. Without this rule a requester
+    # naming system:masters in their organization would receive cluster administrator.
+    userValidationRules:
+    - expression: '!user.username.startsWith("system:") && !user.groups.exists(g, g.startsWith("system:"))'
+      message: 'this authenticator may not assert an identity under the system: prefix'
+```
+
+The client side states the certificate and its key, and nothing else:
+
+```yaml
+users:
+- name: workload
+  user:
+    httpSignature:
+      apiVersion: client.authentication.k8s.io/v1alpha1
+      certFile: /var/run/secrets/workload/tls.crt
+      keyFile:  /var/run/secrets/workload/tls.key
+      # No algorithm and no keyID. The certificate's key type determines the
+      # algorithm, and the key ID is the certificate's digest.
+```
+
+For a pod there is a one-file form, `credentialBundleFile`, which is what a
+`PodCertificateProjection` writes: one read returns a consistent key and certificate, where two
+files can be read between the two writes of a rotation.
+
+This is mutual TLS with the handshake replaced by a message signature. The same authority, the same
+issuance, and the same subject conventions apply; only the point of authentication moves into the
+message, which is what lets it survive a TLS-terminating hop.
+
+What binds the certificate to the signature is the `keyid`, which must be `x509-sha256:` followed by
+the leaf's digest. A signature's parameters are always part of its signature base, so a `keyid`
+naming the certificate is covered by every signature that carries one. The server recomputes the
+digest from the bytes it received rather than trusting the claim.
+
 ## What is not solved
 
-**Key lookup.** The static key list above is a stand-in so the rest can be demonstrated. It does not
-scale past a handful of identities. It has no revocation short of editing a file on every control
-plane node. And it puts human identities in server configuration.
+**Revocation, for a certificate.** The server holds nothing per client, which is the point, so there
+is nothing to delete. A certificate's lifetime is the window, narrowed by the validation cache's TTL
+and by whatever lifetime rule the configuration states. For pods, kube-apiserver caps issuance.
 
-Getting a credential to the client has a real answer here. Getting verification material to the
-server does not. Everything unsolved sits on one side.
+**Replay, for a certificate.** Nonces are remembered per configured key, and a certificate is not a
+configured key, so `maxAge` alone bounds replay there. The nonce parameter is on the wire and is
+deliberately not recorded, so enforcement can begin later without breaking existing clients. The
+bound needs a design rather than a constant: a bucket keyed on the trust anchor would put every
+client under one authority into one shared, peer-driven cache, which is the arrangement that turns
+replay tracking into a replay enabling mechanism.
 
-Two directions could replace the list, and `DECISIONS.md` section 6 works through both:
-
-- **An X.509 certificate as a user assertion.** The client sends a certificate alongside the
-  signature. The server validates it against a CA and reads the identity from the subject. This is
-  mTLS with the handshake replaced by a message signature, and for pods most of the delivery
-  machinery already exists in tree.
-- **An external lookup API.** The verifier asks a key distribution service what key verifies a given
-  key ID and who it belongs to, then checks the signature locally. Only the lookup is remote, and
-  its answer is cacheable because a key is stable where a token is not.
+**Key lookup, in general.** The static key list does not scale past a handful of identities and has
+no revocation short of editing a file on every control plane node. A certificate answers that for
+clients that can be issued one. For those that cannot, the remaining direction is an external lookup
+API: the verifier asks a key distribution service what key verifies a given key ID and who it
+belongs to, then checks the signature locally. Only the lookup is remote, and its answer is
+cacheable because a key is stable where a token is not. Key resolution is an interface, so that is a
+third implementation rather than a rewrite. `DECISIONS.md` section 6 works through it.
 
 ## Status
 

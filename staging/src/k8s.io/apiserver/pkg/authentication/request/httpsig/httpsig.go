@@ -34,140 +34,185 @@ limitations under the License.
 // intermediary can append Impersonate-User to a signed request that carried no
 // impersonation and the signature still verifies. Checking presence against the
 // covered set is the only defense against that.
+//
+// # Resolving a signature to an identity
+//
+// Everything above is about checking a signature. Deciding whose signature it is
+// is a separate question, and it has more than one answer, so it sits behind the
+// resolver seam rather than inline. A resolver takes a signature and returns a
+// verifier plus a way to name the signer.
+//
+// Two are built in. The keys resolver states both halves in configuration. The
+// certificate resolver takes both from an X.509 certificate the request carries,
+// which the configured trust anchors have to validate. The difference that matters
+// is what the server has to hold: every key, versus a certificate authority
+// bundle and nothing per client.
+//
+// Which resolver handles a signature is decided by its keyid, never by whether an
+// unsigned header happens to be present. A signature's parameters are always the
+// last line of its signature base, so a keyid is covered by every signature that
+// carries one. That is also what binds a certificate to the signature made with
+// it, and it is why the certificate header's own coverage is belt and braces
+// rather than the mechanism.
 package httpsig
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/base64"
-	"encoding/pem"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/micahhausler/httpsig"
 
-	"github.com/micahhausler/httpsig/keyscope"
 	"k8s.io/apiserver/pkg/apis/apiserver"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
-	"k8s.io/apiserver/pkg/authentication/user"
+	authenticationcel "k8s.io/apiserver/pkg/authentication/cel"
 
 	transporthttpsig "k8s.io/client-go/transport/httpsig"
 	"k8s.io/klog/v2"
 )
 
 const (
-	// defaultMaxAge bounds signature age when configuration does not. It is also
-	// the only bound on replay: replay protection is unimplemented, so a
-	// captured request can be resent until it ages out.
+	// defaultMaxAge bounds signature age when configuration does not. It also
+	// bounds replay: a captured request can be resent until it ages out.
 	defaultMaxAge = 5 * time.Minute
 
 	// maxBodyBytes caps the body read to check a Content-Digest. It matches the
 	// API server's default request body limit, so a request this verifier
 	// rejects for size is one the server would have rejected anyway.
 	maxBodyBytes = int64(3 * 1024 * 1024)
+
+	// maxSignatures caps how many signatures on one request are considered.
+	//
+	// A request may legitimately carry more than one, which is what the tag
+	// parameter exists to disambiguate, but the count is chosen by the sender and
+	// each one costs a signature base and possibly a signature verification. The
+	// signing library imposes no bound of its own. Four is well past any use this
+	// verifier has: a client produces one, and an intermediary annotating a request
+	// produces one more.
+	maxSignatures = 4
 )
 
 // errNoSignature reports a request carrying no signature at all. The union
 // authenticator moves on, so this never reaches a client.
 var errNoSignature = errors.New("request carries no HTTP message signature")
 
-// key is one configured verification key and the identity it authenticates.
-type key struct {
-	// verifier is set for keys that verify the same way on every request. For a
-	// derived key it is nil and a verifier is built per request, because the
-	// derived key depends on the created timestamp the signature carries and
-	// on the scope the keyid claims.
+// A resolver decides whose signature a signature is: it produces a verifier to
+// check it with, and a way to name the signer once it has checked out.
+//
+// This is the seam a remote resolution scheme plugs into. It exists as an
+// interface rather than as branches through one function because a certificate
+// authority and a key broker differ only here, and everything around them, the
+// coverage rules, the digest check, the replay window, is the same either way.
+type resolver interface {
+	// name identifies this resolver in errors and metrics. It never appears on
+	// the wire.
+	name() string
+
+	// handles reports whether this resolver claims a signature, judged by its
+	// keyid alone. The keyid is covered by the signature, so this decision is
+	// made on signed input, and it is made before any work.
+	//
+	// More than one resolver may claim the same keyid, which is how several
+	// certificate authorities coexist: each is tried until one resolves.
+	handles(keyID string) bool
+
+	// resolve returns what is needed to check the signature and name its signer.
+	// It runs before the signature has been checked, so anything expensive
+	// belongs in the returned resolution's identify rather than here.
+	resolve(req *http.Request, sig *httpsig.Signature) (*resolution, error)
+}
+
+// A resolution is one resolver's answer for one signature.
+type resolution struct {
+	// verifier checks the signature.
 	verifier httpsig.Verifier
-	// scoped is set for a derived key: material bound to its position on the
-	// ladder, which derives a verifier per signature.
-	scoped *keyscope.Key
-	info   *user.DefaultInfo
+
+	// policy is the coverage, age, and skew policy the signature is held to.
+	policy httpsig.Policy
+
+	// identify names the signer. It runs only after the signature has verified,
+	// which is what lets a resolver put work here that an unauthenticated caller
+	// must not be able to cause: proof of possession comes first, trust second.
+	identify func(context.Context) (*authenticator.Response, error)
 }
 
 // Authenticator verifies HTTP message signatures on incoming requests.
 type Authenticator struct {
-	keys      map[string]*key
-	policy    httpsig.Policy
+	resolvers []resolver
 	parseOpts *httpsig.ParseOptions
 }
 
 var _ authenticator.Request = &Authenticator{}
 
-// New builds an Authenticator from configuration. Key material is parsed here,
-// so a malformed key fails at server start rather than on a request.
-func New(config *apiserver.HTTPSignatureAuthenticator) (*Authenticator, error) {
+// New builds an Authenticator from configuration. Key material, trust anchors,
+// and CEL expressions are all parsed and compiled here, so a malformed one fails
+// at server start rather than on a request.
+func New(config *apiserver.HTTPSignatureConfig, compiler authenticationcel.Compiler) (*Authenticator, error) {
 	if config == nil {
 		return nil, fmt.Errorf("httpsig: configuration is required")
 	}
-	maxAge := defaultMaxAge
-	if config.MaxAge != nil {
-		maxAge = config.MaxAge.Duration
+	if compiler == nil {
+		compiler = authenticationcel.NewDefaultCompiler()
 	}
-	var tolerance time.Duration
-	if config.Tolerance != nil {
-		tolerance = config.Tolerance.Duration
-	}
+	registerMetrics()
 
-	a := &Authenticator{
-		keys: make(map[string]*key, len(config.Keys)),
-		policy: httpsig.Policy{
-			// The floor is stated here, by this verifier, and not taken from
-			// the signature.
-			RequiredComponents: transporthttpsig.FloorComponents,
-			// A positive maximum age is also what makes the created parameter
-			// mandatory: the verifier rejects a signature it cannot age.
-			// Configuration cannot reach a non-positive value, because maxAge
-			// is either unset and defaulted above or validated as positive.
-			MaxAge:    maxAge,
-			Tolerance: tolerance,
-		},
-	}
+	a := &Authenticator{}
+	// Authority and scheme are read once, here, because they are consumed when a
+	// request's signatures are parsed, before any resolver has been chosen. That
+	// is why they are configured for the server rather than per authenticator.
 	if config.Scheme != "" || config.Authority != "" {
 		a.parseOpts = &httpsig.ParseOptions{Scheme: config.Scheme, Authority: config.Authority}
 	}
 
-	for i, k := range config.Keys {
-		built, err := buildKey(k, config.KeyDerivation)
+	seen := map[string]bool{}
+	for i, c := range config.Authenticators {
+		if seen[c.Name] {
+			return nil, fmt.Errorf("httpsig: authenticators[%d]: duplicate name %q", i, c.Name)
+		}
+		seen[c.Name] = true
+
+		r, err := newResolver(c, compiler)
 		if err != nil {
-			return nil, fmt.Errorf("httpsig: keys[%d]: %w", i, err)
+			return nil, fmt.Errorf("httpsig: authenticators[%d] (%s): %w", i, c.Name, err)
 		}
-		if _, dup := a.keys[k.KeyID]; dup {
-			return nil, fmt.Errorf("httpsig: keys[%d]: duplicate keyID %q", i, k.KeyID)
-		}
-		built.info = &user.DefaultInfo{
-			Name:   k.User.Username,
-			UID:    k.User.UID,
-			Groups: k.User.Groups,
-		}
-		a.keys[k.KeyID] = built
+		a.resolvers = append(a.resolvers, r)
+	}
+	if len(a.resolvers) == 0 {
+		return nil, fmt.Errorf("httpsig: at least one authenticator is required for this authenticator to authenticate anything")
 	}
 	return a, nil
 }
 
-// verifierFor returns the verifier for one signature. A static key holds one; a
-// derived key builds one per request, checking the scope the keyid claims
-// against its own configuration first, so a request signed under the wrong
-// scope, whatever dimensions the ladder scopes by, is rejected with an error
-// naming the disagreeing step rather than a bare signature mismatch. The verifier never derives with its
-// own clock: it uses the created timestamp the signature carries, which is
-// covered by the signature and bounded by the maximum age policy.
-func (k *key) verifierFor(sig *httpsig.Signature) (httpsig.Verifier, error) {
-	if k.scoped == nil {
-		return k.verifier, nil
+// newResolver builds the one resolver an authenticator configuration names.
+func newResolver(c apiserver.HTTPSignatureAuthenticator, compiler authenticationcel.Compiler) (resolver, error) {
+	policy := httpsig.Policy{
+		// The floor is stated here, by this verifier, and not taken from the
+		// signature.
+		RequiredComponents: transporthttpsig.FloorComponents,
+		MaxAge:             defaultMaxAge,
 	}
-	created := sig.Created()
-	if created.IsZero() {
-		return nil, fmt.Errorf("the signature carries no created parameter, and this key's verification key is derived from it")
+	if c.MaxAge != nil {
+		policy.MaxAge = c.MaxAge.Duration
 	}
-	return k.scoped.Verifier(sig.KeyID(), created)
+	if c.Tolerance != nil {
+		policy.Tolerance = c.Tolerance.Duration
+	}
+
+	switch {
+	case c.X509 != nil && len(c.Keys) > 0:
+		return nil, fmt.Errorf("keys and x509 are alternatives: keys states an identity per key, x509 takes it from a certificate")
+	case c.X509 != nil:
+		return newCertificateResolver(c, policy, compiler)
+	case len(c.Keys) > 0:
+		return newKeyResolver(c, policy)
+	default:
+		return nil, fmt.Errorf("one of keys or x509 is required")
+	}
 }
 
 // AuthenticateRequest verifies the request's signatures. It returns no opinion
@@ -185,66 +230,122 @@ func (a *Authenticator) AuthenticateRequest(req *http.Request) (*authenticator.R
 	if err != nil {
 		return nil, false, fmt.Errorf("parsing HTTP message signature: %w", err)
 	}
+	if len(sigs) == 0 {
+		// The fields were present but held no signature. Still an error rather
+		// than no opinion: something set them, and silently ignoring that would
+		// let a malformed client look like an anonymous one.
+		return nil, false, errNoSignature
+	}
+	if len(sigs) > maxSignatures {
+		// Refused rather than truncated. Considering the first few would let a
+		// sender bury the signature they meant behind ones they did not, and the
+		// request would fail for a reason nothing explains.
+		return nil, false, fmt.Errorf("request carries %d signatures, more than the %d this server considers",
+			len(sigs), maxSignatures)
+	}
 
 	var errs []error
-	for _, sig := range sigs {
-		resp, err := a.authenticateSignature(req, sig)
-		if err != nil {
-			errs = append(errs, err)
-			continue
+	// Outcomes are buffered and recorded only if nothing authenticates the
+	// request. A signature is offered to every authenticator whose keyid form it
+	// matches, so with more than one certificate authenticator configured, a
+	// client's certificate chains to one and fails against the rest. Recording
+	// those attempts as they happen would make a correct configuration report a
+	// rejection on every request, which is a metric nobody could read.
+	var rejected []rejection
+	authenticated := false
+	defer func() {
+		if authenticated {
+			return
 		}
-		// The signature fields have served their purpose. Clearing them keeps
-		// anything downstream from treating them as credentials, the way the
-		// bearer token and front proxy authenticators clear theirs.
-		req.Header.Del("Signature")
-		req.Header.Del("Signature-Input")
-		return resp, true, nil
+		for _, r := range rejected {
+			recordOutcome(r.authenticator, r.outcome)
+		}
+	}()
+
+	for _, sig := range sigs {
+		for _, r := range a.resolvers {
+			// The keyid decides which resolvers even look at this signature, so
+			// a signature naming a key one resolver holds is never offered to
+			// another.
+			if !r.handles(sig.KeyID()) {
+				continue
+			}
+			resp, outcome, err := a.authenticateSignature(req, sig, r)
+			if err != nil {
+				rejected = append(rejected, rejection{r.name(), outcome})
+				errs = append(errs, fmt.Errorf("%s: %w", r.name(), err))
+				continue
+			}
+			authenticated = true
+			recordOutcome(r.name(), outcomeAuthenticated)
+			// The signature fields and the asserted certificate have served
+			// their purpose. Clearing them keeps anything downstream from
+			// treating them as credentials, the way the bearer token and front
+			// proxy authenticators clear theirs.
+			req.Header.Del("Signature")
+			req.Header.Del("Signature-Input")
+			req.Header.Del(transporthttpsig.CertificateHeader)
+			return resp, true, nil
+		}
 	}
 	if len(errs) == 0 {
-		errs = append(errs, errNoSignature)
+		// Signatures were present, but no authenticator claimed any of them. The
+		// keyids are named because the answer is nearly always that one is
+		// misspelled, or that the authenticator holding it is not configured on
+		// this server. Reporting this as "no signature" would send the reader
+		// looking at the client's signing code instead.
+		keyIDs := make([]string, 0, len(sigs))
+		for _, sig := range sigs {
+			keyIDs = append(keyIDs, fmt.Sprintf("%q", sig.KeyID()))
+		}
+		return nil, false, fmt.Errorf("no configured authenticator handles the keyid of any signature on this request: %s",
+			strings.Join(keyIDs, ", "))
 	}
 	return nil, false, fmt.Errorf("no valid HTTP message signature: %w", errors.Join(errs...))
 }
 
-func (a *Authenticator) authenticateSignature(req *http.Request, sig *httpsig.Signature) (*authenticator.Response, error) {
-	// KeyID is an unverified claim until Verify succeeds. It is used only to
-	// select a key, never to grant anything. A derived key's keyid carries its
-	// claimed scope after the name, joined by slashes, so the
-	// lookup falls back to the segment before the first slash; the claimed
-	// scope itself is checked by the key, not here.
-	keyID := sig.KeyID()
-	k, ok := a.keys[keyID]
-	if !ok {
-		if name, _, found := strings.Cut(keyID, "/"); found {
-			k, ok = a.keys[name]
-		}
-	}
-	if !ok {
-		return nil, fmt.Errorf("signature %q: unknown keyID", sig.Label())
-	}
+// rejection is one authenticator's refusal of one signature, held until the
+// request's fate is known.
+type rejection struct {
+	authenticator string
+	outcome       string
+}
 
-	verifier, err := k.verifierFor(sig)
+// authenticateSignature checks one signature against one resolver. It returns the
+// outcome alongside the error so the caller can decide whether the attempt is
+// worth recording: a failure against one of several certificate authenticators is
+// the ordinary case, not a signal.
+func (a *Authenticator) authenticateSignature(req *http.Request, sig *httpsig.Signature, r resolver) (*authenticator.Response, string, error) {
+	res, err := r.resolve(req, sig)
 	if err != nil {
-		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
+		return nil, outcomeUnresolved, fmt.Errorf("signature %q: %w", sig.Label(), err)
 	}
 
 	// Verify before anything that costs work: the signature base is built from
-	// headers alone, so an unauthenticated caller cannot make this server read
-	// a body.
-	if err := sig.Verify(verifier, a.policy); err != nil {
-		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
+	// headers alone, so an unauthenticated caller cannot make this server read a
+	// body, build a certificate chain, or evaluate an expression.
+	if err := sig.Verify(res.verifier, res.policy); err != nil {
+		return nil, outcomeBadSignature, fmt.Errorf("signature %q: %w", sig.Label(), err)
 	}
 
 	if err := checkProtectedHeaders(req, sig); err != nil {
-		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
+		return nil, outcomeUncoveredHeader, fmt.Errorf("signature %q: %w", sig.Label(), err)
 	}
 	if err := checkBodyDigest(req, sig); err != nil {
-		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
+		return nil, outcomeBadDigest, fmt.Errorf("signature %q: %w", sig.Label(), err)
+	}
+
+	// The resolver's own work, which it is only allowed to do for a caller that
+	// has proved possession of the key.
+	resp, err := res.identify(req.Context())
+	if err != nil {
+		return nil, outcomeRejectedIdentity, fmt.Errorf("signature %q: %w", sig.Label(), err)
 	}
 
 	klog.V(4).InfoS("Authenticated request by HTTP message signature",
-		"keyID", sig.KeyID(), "username", k.info.Name, "components", len(sig.Components()))
-	return &authenticator.Response{User: k.info}, nil
+		"authenticator", r.name(), "keyID", sig.KeyID(), "username", resp.User.GetName(),
+		"components", len(sig.Components()))
+	return resp, outcomeAuthenticated, nil
 }
 
 // checkProtectedHeaders rejects a request carrying a protected header the
@@ -329,132 +430,4 @@ func readBody(req *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("request body exceeds the %d byte limit for digest verification", maxBodyBytes)
 	}
 	return body, nil
-}
-
-// ValidateKey reports whether one configured key is usable. It is exported so
-// configuration validation can reject unusable key material, ladder documents,
-// and stages without repeating the rules, which live here and in the signing
-// library.
-func ValidateKey(k apiserver.HTTPSignatureKey, ladder *apiserver.HTTPSignatureKeyDerivation) error {
-	_, err := buildKey(k, ladder)
-	return err
-}
-
-// buildKey loads one configured key: parses its material, loads its ladder, and
-// validates its stage. Everything that can fail does so here, at server start,
-// rather than on a request.
-func buildKey(k apiserver.HTTPSignatureKey, ladder *apiserver.HTTPSignatureKeyDerivation) (*key, error) {
-	alg := httpsig.Algorithm(k.Algorithm)
-	if k.Algorithm == "" {
-		return nil, fmt.Errorf("algorithm is required")
-	}
-	if k.KeyID == "" {
-		return nil, fmt.Errorf("keyID is required")
-	}
-
-	if alg != httpsig.HMACSHA256 {
-		if k.SecretFile != "" {
-			return nil, fmt.Errorf("algorithm %s uses a public key, not secretFile", alg)
-		}
-		if ladder != nil && k.Stage != nil {
-			return nil, fmt.Errorf("stage names a position on a derivation ladder, which applies to hmac-sha256 only; an asymmetric key is not derived")
-		}
-		if k.Stage != nil {
-			return nil, fmt.Errorf("stage applies to hmac-sha256 only")
-		}
-		if k.PublicKey == "" {
-			return nil, fmt.Errorf("algorithm %s requires publicKey", alg)
-		}
-		pub, err := parsePublicKey(k.PublicKey)
-		if err != nil {
-			return nil, err
-		}
-		verifier, err := httpsig.NewVerifier(alg, pub)
-		if err != nil {
-			return nil, err
-		}
-		return &key{verifier: verifier}, nil
-	}
-
-	if k.PublicKey != "" {
-		return nil, fmt.Errorf("algorithm %s uses a shared secret, not publicKey", alg)
-	}
-	if k.SecretFile == "" {
-		return nil, fmt.Errorf("algorithm %s requires secretFile", alg)
-	}
-	if k.Stage != nil && ladder == nil {
-		return nil, fmt.Errorf("stage names a position on a ladder, so it requires httpSignature.keyDerivation")
-	}
-	raw, err := os.ReadFile(k.SecretFile)
-	if err != nil {
-		return nil, fmt.Errorf("reading secretFile: %w", err)
-	}
-	var material []byte
-	if k.Stage != nil && k.Stage.From != "" {
-		// An intermediate rung is raw hash output. The newline trim applied to
-		// a plain secret would corrupt a rung that ends in a newline byte, so a
-		// rung-holding secretFile holds base64. A root secret is a printable
-		// string even when a stage carries scope values, so it stays plain.
-		material, err = base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
-		if err != nil {
-			return nil, fmt.Errorf("secretFile must hold base64 when stage.from is set, because a derived rung is raw bytes: %w", err)
-		}
-	} else {
-		// A trailing newline is what an editor or `echo` leaves behind, and a
-		// secret that differs by one byte fails with no clue why.
-		material = bytes.TrimRight(raw, "\r\n")
-	}
-
-	if ladder == nil {
-		verifier, err := httpsig.NewVerifier(alg, material)
-		if err != nil {
-			return nil, err
-		}
-		return &key{verifier: verifier}, nil
-	}
-
-	derivation, digest, err := transporthttpsig.DerivationFrom(ladder)
-	if err != nil {
-		return nil, err
-	}
-	// The digest is the drift check: the client logs the same value for its
-	// copy, and a mismatch otherwise surfaces as a bare signature failure.
-	klog.V(2).InfoS("Loaded key derivation ladder", "keyID", k.KeyID, "sha256", digest)
-	var stage *transporthttpsig.Stage
-	if k.Stage != nil {
-		stage = &transporthttpsig.Stage{From: k.Stage.From, Scope: k.Stage.Scope}
-	}
-	// Binding the material to its position validates the stage, so a scope typo
-	// fails at server start rather than on a request.
-	scoped, err := keyscope.New(derivation, transporthttpsig.KeyscopeStage(k.KeyID, stage), material)
-	if err != nil {
-		return nil, err
-	}
-	return &key{scoped: scoped}, nil
-}
-
-// parsePublicKey reads a PEM-encoded public key. Both the SubjectPublicKeyInfo
-// and PKCS#1 encodings are accepted, which covers what openssl emits.
-func parsePublicKey(data string) (any, error) {
-	block, _ := pem.Decode([]byte(data))
-	if block == nil {
-		return nil, fmt.Errorf("publicKey holds no PEM block")
-	}
-	switch block.Type {
-	case "PUBLIC KEY":
-		pub, err := x509.ParsePKIXPublicKey(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("parsing publicKey: %w", err)
-		}
-		switch pub.(type) {
-		case *rsa.PublicKey, *ecdsa.PublicKey, ed25519.PublicKey:
-			return pub, nil
-		default:
-			return nil, fmt.Errorf("publicKey holds an unsupported key type %T", pub)
-		}
-	case "RSA PUBLIC KEY":
-		return x509.ParsePKCS1PublicKey(block.Bytes)
-	default:
-		return nil, fmt.Errorf("publicKey holds an unsupported PEM block %q", block.Type)
-	}
 }

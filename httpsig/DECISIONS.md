@@ -699,6 +699,261 @@ Three costs are real and recorded rather than solved:
   the old exclusivity check is stricter and simpler than what it replaced: exactly one credential
   source among `keyFile`, `credentialFile`, and `exec`.
 
+### D11: a certificate can be the assertion, and key resolution is an interface
+
+The static key list in D4 states a key and an identity per client. Q4 says why that
+does not survive a real deployment, and the prerequisite above says identity has to
+stop coming from configuration. This is the first answer to that: a client carries
+its leaf certificate, the server validates it against configured trust anchors, and
+CEL expressions map the certificate to an identity.
+
+What the server holds changes, and that is the whole point. With a key list it holds
+every public key and every shared secret, and withdrawing one means editing a file
+and restarting. With a certificate it holds a certificate authority bundle and
+nothing per client, and a certificate's lifetime is the withdrawal window.
+
+**Key resolution became an interface first**, which "the seam both paths need first"
+named as step one. A resolver takes a signature and returns a verifier plus a way to
+name the signer. The key list and the certificate bundle are two implementations, so
+a remote resolver (path B) is a third rather than a third branch through one
+function.
+
+#### The keyid is the binding, not header coverage
+
+D2 left open which coverage class the assertion header belongs to, and said the case
+for the protected class had to be made rather than assumed. The answer is that
+neither class is the mechanism.
+
+A signature's parameters are always the last line of its signature base. So `keyid`
+is covered by every signature that carries one, with no coverage rule involved.
+Requiring `keyid` to be `x509-sha256:` followed by the leaf's digest, and recomputing
+that digest from the bytes received, binds the certificate to the signature through a
+value already covered.
+
+Three things fall out of that:
+
+- The discriminator sits inside the signature base. Which kind of authenticator
+  handles a signature is stated by the signature, not inferred from whether an
+  unsigned header happens to be present. Configuration validation refuses a
+  configured key named with the prefix, so the two cannot collide.
+- A substituted certificate is refused by name. Without the digest comparison the
+  request still fails, because the signature has to verify against the key the
+  certificate names, but it fails as a bare signature mismatch. A test confirms
+  this by removing the check and observing exactly that error.
+- The header is still put in the protected class, which is belt and braces rather
+  than the mechanism. It costs a few kilobytes in each signature base and closes
+  reasoning nobody should have to redo.
+
+#### Verify before work does not actually invert
+
+The section this replaces said the rule inverts, because the verification key has to
+come from the certificate before there is anything to verify with. It does not,
+because reading a certificate splits in two:
+
+1. Recompute the leaf's digest and compare it to the keyid. One hash.
+2. Parse the leaf and take its public key. One parse, size bounded.
+3. Verify the signature. This proves the caller holds the leaf's private key, and
+   grants nothing: the certificate is still untrusted.
+4. Only then build the chain and evaluate the expressions.
+
+So an unauthenticated caller can cause one hash and one bounded parse. Everything
+expensive is behind proof of possession. Only the leaf is read from the request;
+intermediates come from configuration, so the chain build is against a fixed pool.
+
+#### Validation runs before mapping
+
+The prerequisite section observed that the JWT authenticator maps before it
+validates, and compensates with an AST walk for `email_verified`. This authenticator
+validates first, so it needs no such patch. `certificateValidationRules` run against
+the certificate, then `claimMappings` produce an identity, then `userValidationRules`
+run against that identity. What an assertion claims is a claim, not a conclusion, and
+the user rules are the cluster's only say over what a certificate authority may mint.
+
+#### The certificate is exposed as a declared type, not a claim map
+
+A certificate is not a map of names to values, so `cert` is a declared
+`kubernetes.Certificate` rather than the JWT side's `map(string, any)`. Two
+consequences worth recording:
+
+The declared type and the runtime value are generated from one table of fields, so a
+field cannot be declared without being populated. The SubjectAccessReview types take
+the other approach and carry a comment on each half asking the next person to
+remember the other.
+
+The environment declares no clock and no request. That is not an omission: it is what
+makes an expression's result a pure function of the certificate, and therefore what
+makes caching the mapped identity a memo rather than stale state. A test asserts the
+absence.
+
+Two things follow from exposing the validity bounds as timestamps rather than as a
+precomputed lifetime. A rule can bound a certificate's lifetime itself, with
+`cert.notAfter - cert.notBefore <= duration('24h')`, which is the only lever a
+verifier has over the withdrawal window. The option of a `maxCertificateLifetime`
+field was therefore dropped rather than adopted, because it would be a special case
+of an expression that already works.
+
+One hazard found while testing and recorded rather than worked around: the order of a
+multi-valued distinguished name attribute does not survive DER encoding. A
+multi-valued attribute is an ASN.1 SET, whose members are canonically ordered by
+their encoding, so `[zzz, aaa]` reads back as `[aaa, zzz]`. Indexing positionally
+into `organization` is a latent bug whose behavior depends on the bytes of the other
+values, and `exists()` is the correct idiom. Sorting the list in the CEL value would
+hide the fact and disagree with every tool that prints a subject.
+
+#### Extended key usage is not checked
+
+D2's predecessor left this unresolved, and it stays unresolved in the sense that no
+registered usage means "may sign detached HTTP messages". Requiring client
+authentication would silently enlist every certificate issued for connection
+authentication, which its issuer never agreed to. Requiring a new usage would mean
+reissuing for everyone.
+
+So the trust anchor bundle is the opt-in, and it must be a bundle issued for this
+purpose: pointing it at the cluster's client certificate authority would give every
+existing client certificate the ability to sign detached messages that survive a
+proxy. A deployment that has minted a usage requires it with a rule, since
+`extendedKeyUsages` is exposed.
+
+One mechanical note, because the obvious choice is wrong. Go's `x509.VerifyOptions`
+with a nil `KeyUsages` defaults to `ExtKeyUsageServerAuth`, not to "no check", so
+`ExtKeyUsageAny` has to be stated.
+
+#### Replay, and one constraint an assertion adds to Q6
+
+D5 says replay protection is unimplemented and the acceptance window is the bound.
+That is unchanged here: a certificate is not a configured key, so there was never a
+per-key bucket to lift, and `maxAge` bounds replay for both kinds of authenticator
+equally.
+
+What an assertion adds is one constraint on Q6, if a store is ever built. Q6 already
+requires keying on the nonce together with the identity the signature authenticated
+as, rather than on the nonce alone. Under a certificate that identity has to be the
+leaf's own digest, and never the trust anchor: anchor-keyed records would put every
+client under one authority into a single namespace of client-chosen values, which is
+exactly the eviction that turns the store into a replay enabling mechanism.
+
+The cardinality bound Q6 needs is also already solved once here, by the validation
+cache below, and for the same reason: entries created only on success cost an
+attacker a certificate the authority actually issued.
+
+#### The validation cache, and the bound that is not decoration
+
+Successful validations are memoized, keyed on the digest the server computed over the
+presented bytes and never on the keyid the client claimed.
+
+Failures are not cached. A negative cache would be keyed on bytes any caller can
+choose, which is unbounded cardinality for anyone who can send a request, and it
+would buy nothing: an untrusted certificate is rejected by one chain build. Because
+entries are created only on success, occupying one requires a certificate the
+configured authority actually issued.
+
+Entry lifetime is the smallest of the configured TTL, the leaf's remaining life, and
+the remaining life of every certificate in the validated chain. The chain clamp is
+the one that matters: without it a TTL longer than a trust anchor's remaining life
+would keep admitting requests after the anchor expired, which is the only case where
+the cache would grant something the uncached path refuses. A test confirms it by
+removing the clamp.
+
+#### The exec plugin uses the GA fields
+
+D10 records an alpha field in a GA API as a permanent cost. Under a certificate that
+cost goes away: the plugin returns `clientCertificateData` and `clientKeyData`, which
+have been GA for years.
+
+D10's rule inverts rather than relaxes. It refuses a status carrying signing material
+alongside a certificate, because the client would send both and identity would depend
+on authenticator ordering. Here the pair serves one purpose, chosen by configuration:
+when the client is configured to sign, the certificate and key go to the signer and
+never to the TLS configuration. What is refused instead is a status carrying both a
+certificate and key material, which asks to sign under two keys at once.
+
+Whether the plugin will return a certificate or key material is not knowable before
+it runs, so the algorithm is checked when the answer arrives rather than when the
+client is built. That is the first point where both facts exist.
+
+#### Bounding what an untrusted key costs to verify against
+
+The verification key comes from a certificate the server has not yet decided to
+trust, so one verification costs whatever the presented key costs. Two facts make
+that a lever rather than a detail: `x509.ParseCertificate` does not check the
+certificate's own signature, and neither Go's parser nor `crypto/rsa` bounds an RSA
+modulus from above. `crypto/rsa` enforces a 1024-bit floor and no ceiling.
+
+So a modulus nobody generated, an odd integer of any width in a certificate signed
+by a throwaway key, is admitted and exponentiated against. Measured before the
+bound existed:
+
+| modulus | certificate size | verify |
+| --- | --- | --- |
+| 2048 | 483 B | 165 µs |
+| 8192 | 1.3 kB | 2.6 ms |
+| 32768 | 4.3 kB | 40 ms |
+| 65536 | 8.4 kB | 158 ms |
+| 131072 | 16.6 kB | 629 ms |
+
+The 16 kB header cap bounds the parse and does not bound the crypto. So the key is
+bounded before a verifier is built: RSA 2048 to 4096, which is what
+`PodCertificateRequest` issues, with an odd exponent no larger than 65537; ECDSA on
+P-256 or P-384 only; Ed25519. The number of signatures considered per request is
+capped for the same reason, since the signing library caps nothing.
+
+#### The cache supplies a key, never a conclusion
+
+A cache hit returns a verification key and a mapped identity, and the signature is
+verified against that key exactly as on a miss. This is worth stating because the
+optimization that skips it is plausible-looking and its consequence is total:
+anyone who has merely observed a certificate, from an intermediary, a log, or a
+packet capture, would authenticate as its subject. A test presents a cached
+certificate with a signature made by a different key and expects a refusal.
+
+Cached identities are copied on read. The authenticated group adder builds a fresh
+`user.Info` rather than appending to this one, but it carries the `Extra` map over
+by reference, so a shared cached map would be reachable by anything downstream that
+annotated it, and the failure that produces is one request's attributes appearing
+on another's identity.
+
+#### A mapping can hand identity selection to the certificate holder
+
+`claimMappings` derives from the certificate, so `groups: cert.subject.organization`
+gives whoever can request a certificate the choice of group. With a general-purpose
+authority in the bundle, a requester naming `system:masters` in their organization
+would receive cluster administrator.
+
+The control is a `userValidationRules` entry, shipped in the canonical example
+config and in the kind demo, refusing the `system:` prefix on the username and on
+every group. A rule rather than a hardcoded list, because the list would be a third
+copy of a guard the static key list and the JWT authenticator already answer
+differently, and it is a rule rather than a prefix ban in Go because mapping a
+node's certificate to `system:node:<name>` is a legitimate use that a ban would
+forbid.
+
+Three names are refused unconditionally, and they are not policy. The server adds
+`system:authenticated` or `system:unauthenticated` according to whether
+authentication succeeded, and `system:anonymous` is what the anonymous authenticator
+asserts about a request that carried no credential. An authenticator claiming one of
+those is stating a falsehood rather than making a choice. The check is on the
+mapping's evaluated output rather than on its text, since a derivation is invisible
+in the text.
+
+**The absence of this guard elsewhere is a separate question, and it is a question
+rather than a finding.** The static key list refuses a `system:` username at
+configuration time. The JWT authenticator's claim mappings do not. That is one guard
+written once and not carried forward as paths were added, so the class is the defect
+and hardening one instance makes the drift worse. What is unresolved is which layer
+should enforce it: if the answer is the authentication framework, for every
+authenticator, then a per-authenticator list here is a third parallel copy, which is
+why there is no list here. Changing the JWT authenticator is out of scope and would
+break anyone currently mapping to a `system:` name, and whether anyone does is the
+fact that decides the fix.
+
+#### What a certificate still does not solve
+
+Revocation. The server holds no per-client state, which is the point, so there is
+nothing to delete. The certificate's lifetime is the window, narrowed by the cache
+TTL and by whatever lifetime rule a deployment writes. For pods, kube-apiserver caps
+issuance at 24 hours.
+
+
 ## 5. Open questions
 
 ### Q1: which components survive a conforming intermediary
@@ -890,68 +1145,10 @@ peer-controlled input, the aggregate is what matters.
 
 ### Path A: the certificate is the assertion
 
-A client signs with an X.509 keypair and carries the leaf certificate in a covered header. The server
-validates the certificate against a configured CA, extracts the public key, verifies the signature
-with it, and maps the subject to an identity.
-
-This is not a key format change. An X.509 keypair is the keypair the client already signs with, and
-`parsePrivateKey` already accepts PKCS#8, PKCS#1, and SEC1. The signing path does not change at all.
-What changes is that key resolution stops being a lookup and becomes a validation.
-
-So this is mTLS with the handshake replaced by a message signature. The alternatives table rejects
-mTLS because it authenticates the connection and dies at the first TLS-terminating hop. This path
-keeps everything else: the same CA, the same issuance, the same certificate tooling, the same subject
-convention. It moves only the point of authentication into the message, and distribution and rotation
-come for free.
-
-#### The pod case is mostly built already
-
-Kubernetes already has three pieces in tree:
-
-- `PodCertificateRequest`, where kubelet requests a certificate for a pod's service account. The
-  request carries the pod UID, service account name, node name, and node UID, and proves possession
-  of the requested key. kube-apiserver bounds the lifetime through `maxExpirationSeconds`, 24 hours
-  by default and one hour minimum. The in-tree signers never issue longer than 24 hours.
-- `PodCertificateProjection`, a projected volume source. Kubelet generates the keypair itself, from
-  RSA 3072 or 4096, ECDSA P-256, P-384, or P-521, or Ed25519, submits the request, and writes the
-  result into the pod.
-- `credentialBundlePath`, which writes one file whose first PEM block is a PKCS#8 private key and
-  whose remaining blocks are the issued certificate chain, leaf first. The API documentation gives
-  the reason: one atomic read returns a consistent key and chain, where separate paths can be read
-  mid-rotation.
-
-For pods, then, the credential delivery mechanism, the key generation, the proof of possession at
-issuance, and the rotation all exist. Two pieces are missing from the PoC: a client credential source
-that reads a credential bundle, and a server that treats the chain as an assertion.
-
-Two mechanical notes. `parsePrivateKey` calls `pem.Decode`, which returns the first block only, and
-the bundle's first block is the private key, so reading the key from a bundle works today with no
-change. Reading the chain needs a loop. Second, D3 justified `credentialFile` on the grounds that a
-projected volume rewrites a credential in place and nothing has to fork a process to pick it up. This
-is that case arriving.
-
-#### What path A does not solve
-
-**Revocation.** The server holds no per-client state, which is the point, so there is nothing to
-delete. The certificate's lifetime is the revocation window. For pods, kube-apiserver caps it.
-Everywhere else the CA administrator decides, and the verifier has no say unless a maximum accepted
-lifetime becomes verifier policy. This section records that option and does not adopt it.
-
-**A separate CA, deliberately.** Pointing this at the cluster's existing client CA would give every
-existing client certificate the ability to sign detached messages that survive a proxy, with nobody
-opting in. Its own CA bundle is the decision. That costs issuance for anything not already using pod
-certificates, and buys an explicit trust boundary.
-
-**Extended key usage is unresolved.** Requiring client authentication usage means every certificate
-issued for connection authentication also signs messages, which its issuer never agreed to. Requiring
-a distinct usage means new issuance for everyone. No registered usage fits, and the in-tree default
-verify options require client authentication.
-
-**Verify-before-work inverts.** The verifier checks the signature before it reads a body or touches a
-cache, so an anonymous caller cannot make the server do work. Here the server has to parse and
-chain-validate a certificate before a verifier exists at all. That needs bounding: leaf only, size
-limited, and intermediates from configuration rather than from the request. The per-request work is
-then one parse and one chain build against a fixed pool.
+Built. See D11. This section previously described it as unbuilt; what it argued for
+is what shipped, with two things settled that it left open: which coverage class the
+assertion header belongs to, and extended key usage. The third, how an assertion
+bounds nonce buckets, was overtaken by D5 dropping nonce tracking altogether.
 
 ### Path B: remote resolution returning a key and an identity
 
@@ -983,7 +1180,8 @@ external authentication service that already holds the keys.
 
 ### Invariants these paths break
 
-**Q6, a replay store keyed per credential.** Q6 notes that a store narrowing the replay window would
+**Q6, a replay store keyed per credential.** Settled for path A in D11, which states the key it would
+have to use. Q6 notes that a store narrowing the replay window would
 have to be keyed per authenticated identity and bounded. With the static list, both come free: the
 configured list caps the number of identities. An assertion lifts that ceiling. Keys then have to be
 the credential's own identity, a leaf thumbprint or its equivalent, and never the trust anchor or the
@@ -991,7 +1189,8 @@ resolver. Keying per anchor puts every client under one CA into one entry, which
 namespace Q6 says turns such a store into a replay enabling mechanism. A global ceiling on entry count
 becomes necessary, which the static list never needed.
 
-**D2, coverage.** Which class the assertion header belongs to is unresolved. Coverage protects against
+**D2, coverage.** Settled in D11: the keyid binds the certificate, so the header's class is redundancy
+rather than the mechanism. The argument below is what D11 answers. Coverage protects against
 removal for free, and the protected class exists to catch addition. Neither obviously applies here:
 substituting a certificate breaks verification anyway, because the signature has to verify against
 the key the certificate names, and adding one to a request that carried none is self-defeating for
@@ -1060,8 +1259,31 @@ Built and covered by tests:
   disagree with the other about which headers matter. The signer assembles its component list with
   `Components`; the verifier states the floor as its requirement and checks presence in its own loop.
 - An `httpSignature` section in `AuthenticationConfiguration` behind the
-  `HTTPSignatureAuthentication` alpha feature gate, with validation, carrying the deployment's
-  ladder once and each key's own position on it.
+  `HTTPSignatureAuthentication` alpha feature gate, with validation, holding a list of
+  authenticators. `authority` and `scheme` sit on the section rather than on each authenticator,
+  because they are consumed when a request's signatures are parsed, before any authenticator has
+  been selected. Each authenticator carries the deployment's ladder once and each key's own
+  position on it.
+- Key resolution as an interface, with two implementations: a static key list and a certificate
+  authority bundle (D11). A signature reaches one of them by its keyid, which is covered by every
+  signature, so nothing about the choice depends on an unsigned header.
+- Certificate-asserted identity (D11): `certFile` with `keyFile`, or `credentialBundleFile` for
+  the one-file form a pod certificate projected volume writes. The key ID, the algorithm, and the
+  credential's expiry are all derived from the certificate, so none of them is configurable. Two
+  files are checked for being a pair, because reading them mid-rotation is what produces a
+  mismatch, and the error names that rather than the key.
+- A `kubernetes.Certificate` CEL type whose declared fields and runtime value are generated from
+  one table, with `certificateValidationRules`, `claimMappings`, and `userValidationRules`
+  evaluated in that order.
+- A validation cache holding successful chain builds and their mapped identities, keyed on the
+  digest the server computed, with entry lifetime clamped to the shortest remaining life in the
+  validated chain.
+- Metrics: an outcome counter per authenticator naming which check refused a signature, and a
+  cache hit counter. Labels come from configuration and from a closed set, so nothing a peer
+  chooses becomes a label value.
+- Hot reload of the `httpSignature` section, through the same atomic pointer the JWT
+  authenticators use. A section absent at startup and added by a reload now takes effect, which it
+  did not before.
 - `spec.httpSignature` and `status.httpSignature` in `clientauthentication` v1 and v1beta1, behind
   the `ClientsAllowHTTPSignature` client-go feature gate, so a plugin is told what to produce and
   can answer with key material instead of a token.
@@ -1098,9 +1320,7 @@ Built and covered by tests:
 
 Deliberately not built:
 
-- Any key lookup beyond the static list (Q4), and therefore any key retirement story.
-- Hot reload of the `httpSignature` section. A change to it is accepted, ignored, and reported as a
-  successful reload, which is a defect rather than a decision (D4).
+- Remote key resolution (Q4, path B). The resolver interface is the seam it plugs into.
 - Hardware-backed or non-exportable keys (D3), which the signer seam allows and nothing here
   delivers.
 - Asymmetric key derivation (D8), which is a new ladder kind and a key distribution design.

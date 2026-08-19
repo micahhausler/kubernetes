@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync/atomic"
 	"time"
 
@@ -134,12 +135,32 @@ func (config Config) New(serverLifecycle context.Context) (authenticator.Request
 	// HTTP message signatures. This runs before the bearer token authenticator
 	// so that a request presenting both is authenticated as the signer, whose
 	// identity is bound to the request rather than merely presented with it.
-	if config.AuthenticationConfig != nil && config.AuthenticationConfig.HTTPSignature != nil {
-		signatureAuth, err := httpsig.New(config.AuthenticationConfig.HTTPSignature)
-		if err != nil {
-			return nil, nil, nil, nil, err
+	//
+	// The authenticator is reached through an atomic pointer rather than being
+	// installed directly, for the same reason the JWT authenticator is: the union
+	// below is built once, so a reloaded configuration has to be able to replace
+	// the implementation without replacing the union. The pointer may hold nil,
+	// which is how httpSignature being absent at startup and added by a reload
+	// works at all.
+	var httpSignatureAuthenticatorPtr *atomic.Pointer[httpsig.Authenticator]
+	if config.AuthenticationConfig != nil {
+		httpSignatureAuthenticatorPtr = &atomic.Pointer[httpsig.Authenticator]{}
+		if config.AuthenticationConfig.HTTPSignature != nil {
+			signatureAuth, err := httpsig.New(config.AuthenticationConfig.HTTPSignature, nil)
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+			httpSignatureAuthenticatorPtr.Store(signatureAuth)
 		}
-		authenticators = append(authenticators, authenticator.WrapAudienceAgnosticRequest(config.APIAudiences, signatureAuth))
+		authenticators = append(authenticators, authenticator.WrapAudienceAgnosticRequest(config.APIAudiences,
+			authenticator.RequestFunc(func(req *http.Request) (*authenticator.Response, bool, error) {
+				current := httpSignatureAuthenticatorPtr.Load()
+				if current == nil {
+					// Not configured. No opinion, so the rest of the chain runs.
+					return nil, false, nil
+				}
+				return current.AuthenticateRequest(req)
+			})))
 	}
 
 	// Bearer token methods, local first, then remote
@@ -191,10 +212,11 @@ func (config Config) New(serverLifecycle context.Context) (authenticator.Request
 		}
 
 		updateAuthenticationConfig = (&authenticationConfigUpdater{
-			serverLifecycle:     serverLifecycle,
-			config:              config,
-			jwtAuthenticatorPtr: jwtAuthenticatorPtr,
-			issuers:             initialIssuers,
+			serverLifecycle:               serverLifecycle,
+			config:                        config,
+			jwtAuthenticatorPtr:           jwtAuthenticatorPtr,
+			httpSignatureAuthenticatorPtr: httpSignatureAuthenticatorPtr,
+			issuers:                       initialIssuers,
 		}).updateAuthenticationConfig
 
 		tokenAuthenticators = append(tokenAuthenticators,
@@ -316,14 +338,34 @@ func newJWTAuthenticator(serverLifecycle context.Context, config *apiserver.Auth
 }
 
 type authenticationConfigUpdater struct {
-	serverLifecycle     context.Context
-	config              Config
-	jwtAuthenticatorPtr *atomic.Pointer[jwtAuthenticatorWithCancel]
-	issuers             sets.Set[string]
+	serverLifecycle               context.Context
+	config                        Config
+	jwtAuthenticatorPtr           *atomic.Pointer[jwtAuthenticatorWithCancel]
+	httpSignatureAuthenticatorPtr *atomic.Pointer[httpsig.Authenticator]
+	issuers                       sets.Set[string]
 }
 
 // the input ctx controls the timeout for updateAuthenticationConfig to return, not the lifetime of the constructed authenticators.
 func (c *authenticationConfigUpdater) updateAuthenticationConfig(ctx context.Context, authConfig *apiserver.AuthenticationConfiguration) error {
+	// Built before the JWT half so that a configuration this authenticator
+	// rejects fails the whole reload, rather than leaving the JWT authenticators
+	// swapped and this one stale.
+	//
+	// A nil section is a legitimate state and stores nil, so removing the section
+	// takes effect too. Swapping discards the certificate validation cache, which
+	// costs each client one revalidation, and the nonce buckets, which reopens the
+	// replay window for the length of maxAge. Both are the price of the section
+	// being reloadable at all, and neither grants anything a fresh server would
+	// not have granted.
+	var updatedHTTPSignature *httpsig.Authenticator
+	if c.httpSignatureAuthenticatorPtr != nil && authConfig.HTTPSignature != nil {
+		var err error
+		updatedHTTPSignature, err = httpsig.New(authConfig.HTTPSignature, nil)
+		if err != nil {
+			return err
+		}
+	}
+
 	updatedJWTAuthenticator, err := newJWTAuthenticator(c.serverLifecycle, authConfig, c.config.OIDCSigningAlgs, c.config.APIAudiences, c.config.ServiceAccountIssuers, c.config.EgressLookup, c.config.APIServerID)
 	if err != nil {
 		return err
@@ -348,6 +390,12 @@ func (c *authenticationConfigUpdater) updateAuthenticationConfig(ctx context.Con
 
 	oldJWTAuthenticator := c.jwtAuthenticatorPtr.Swap(updatedJWTAuthenticator)
 	c.issuers = newIssuers
+
+	// Swapped after the JWT health check has passed, so a reload that fails
+	// leaves both halves as they were.
+	if c.httpSignatureAuthenticatorPtr != nil {
+		c.httpSignatureAuthenticatorPtr.Store(updatedHTTPSignature)
+	}
 
 	go func() {
 		t := time.NewTimer(time.Minute)

@@ -84,17 +84,22 @@ func ValidateAuthenticationConfiguration(compiler authenticationcel.Compiler, c 
 		}
 	}
 
-	allErrs = append(allErrs, validateHTTPSignatureAuthenticator(c.HTTPSignature, field.NewPath("httpSignature"),
+	allErrs = append(allErrs, validateHTTPSignature(compiler, c.HTTPSignature, field.NewPath("httpSignature"),
 		utilfeature.DefaultFeatureGate.Enabled(features.HTTPSignatureAuthentication))...)
 
 	return allErrs
 }
 
-// maxHTTPSignatureKeys bounds the static key list. A list this long is a sign
-// the deployment needs a key directory rather than a longer file.
+// maxHTTPSignatureAuthenticators bounds the authenticator list, matching the
+// bound on JWT authenticators. Every certificate authenticator holds a validation
+// cache, so the list length sets a memory floor.
+const maxHTTPSignatureAuthenticators = 64
+
+// maxHTTPSignatureKeys bounds one authenticator's static key list. A list this
+// long is a sign the deployment needs certificates rather than a longer file.
 const maxHTTPSignatureKeys = 64
 
-func validateHTTPSignatureAuthenticator(c *api.HTTPSignatureAuthenticator, fldPath *field.Path, featureEnabled bool) field.ErrorList {
+func validateHTTPSignature(compiler authenticationcel.Compiler, c *api.HTTPSignatureConfig, fldPath *field.Path, featureEnabled bool) field.ErrorList {
 	var allErrs field.ErrorList
 	if c == nil {
 		return allErrs
@@ -103,30 +108,86 @@ func validateHTTPSignatureAuthenticator(c *api.HTTPSignatureAuthenticator, fldPa
 		return append(allErrs, field.Forbidden(fldPath, "httpSignature is not supported when the HTTPSignatureAuthentication feature gate is disabled"))
 	}
 
-	if len(c.Keys) == 0 {
-		allErrs = append(allErrs, field.Required(fldPath.Child("keys"), "at least one key is required for the httpSignature authenticator to authenticate anything"))
-	}
-	if len(c.Keys) > maxHTTPSignatureKeys {
-		return append(allErrs, field.TooMany(fldPath.Child("keys"), len(c.Keys), maxHTTPSignatureKeys))
-	}
-
-	// Rejecting a non-positive maxAge also keeps the created parameter
-	// mandatory, because the verifier requires created only while it has an age
-	// bound to apply.
-	if c.MaxAge != nil && c.MaxAge.Duration <= 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("maxAge"), c.MaxAge.Duration.String(), "must be positive: it is the bound on how long a captured request can be replayed"))
-	}
-	if c.Tolerance != nil && c.Tolerance.Duration < 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("tolerance"), c.Tolerance.Duration.String(), "must not be negative"))
-	}
 	if c.Scheme != "" && c.Scheme != "http" && c.Scheme != "https" {
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("scheme"), c.Scheme, "must be http or https"))
 	}
 
+	authPath := fldPath.Child("authenticators")
+	if len(c.Authenticators) == 0 {
+		allErrs = append(allErrs, field.Required(authPath, "at least one authenticator is required for httpSignature to authenticate anything"))
+		return allErrs
+	}
+	if len(c.Authenticators) > maxHTTPSignatureAuthenticators {
+		return append(allErrs, field.TooMany(authPath, len(c.Authenticators), maxHTTPSignatureAuthenticators))
+	}
+
+	seenNames := sets.New[string]()
+	// Trust anchors are collected across authenticators because two that share
+	// one would both claim the same certificate, and which identity it got would
+	// depend on the order they appear in this file.
+	anchorOwners := map[string]string{}
+
+	for i, a := range c.Authenticators {
+		path := authPath.Index(i)
+
+		if len(a.Name) == 0 {
+			allErrs = append(allErrs, field.Required(path.Child("name"), "a name is required to identify this authenticator in errors and metrics"))
+		} else if seenNames.Has(a.Name) {
+			allErrs = append(allErrs, field.Duplicate(path.Child("name"), a.Name))
+		}
+		seenNames.Insert(a.Name)
+
+		// Rejecting a non-positive maxAge also keeps the created parameter
+		// mandatory, because the verifier requires created only while it has an
+		// age bound to apply.
+		if a.MaxAge != nil && a.MaxAge.Duration <= 0 {
+			allErrs = append(allErrs, field.Invalid(path.Child("maxAge"), a.MaxAge.Duration.String(), "must be positive: it is the bound on how long a captured request can be replayed"))
+		}
+		if a.Tolerance != nil && a.Tolerance.Duration < 0 {
+			allErrs = append(allErrs, field.Invalid(path.Child("tolerance"), a.Tolerance.Duration.String(), "must not be negative"))
+		}
+
+		switch {
+		case a.X509 != nil && len(a.Keys) > 0:
+			allErrs = append(allErrs, field.Invalid(path, "", "keys and x509 are mutually exclusive: keys states an identity per key, and x509 takes the identity from a certificate"))
+		case a.X509 != nil:
+			allErrs = append(allErrs, validateHTTPSignatureX509(compiler, a, path, anchorOwners)...)
+		case len(a.Keys) > 0:
+			allErrs = append(allErrs, validateHTTPSignatureKeys(a, path)...)
+		default:
+			allErrs = append(allErrs, field.Required(path, "one of keys or x509 is required"))
+		}
+	}
+	return allErrs
+}
+
+// validateHTTPSignatureKeys validates an authenticator that states its keys and
+// identities in this file.
+func validateHTTPSignatureKeys(a api.HTTPSignatureAuthenticator, fldPath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+
+	// Fields that only mean something for an asserted identity. A field that is
+	// accepted and ignored is worse than one that is rejected, because nothing
+	// tells the administrator their rule is not running.
+	if a.ClaimMappings != nil {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("claimMappings"), "", "claimMappings derives an identity from a certificate and requires x509; keys states its identities directly"))
+	}
+	if len(a.CertificateValidationRules) > 0 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("certificateValidationRules"), "", "certificateValidationRules requires x509"))
+	}
+	if len(a.UserValidationRules) > 0 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("userValidationRules"), "", "userValidationRules constrains an identity an assertion claimed and requires x509; the identities keys authenticates are stated in this file"))
+	}
+
+	keysPath := fldPath.Child("keys")
+	if len(a.Keys) > maxHTTPSignatureKeys {
+		return append(allErrs, field.TooMany(keysPath, len(a.Keys), maxHTTPSignatureKeys))
+	}
+
 	seenKeyIDs := sets.New[string]()
 	seenUsernames := sets.New[string]()
-	for i, k := range c.Keys {
-		keyPath := fldPath.Child("keys").Index(i)
+	for i, k := range a.Keys {
+		keyPath := keysPath.Index(i)
 		if len(k.KeyID) == 0 {
 			allErrs = append(allErrs, field.Required(keyPath.Child("keyID"), ""))
 		} else if seenKeyIDs.Has(k.KeyID) {
@@ -157,14 +218,120 @@ func validateHTTPSignatureAuthenticator(c *api.HTTPSignatureAuthenticator, fldPa
 			}
 		}
 
-		// The algorithm registry and the key encodings live in the verifier, so
-		// they are checked by building the verifier rather than by a second copy
-		// of the rules here. This also rejects a key file that cannot be read.
-		if err := httpsig.ValidateKey(k, c.KeyDerivation); err != nil {
+		// The algorithm registry, the key encodings, and the reservation of the
+		// certificate keyid form all live in the verifier, so they are checked by
+		// building the verifier rather than by a second copy of the rules here.
+		// This also rejects a key file that cannot be read.
+		if err := httpsig.ValidateKey(k, a.KeyDerivation); err != nil {
 			allErrs = append(allErrs, field.Invalid(keyPath, "", err.Error()))
 		}
 	}
 	return allErrs
+}
+
+// validateHTTPSignatureX509 validates an authenticator that takes its keys and
+// identities from certificates.
+//
+// anchorOwners accumulates across authenticators, mapping each trust anchor to the
+// name of the authenticator that already claimed it.
+func validateHTTPSignatureX509(compiler authenticationcel.Compiler, a api.HTTPSignatureAuthenticator, fldPath *field.Path, anchorOwners map[string]string) field.ErrorList {
+	var allErrs field.ErrorList
+	x509Path := fldPath.Child("x509")
+
+	if a.KeyDerivation != nil {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("keyDerivation"), "", "keyDerivation applies to hmac-sha256 only, and a certificate carries its own key"))
+	}
+
+	caPath := x509Path.Child("certificateAuthority")
+	if len(a.X509.CertificateAuthority) == 0 {
+		allErrs = append(allErrs, field.Required(caPath, "trust anchors are required: they are what makes a certificate mean anything to this server"))
+	} else {
+		anchors, err := cert.ParseCertsPEM([]byte(a.X509.CertificateAuthority))
+		if err != nil {
+			// The value is reported as omitted rather than echoed, matching how
+			// the JWT issuer's authority is reported.
+			allErrs = append(allErrs, field.Invalid(caPath, "<omitted>", err.Error()))
+		}
+		for _, anchor := range anchors {
+			fingerprint := string(anchor.Raw)
+			if owner, taken := anchorOwners[fingerprint]; taken {
+				allErrs = append(allErrs, field.Invalid(caPath, "<omitted>",
+					fmt.Sprintf("trust anchor %q is already used by authenticator %q; two authenticators sharing an anchor would both accept the same certificate, "+
+						"and which identity it received would depend on the order they appear in this list", anchor.Subject.String(), owner)))
+				continue
+			}
+			anchorOwners[fingerprint] = a.Name
+		}
+	}
+
+	if cc := a.X509.CertificateCache; cc != nil {
+		cachePath := x509Path.Child("certificateCache")
+		if cc.MaxEntries != nil && *cc.MaxEntries <= 0 {
+			allErrs = append(allErrs, field.Invalid(cachePath.Child("maxEntries"), *cc.MaxEntries,
+				"must be positive: a cache holding no entries revalidates every request"))
+		}
+		if cc.TTL != nil && cc.TTL.Duration < 0 {
+			allErrs = append(allErrs, field.Invalid(cachePath.Child("ttl"), cc.TTL.Duration.String(), "must not be negative"))
+		}
+	}
+
+	if a.ClaimMappings == nil {
+		allErrs = append(allErrs, field.Required(fldPath.Child("claimMappings"),
+			"claimMappings is required with x509, because the identity comes from the certificate rather than from this file"))
+	} else if len(a.ClaimMappings.Username.Expression) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("claimMappings", "username", "expression"),
+			"a username expression is required: a certificate has no field this server would pick by default"))
+	}
+
+	if a.ClaimMappings != nil {
+		seenExtraKeys := sets.New[string]()
+		for i, extra := range a.ClaimMappings.Extra {
+			extraPath := fldPath.Child("claimMappings", "extra").Index(i)
+			keyErrs, duplicate := validateExtraMappingKey(extra.Key, extraPath.Child("key"), seenExtraKeys)
+			allErrs = append(allErrs, keyErrs...)
+			if duplicate {
+				continue
+			}
+			if len(extra.ValueExpression) == 0 {
+				allErrs = append(allErrs, field.Required(extraPath.Child("valueExpression"), ""))
+			}
+		}
+	}
+
+	// Compilation is the validation. It runs the same function the authenticator
+	// runs, so an expression that validates here cannot fail to compile there.
+	if _, err := httpsig.CompileCertificateAuthenticator(compiler, a); err != nil {
+		allErrs = append(allErrs, field.Invalid(fldPath, "", err.Error()))
+	}
+	return allErrs
+}
+
+// validateExtraMappingKey checks an extra attribute key, and reports whether the
+// key was already seen so the caller can skip the rest of the mapping.
+//
+// Both the JWT and the HTTP signature authenticators call this. An extra
+// attribute key means the same thing whichever authenticator produced it, and two
+// copies of these rules would eventually disagree about one of them, most likely
+// the reservation of the Kubernetes domains.
+//
+// Keys should be namespaced to the authenticator or authenticator/authorizer pair
+// making use of them, for instance "example.org/foo" rather than "foo".
+// xref: https://github.com/kubernetes/kubernetes/blob/3825e206cb162a7ad7431a5bdf6a065ae8422cf7/staging/src/k8s.io/apiserver/pkg/authentication/user/user.go#L31-L41
+func validateExtraMappingKey(key string, fldPath *field.Path, seen sets.Set[string]) (field.ErrorList, bool) {
+	var allErrs field.ErrorList
+	// IsDomainPrefixedPath checks for a non-empty key prefixed with a domain name.
+	allErrs = append(allErrs, utilvalidation.IsDomainPrefixedPath(fldPath, key)...)
+	if key != strings.ToLower(key) {
+		allErrs = append(allErrs, field.Invalid(fldPath, key, "must be lowercase"))
+	}
+	if isKubernetesDomainPrefix(key) {
+		allErrs = append(allErrs, field.Invalid(fldPath, key, "k8s.io, kubernetes.io and their subdomains are reserved for Kubernetes use"))
+	}
+	if seen.Has(key) {
+		return append(allErrs, field.Duplicate(fldPath, key)), true
+	}
+	seen.Insert(key)
+	return allErrs, false
 }
 
 // CompileAndValidateJWTAuthenticator validates a given JWTAuthenticator and returns a CELMapper with the compiled
@@ -413,28 +580,15 @@ func validateClaimMappings(compiler authenticationcel.Compiler, state *validatio
 	}
 
 	var extraCompilationResults []authenticationcel.CompilationResult
-	seenExtraKeys := sets.NewString()
+	seenExtraKeys := sets.New[string]()
 
 	for i, mapping := range m.Extra {
 		fldPath := fldPath.Child("extra").Index(i)
-		// Key should be namespaced to the authenticator or authenticator/authorizer pair making use of them.
-		// For instance: "example.org/foo" instead of "foo".
-		// xref: https://github.com/kubernetes/kubernetes/blob/3825e206cb162a7ad7431a5bdf6a065ae8422cf7/staging/src/k8s.io/apiserver/pkg/authentication/user/user.go#L31-L41
-		// IsDomainPrefixedPath checks for non-empty key and that the key is prefixed with a domain name.
-		allErrs = append(allErrs, utilvalidation.IsDomainPrefixedPath(fldPath.Child("key"), mapping.Key)...)
-		if mapping.Key != strings.ToLower(mapping.Key) {
-			allErrs = append(allErrs, field.Invalid(fldPath.Child("key"), mapping.Key, "must be lowercase"))
-		}
-
-		if isKubernetesDomainPrefix(mapping.Key) {
-			allErrs = append(allErrs, field.Invalid(fldPath.Child("key"), mapping.Key, "k8s.io, kubernetes.io and their subdomains are reserved for Kubernetes use"))
-		}
-
-		if seenExtraKeys.Has(mapping.Key) {
-			allErrs = append(allErrs, field.Duplicate(fldPath.Child("key"), mapping.Key))
+		keyErrs, duplicate := validateExtraMappingKey(mapping.Key, fldPath.Child("key"), seenExtraKeys)
+		allErrs = append(allErrs, keyErrs...)
+		if duplicate {
 			continue
 		}
-		seenExtraKeys.Insert(mapping.Key)
 
 		if len(mapping.ValueExpression) == 0 {
 			allErrs = append(allErrs, field.Required(fldPath.Child("valueExpression"), ""))
