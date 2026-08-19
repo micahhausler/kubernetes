@@ -470,9 +470,6 @@ type HTTPSignatureAuthenticator struct {
 	// unsigned input and are never consulted.
 	Authority string
 	Scheme    string
-
-	// MaxNoncesPerKey caps the nonces remembered per key. Unset means 1024.
-	MaxNoncesPerKey *int32
 }
 
 // HTTPSignatureKey is one verification key and the identity it authenticates.

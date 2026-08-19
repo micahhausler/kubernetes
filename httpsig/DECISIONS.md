@@ -8,7 +8,7 @@ This records the reasoning behind decisions made as well as open questions.
 
 It is a porcelain and plumbing layer for the client and the server: the kubeconfig surface, the
 credential sources behind it, the signing round tripper, the wire format and coverage rules, the
-verifier, replay tracking, and the mapping from a verified key to an identity. Those are the parts
+verifier, and the mapping from a verified key to an identity. Those are the parts
 meant to be read as proposals.
 
 Key distribution and key lookup are **unsolved and out of scope**, and the static key list in the API
@@ -42,8 +42,8 @@ This implementation uses two new libraries:
 ## 2. Motivation
 
 The property to lead with is not non-replayability. A signature scheme with a `created` timestamp
-and an acceptance window still admits replay inside that window if nonces are not stored in a shared
-cached by all API servers.
+and an acceptance window still admits replay inside that window, and detecting a replay would take
+state shared by all API servers. Replay protection is unimplemented. See D5.
 
 The properties that do hold. The first two are what a signature has over a bearer token, which
 transits on every request. The third is what it has over a client certificate, which signs the
@@ -84,7 +84,7 @@ and shared secrets from files, or takes them from an exec plugin, see D3. This i
 because the KEP argues about the mechanism, not about how the PoC loads keys.
 
 Non-replayability is then stated as what it is: `created` plus a maximum age bound the replay
-window, and a nonce cache reduces in-window replay on the instance that holds the cache. See D5.
+window, and nothing narrows it further. See D5.
 
 Property 3 is the strongest leg and it is in tension with the covered component set. See Q1.
 
@@ -131,9 +131,13 @@ user-specified extras.
 
 | Class | Contents | Client | Server |
 | --- | --- | --- | --- |
-| Floor | `@method`, `@authority`, `@path`, `@query`, content digest when a body is present, `created`, `nonce` | always signed | required by policy |
+| Floor | `@method`, `@authority`, `@path`, `@query`, content digest when a body is present | always signed | required by policy |
 | Protected headers | `Impersonate-User`, `Impersonate-Uid`, `Impersonate-Group`, `Impersonate-Extra-*`, `Audit-ID`, `Accept`, `Content-Type`, `User-Agent` | covered when present on the outgoing request | if present on the received request, must be covered |
 | User extras | headers named in the kubeconfig `signedHeaders` list | injected and always covered | covered by construction; the key lookup may read them |
+
+`created` is a signature parameter rather than a covered component, so it is not in the floor. The
+verifier requires it all the same: a signature it cannot age is rejected, because the acceptance
+window is the only bound on replay.
 
 `@query` is in the floor because Kubernetes API semantics live in the query string: `dryRun`,
 `watch`, `fieldSelector`, `resourceVersion`. A signature that leaves the query uncovered permits a
@@ -269,22 +273,21 @@ and keeps the option open.
 The verifier is configured by a new `httpSignature` section in `AuthenticationConfiguration`
 (`apiserver.config.k8s.io`), alongside `JWT` and `Anonymous`, gated by the
 `HTTPSignatureAuthentication` alpha feature gate. The section carries the acceptance policy (maximum
-signature age, clock tolerance, nonce cache size, and the external authority and scheme for a server
-behind a TLS-terminating proxy), the derivation ladder, and a list of keys. Each key states its own
+signature age, clock tolerance, and the external authority and scheme for a server behind a
+TLS-terminating proxy), the derivation ladder, and a list of keys. Each key states its own
 algorithm, its public key inline or a path to a shared secret file, where its own material sits on
 the ladder, and the user name, UID, and groups it authenticates as.
 
-The API server reads the `httpSignature` section once at startup and builds the verifier from it, keys
-and nonce caches together. The file watcher that hot-reloads JWT authenticators does not rebuild it,
+The API server reads the `httpSignature` section once at startup and builds the verifier from it. The
+file watcher that hot-reloads JWT authenticators does not rebuild it,
 and it does not refuse the change either: it validates the new section, ignores it, and logs a
 successful reload. Demonstrated on the kind cluster in `e2e/`, where correcting a bad key made the
 server log a reload at that moment and then keep rejecting requests until the process restarted.
 
 Accepting a change and then ignoring it is worse than refusing it, so making the reload fail loudly
 is the part worth doing first, and it does not depend on Q4. Supporting reload properly means
-swapping the verifier under an atomic pointer, which also has to decide what happens to the nonce
-caches of keys that survive the change. That belongs with Q4 rather than in front of it, because the
-static key list is the thing being reloaded and it is a placeholder.
+swapping the verifier under an atomic pointer. That belongs with Q4 rather than in front of it,
+because the static key list is the thing being reloaded and it is a placeholder.
 
 A static key list is a PoC choice, not a proposal. It avoids the problem of defining an external
 lookup API. The verifier holds its keys in a map and indexes that map in one function, so replacing
@@ -292,11 +295,20 @@ the static list with something else is a contained change. It is not an interfac
 it one would overstate what is built. Informer-backed lookup of cluster objects, the bootstrap token
 authenticator's pattern, is the likely successor and needs its own design.
 
-### D5: nonce replay cache is per instance, per key ID, and is not called replay protection
+### D5: replay protection is unimplemented
 
-The built in nonce cache is just PoC work, a real production instance that wants to implement nonce
-protection will require a shared cache across all API servers. A real implementation will either not
-support a nonce cache or use a shared cache.
+The acceptance window is the whole of the replay bound. A captured request can be replayed as itself,
+unchanged, against any API server until its signature ages out.
+
+Detecting a replay means recognising a signature the fleet has already accepted, which takes state
+shared by every API server. A per-instance cache does not provide that: with more than one API server
+a captured request is replayable once against each instance that has not seen it. Building one and
+calling the result replay protection would claim a property the deployment does not have, which is
+worse than not building it, because the claim is what an operator would rely on.
+
+Whether Kubernetes should have shared state for this, or should state non-replayability as a non-goal
+and leave the window as the bound, is Q6. The client attaches a `nonce` to every signature either
+way, so whatever consumes one later needs no change on the client side.
 
 ### D6: new operational dependency on client clock sanity
 
@@ -726,7 +738,7 @@ I'm open to any outcome.
 ### Q4: remote key lookup, which the static list stands in for
 
 The static key list in D4 is the API integration surface, not the key distribution answer. It is
-enough to prove that the authenticator, the coverage rules, and the replay tracking work. It is also
+enough to prove that the authenticator and the coverage rules work. It is also
 wrong for any real deployment: it does not scale past a handful of identities, it has no revocation
 beyond editing a file on every control plane node, and it puts human identities in server
 configuration.
@@ -756,8 +768,7 @@ Design questions this raises, none of them settled:
   What not to copy: `cached_token_authenticator`'s cache is an unbounded `utilcache.NewExpiring`, and
   its striping is for lock contention rather than size. A lookup keyed on a key ID and a claimed scope
   is keyed entirely on peer-chosen input, so it needs a bounded cache and a tight negative TTL. This
-  is the same cardinality argument D5 makes for nonce buckets and D8 makes for not caching derived
-  keys, arriving for a third time.
+  is the same cardinality argument D8 makes for not caching derived keys, arriving a second time.
 - Failure behavior. A key lookup that is unreachable must fail closed for that key without taking
   down authentication for anything else.
 - Whether the API server derives at all. If the lookup answers for the scope it was asked about, it
@@ -768,8 +779,8 @@ Design questions this raises, none of them settled:
   deletion and the alternative is a normalization.
 
 Key resolution happens in one function, which indexes a map built at startup. Nothing in the
-coverage or replay logic depends on where a key came from, so a lookup can replace that map without
-disturbing either. That containment is the part of the static list decision meant to survive, and it
+coverage or acceptance logic depends on where a key came from, so a lookup can replace that map
+without disturbing either. That containment is the part of the static list decision meant to survive, and it
 is not an interface today.
 
 ### Q5: recovering the ladder drift check as an operator can use it
@@ -792,6 +803,25 @@ Two shapes would fix it, and neither is built:
   kubeconfig and an authentication configuration and report whether they agree. This is the cheap
   half and probably the right first move, because it serves the operator without changing anything
   on the wire.
+
+### Q6: whether replay gets narrowed below the acceptance window
+
+D5 leaves the acceptance window as the whole of the replay bound. Narrowing it means recognising a
+signature the fleet has already accepted, which is shared state on the request path, and the question
+is whether that is worth having at all rather than how to build it.
+
+The two answers are not a spectrum. Either the fleet keeps shared state, which puts a store on the
+authentication path of every request and makes its availability the API server's availability, or
+non-replayability is stated as a non-goal and the window is documented as the bound. The second is
+the honest default and costs nothing; the first needs a threat that the window does not already
+bound, stated concretely, before the operational cost is worth arguing about.
+
+Whatever consumes a nonce later needs no client change: the client already attaches one to every
+signature. Two constraints on the store, if it is ever built. It has to be keyed on the nonce
+together with the identity the signature authenticated as, not on the nonce alone, because a single
+namespace of client-chosen values lets one client evict another's records and turns the store into a
+replay enabling mechanism. And its cardinality is peer-driven, so it needs a bound, which is the same
+argument D8 makes for not caching derived keys.
 
 ## 6. Paths not taken yet
 
@@ -825,8 +855,8 @@ Two consequences fall out of the table, and both paths inherit them.
 a way to constrain what an assertion may claim. That prerequisite is next, and neither path can ship
 without it.
 
-**For asymmetric keys, the nonce bucket bound disappears.** D5 bounds its per-key buckets by the
-length of the configured key list, and an assertion comes with no such list.
+**Anything keyed per credential loses its bound.** The static list caps the number of credentials the
+server will ever see, and an assertion comes with no such list.
 
 ### Prerequisite: identity mapping with restrictions
 
@@ -953,12 +983,12 @@ external authentication service that already holds the keys.
 
 ### Invariants these paths break
 
-**D5, nonce buckets.** D5 keeps its bucket count bounded because the verifier records a nonce only
-after a signature verifies, so every bucket belongs to a configured key. An assertion lifts that
-ceiling. Buckets then have to be keyed on the credential's own identity, a leaf thumbprint or its
-equivalent, and never on the trust anchor or the resolver. Bucketing per anchor puts every client
-under one CA into one bucket, which is precisely the shared cache whose peer-driven cardinality D5
-says turns the anti-replay cache into a replay enabling mechanism. A global ceiling on bucket count
+**Q6, a replay store keyed per credential.** Q6 notes that a store narrowing the replay window would
+have to be keyed per authenticated identity and bounded. With the static list, both come free: the
+configured list caps the number of identities. An assertion lifts that ceiling. Keys then have to be
+the credential's own identity, a leaf thumbprint or its equivalent, and never the trust anchor or the
+resolver. Keying per anchor puts every client under one CA into one entry, which is the single shared
+namespace Q6 says turns such a store into a replay enabling mechanism. A global ceiling on entry count
 becomes necessary, which the static list never needed.
 
 **D2, coverage.** Which class the assertion header belongs to is unresolved. Coverage protects against
@@ -1035,15 +1065,15 @@ Built and covered by tests:
 - `spec.httpSignature` and `status.httpSignature` in `clientauthentication` v1 and v1beta1, behind
   the `ClientsAllowHTTPSignature` client-go feature gate, so a plugin is told what to produce and
   can answer with key material instead of a token.
-- An `authenticator.Request` verifier with per-key nonce tracking, wired into the kube-apiserver
-  authenticator chain ahead of the bearer token authenticator.
+- An `authenticator.Request` verifier wired into the kube-apiserver authenticator chain ahead of the
+  bearer token authenticator.
 - A redaction test over every exported type that can hold key material, in every fmt verb, checking
   for the secret as a string and as the bytes an interface field prints, and requiring the key ID to
   survive so the output stays worth logging (D3).
 - Unit tests on both sides, including the attack vectors from D2: a signature whose declared
   component list omits floor components, a request with an injected uncovered impersonation header,
-  an altered body against a signed digest, a replayed nonce, a wrong key for a known key ID, and an
-  algorithm substitution.
+  an altered body against a signed digest, a signature with no `created` parameter, a wrong key for a
+  known key ID, and an algorithm substitution.
 - Derivation tests, covering what Kubernetes adds rather than what the library already tests:
   - a ladder stated as an API type, reproducing a published test vector
   - the digest depending on what a ladder means, not on which API type it arrived in
@@ -1059,7 +1089,6 @@ Built and covered by tests:
 - Integration tests against a real kube-apiserver:
   - a kubeconfig-configured client authenticating, reading, and writing with a body
   - an unknown key rejected with 401
-  - a captured request replayed over the wire and rejected
   - signed impersonation accepted, injected impersonation rejected
   - the HMAC credential document path
   - a brokered rung: the client holds a rung scoped to one cluster, the server re-derives from the

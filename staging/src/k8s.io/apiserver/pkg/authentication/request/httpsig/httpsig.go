@@ -55,7 +55,6 @@ import (
 	"github.com/micahhausler/httpsig"
 
 	"github.com/micahhausler/httpsig/keyscope"
-	"k8s.io/apimachinery/pkg/util/cache"
 	"k8s.io/apiserver/pkg/apis/apiserver"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
@@ -65,12 +64,10 @@ import (
 )
 
 const (
-	// defaultMaxAge bounds signature age when configuration does not. It also
-	// bounds replay: a captured request can be resent until it ages out.
+	// defaultMaxAge bounds signature age when configuration does not. It is also
+	// the only bound on replay: replay protection is unimplemented, so a
+	// captured request can be resent until it ages out.
 	defaultMaxAge = 5 * time.Minute
-
-	// defaultMaxNoncesPerKey bounds the nonces remembered for one key.
-	defaultMaxNoncesPerKey = 1024
 
 	// maxBodyBytes caps the body read to check a Content-Digest. It matches the
 	// API server's default request body limit, so a request this verifier
@@ -93,11 +90,6 @@ type key struct {
 	// ladder, which derives a verifier per signature.
 	scoped *keyscope.Key
 	info   *user.DefaultInfo
-	// nonces holds recently seen nonces for this key. Buckets are per key
-	// rather than one shared set: a shared set keyed on client-chosen values
-	// lets one noisy or hostile client evict every other client's entries,
-	// which turns replay tracking into a replay enabling mechanism.
-	nonces *cache.LRUExpireCache
 }
 
 // Authenticator verifies HTTP message signatures on incoming requests.
@@ -105,9 +97,6 @@ type Authenticator struct {
 	keys      map[string]*key
 	policy    httpsig.Policy
 	parseOpts *httpsig.ParseOptions
-	// nonceTTL is how long a nonce is remembered: long enough that a signature
-	// can never outlive its own record.
-	nonceTTL time.Duration
 }
 
 var _ authenticator.Request = &Authenticator{}
@@ -126,10 +115,6 @@ func New(config *apiserver.HTTPSignatureAuthenticator) (*Authenticator, error) {
 	if config.Tolerance != nil {
 		tolerance = config.Tolerance.Duration
 	}
-	maxNonces := defaultMaxNoncesPerKey
-	if config.MaxNoncesPerKey != nil {
-		maxNonces = int(*config.MaxNoncesPerKey)
-	}
 
 	a := &Authenticator{
 		keys: make(map[string]*key, len(config.Keys)),
@@ -137,12 +122,13 @@ func New(config *apiserver.HTTPSignatureAuthenticator) (*Authenticator, error) {
 			// The floor is stated here, by this verifier, and not taken from
 			// the signature.
 			RequiredComponents: transporthttpsig.FloorComponents,
-			MaxAge:             maxAge,
-			Tolerance:          tolerance,
+			// A positive maximum age is also what makes the created parameter
+			// mandatory: the verifier rejects a signature it cannot age.
+			// Configuration cannot reach a non-positive value, because maxAge
+			// is either unset and defaulted above or validated as positive.
+			MaxAge:    maxAge,
+			Tolerance: tolerance,
 		},
-		// A nonce is remembered for as long as a signature bearing it could
-		// still be accepted.
-		nonceTTL: maxAge + tolerance,
 	}
 	if config.Scheme != "" || config.Authority != "" {
 		a.parseOpts = &httpsig.ParseOptions{Scheme: config.Scheme, Authority: config.Authority}
@@ -161,7 +147,6 @@ func New(config *apiserver.HTTPSignatureAuthenticator) (*Authenticator, error) {
 			UID:    k.User.UID,
 			Groups: k.User.Groups,
 		}
-		built.nonces = cache.NewLRUExpireCache(maxNonces)
 		a.keys[k.KeyID] = built
 	}
 	return a, nil
@@ -245,7 +230,7 @@ func (a *Authenticator) authenticateSignature(req *http.Request, sig *httpsig.Si
 
 	// Verify before anything that costs work: the signature base is built from
 	// headers alone, so an unauthenticated caller cannot make this server read
-	// a body or touch a cache.
+	// a body.
 	if err := sig.Verify(verifier, a.policy); err != nil {
 		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
 	}
@@ -254,11 +239,6 @@ func (a *Authenticator) authenticateSignature(req *http.Request, sig *httpsig.Si
 		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
 	}
 	if err := checkBodyDigest(req, sig); err != nil {
-		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
-	}
-	// Consumed last, so a request rejected for any other reason does not use up
-	// the nonce of a legitimate request it copied.
-	if err := a.consumeNonce(k, sig); err != nil {
 		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
 	}
 
@@ -349,24 +329,6 @@ func readBody(req *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("request body exceeds the %d byte limit for digest verification", maxBodyBytes)
 	}
 	return body, nil
-}
-
-// consumeNonce rejects a nonce this server has already seen for this key.
-//
-// The guarantee is bounded and worth stating exactly: a nonce is remembered by
-// one API server process, so with more than one API server and no shared state,
-// a captured request can be replayed once against each server that has not seen
-// it, until its signature ages out.
-func (a *Authenticator) consumeNonce(k *key, sig *httpsig.Signature) error {
-	nonce := sig.Nonce()
-	if nonce == "" {
-		return fmt.Errorf("signature carries no nonce")
-	}
-	if _, seen := k.nonces.Get(nonce); seen {
-		return fmt.Errorf("signature nonce has already been used")
-	}
-	k.nonces.Add(nonce, struct{}{}, a.nonceTTL)
-	return nil
 }
 
 // ValidateKey reports whether one configured key is usable. It is exported so

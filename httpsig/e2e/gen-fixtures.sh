@@ -1,4 +1,19 @@
 #!/usr/bin/env bash
+
+# Copyright The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Builds the demo tool and generates the key material and the API server's
 # authentication configuration. Idempotent, and safe to rerun: the API server's
 # key is bound to a date, so rerunning is how it gets refreshed.
@@ -26,10 +41,11 @@ demo="$bin/httpsig-demo"
 go build -o "$demo" ./cmd/httpsig-demo
 echo "built $demo"
 
-# kind.yaml owns the cluster name. It is also the value of the ladder's cluster
+# env.sh owns the cluster name. It is also the value of the ladder's cluster
 # scope step, so both the broker and the client have to agree on it, and reading
-# it back from one file is cheaper than keeping three copies in step.
-cluster="$(grep -oP '^name:\s*\K\S+' kind.yaml)"
+# it from one place is cheaper than keeping three copies in step.
+source ./env.sh
+cluster="$HTTPSIG_CLUSTER"
 
 # A demo secret in a repository is not a secret. It is named as such so that no
 # one is tempted to lift the pattern into anything real.
@@ -100,6 +116,10 @@ httpSignature:
   keyDerivation:
 EOF
   "$demo" ladder --indent "    "
+  # SC2001: the sed below indents every line of a multi-line PEM block. A
+  # parameter expansion replaces the newlines but leaves the first line
+  # unindented, so it is not the same operation.
+  # shellcheck disable=SC2001
   cat <<EOF
   keys:
   - keyID: demo-hmac

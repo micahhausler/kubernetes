@@ -90,9 +90,8 @@ func ValidateAuthenticationConfiguration(compiler authenticationcel.Compiler, c 
 	return allErrs
 }
 
-// maxHTTPSignatureKeys bounds the static key list. Every key gets a nonce cache,
-// so the list size sets a memory floor, and a list this long is a sign the
-// deployment needs a key directory rather than a longer file.
+// maxHTTPSignatureKeys bounds the static key list. A list this long is a sign
+// the deployment needs a key directory rather than a longer file.
 const maxHTTPSignatureKeys = 64
 
 func validateHTTPSignatureAuthenticator(c *api.HTTPSignatureAuthenticator, fldPath *field.Path, featureEnabled bool) field.ErrorList {
@@ -111,14 +110,14 @@ func validateHTTPSignatureAuthenticator(c *api.HTTPSignatureAuthenticator, fldPa
 		return append(allErrs, field.TooMany(fldPath.Child("keys"), len(c.Keys), maxHTTPSignatureKeys))
 	}
 
+	// Rejecting a non-positive maxAge also keeps the created parameter
+	// mandatory, because the verifier requires created only while it has an age
+	// bound to apply.
 	if c.MaxAge != nil && c.MaxAge.Duration <= 0 {
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("maxAge"), c.MaxAge.Duration.String(), "must be positive: it is the bound on how long a captured request can be replayed"))
 	}
 	if c.Tolerance != nil && c.Tolerance.Duration < 0 {
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("tolerance"), c.Tolerance.Duration.String(), "must not be negative"))
-	}
-	if c.MaxNoncesPerKey != nil && *c.MaxNoncesPerKey <= 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("maxNoncesPerKey"), *c.MaxNoncesPerKey, "must be positive: a key that remembers no nonces detects no replay"))
 	}
 	if c.Scheme != "" && c.Scheme != "http" && c.Scheme != "https" {
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("scheme"), c.Scheme, "must be http or https"))

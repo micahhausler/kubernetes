@@ -30,9 +30,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/micahhausler/httpsig"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
 )
 
 // capture records the request a round tripper sent.
@@ -437,7 +440,7 @@ func TestSignatureParameters(t *testing.T) {
 	}
 	sig := sigs[0]
 	if sig.Nonce() == "" {
-		t.Error("signature carries no nonce, so a verifier has nothing to track")
+		t.Error("signature carries no nonce, so signatures over an identical request would be identical")
 	}
 	if sig.Created().IsZero() {
 		t.Error("signature carries no created, so its age cannot be bounded")
@@ -456,8 +459,91 @@ func TestSignatureParameters(t *testing.T) {
 	}
 }
 
-// TestNoncesDiffer checks the nonce is per request. A constant nonce would let a
-// verifier's replay cache reject the client's own second request.
+// TestSignatureFieldsAreLogged checks the diagnostic that exists because the
+// debugging round tripper cannot produce it. That round tripper wraps this one
+// from the outside and reads the header map of the original request, so the
+// signature fields are absent from -v9 output no matter how it is invoked, and
+// this line is the only place they appear.
+func TestSignatureFieldsAreLogged(t *testing.T) {
+	keyFile, _ := writeEd25519Key(t)
+	cfg := Config{Algorithm: string(httpsig.Ed25519), KeyID: "k1", KeyFile: keyFile}
+
+	logger := ktesting.NewLogger(t, ktesting.NewConfig(ktesting.Verbosity(7), ktesting.BufferLogs(true)))
+	req, err := http.NewRequest("GET", "https://api.example.com/api/v1/pods", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent := signAndCapture(t, cfg, req.WithContext(klog.NewContext(req.Context(), logger)))
+
+	// The structured values are compared rather than the rendered text: a
+	// header value contains double quotes, which the renderer escapes, so a
+	// substring check against the rendered line fails for a value that is in
+	// fact present.
+	logged := loggedSignatureFields(t, logger)
+	for field, key := range map[string]string{
+		"Signature-Input": "signatureInput",
+		"Signature":       "signature",
+	} {
+		want := sent.Header.Get(field)
+		if want == "" {
+			t.Fatalf("the request carries no %s header", field)
+		}
+		// The value is required verbatim. A truncated or masked signature
+		// cannot be compared against what a verifier reconstructed, which is
+		// the only reason to read this line.
+		if got := logged[key]; got != want {
+			t.Errorf("logged %s: got %q, want %q", key, got, want)
+		}
+	}
+}
+
+// loggedSignatureFields returns the key/value pairs of the signing round
+// tripper's log entry, or nil if it logged nothing.
+func loggedSignatureFields(t *testing.T, logger logr.Logger) map[string]string {
+	t.Helper()
+	fields := map[string]string{}
+	for _, entry := range logger.GetSink().(ktesting.Underlier).GetBuffer().Data() {
+		if !strings.Contains(entry.Message, "HTTP message signature") {
+			continue
+		}
+		kvs := entry.ParameterKVList
+		for i := 0; i+1 < len(kvs); i += 2 {
+			key, ok := kvs[i].(string)
+			if !ok {
+				t.Fatalf("log key %v is not a string", kvs[i])
+			}
+			value, ok := kvs[i+1].(string)
+			if !ok {
+				t.Fatalf("log value for %q is not a string: %v", key, kvs[i+1])
+			}
+			fields[key] = value
+		}
+	}
+	return fields
+}
+
+// TestSignatureFieldsAreNotLoggedBelowThreshold keeps the diagnostic off the
+// default path. Signing happens on every request, and the signature is usable
+// against the API server until it ages out.
+func TestSignatureFieldsAreNotLoggedBelowThreshold(t *testing.T) {
+	keyFile, _ := writeEd25519Key(t)
+	cfg := Config{Algorithm: string(httpsig.Ed25519), KeyID: "k1", KeyFile: keyFile}
+
+	logger := ktesting.NewLogger(t, ktesting.NewConfig(ktesting.Verbosity(6), ktesting.BufferLogs(true)))
+	req, err := http.NewRequest("GET", "https://api.example.com/api/v1/pods", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signAndCapture(t, cfg, req.WithContext(klog.NewContext(req.Context(), logger)))
+
+	if fields := loggedSignatureFields(t, logger); len(fields) != 0 {
+		t.Errorf("the signature fields were logged at verbosity 6: %v", fields)
+	}
+}
+
+// TestNoncesDiffer checks the nonce is per request. A constant one would make
+// every signature over the same request identical, which is the property a
+// verifier tracking nonces would depend on.
 func TestNoncesDiffer(t *testing.T) {
 	keyFile, _ := writeEd25519Key(t)
 	cfg := Config{Algorithm: string(httpsig.Ed25519), KeyID: "k1", KeyFile: keyFile}

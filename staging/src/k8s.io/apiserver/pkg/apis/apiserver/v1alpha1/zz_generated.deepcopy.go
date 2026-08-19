@@ -378,11 +378,6 @@ func (in *HTTPSignatureAuthenticator) DeepCopyInto(out *HTTPSignatureAuthenticat
 		*out = new(v1.Duration)
 		**out = **in
 	}
-	if in.MaxNoncesPerKey != nil {
-		in, out := &in.MaxNoncesPerKey, &out.MaxNoncesPerKey
-		*out = new(int32)
-		**out = **in
-	}
 	return
 }
 

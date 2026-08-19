@@ -1,4 +1,19 @@
 #!/usr/bin/env bash
+
+# Copyright The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Writes fixtures/kubeconfig with one user per demo key.
 #
 # Separate from up.sh so the same file can be produced without a cluster, which
@@ -13,9 +28,10 @@ server="${1:?server URL required}"
 ca="${2:?base64 CA data required}"
 demo="$PWD/fixtures/bin/httpsig-demo"
 client="$PWD/fixtures/client"
-# The same owner gen-fixtures.sh reads it from. The client folds the ladder with
+# The same source gen-fixtures.sh reads it from. The client folds the ladder with
 # this value; a different one derives a key the server cannot verify.
-cluster="$(grep -oP '^name:\s*\K\S+' kind.yaml)"
+source ./env.sh
+cluster="$HTTPSIG_CLUSTER"
 
 # Note what is and is not in the httpSignature block. The algorithm and the TTL
 # are here because they do not rotate. There is no key and no key ID, because
@@ -27,15 +43,15 @@ apiVersion: v1
 kind: Config
 current-context: hmac
 clusters:
-- name: httpsig
+- name: $cluster
   cluster:
     server: $server
     certificate-authority-data: $ca
 contexts:
 - name: hmac
-  context: {cluster: httpsig, user: hmac}
+  context: {cluster: $cluster, user: hmac}
 - name: ecdsa
-  context: {cluster: httpsig, user: ecdsa}
+  context: {cluster: $cluster, user: ecdsa}
 users:
 - name: hmac
   user:

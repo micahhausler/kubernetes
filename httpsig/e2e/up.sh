@@ -1,23 +1,40 @@
 #!/usr/bin/env bash
+
+# Copyright The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Brings up the demo cluster and writes a kubeconfig with one user per key.
 #
 # The node image has to be a source build of this branch, because the API server
 # does the verifying. Build it once with:
 #
-#   kind build node-image --image kindest/node:httpsig-dev /path/to/kubernetes
+#   kind build node-image --image "$(./env.sh image)" /path/to/kubernetes
 #
 # and the kubectl the client side needs with:
 #
 #   make WHAT=cmd/kubectl
+#
+# The cluster and image names come from env.sh and default to the branch name, so
+# two branches on one machine do not share either. See env.sh for why.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 root="$(cd ../.. && pwd)"
 
-cluster=httpsig
-# kind.yaml owns the image name; this only reads it back so the check below can
-# fail with something better than a connection refused twenty seconds in.
-image="${HTTPSIG_NODE_IMAGE:-$(grep -oP '^\s*image:\s*\K\S+' kind.yaml)}"
+source ./env.sh
+cluster="$HTTPSIG_CLUSTER"
+image="$HTTPSIG_NODE_IMAGE"
 kubectl="${HTTPSIG_KUBECTL:-$root/_output/bin/kubectl}"
 kind="${HTTPSIG_KIND:-$HOME/go/bin/kind}"
 
@@ -32,12 +49,17 @@ Build one with: $kind build node-image --image $image $root"
 
 ./gen-fixtures.sh
 
+# The name and the image are substituted rather than passed as flags, so the file
+# kind reads is complete on its own and says what it built.
+rendered=fixtures/kind.yaml
+sed -E "s|^name:.*|name: $cluster|; s|^(\s*)image:.*|\\1image: $image|" kind.yaml >"$rendered"
+grep -q "^name: $cluster\$" "$rendered" || die "could not set the cluster name in $rendered"
+grep -q "image: $image\$" "$rendered" || die "could not set the node image in $rendered"
+
 if "$kind" get clusters 2>/dev/null | grep -qx "$cluster"; then
   echo "up.sh: cluster $cluster already exists, reusing it"
 else
-  create=(--config kind.yaml)
-  [[ -n "${HTTPSIG_NODE_IMAGE:-}" ]] && create+=(--image "$HTTPSIG_NODE_IMAGE")
-  "$kind" create cluster "${create[@]}"
+  "$kind" create cluster --config "$rendered"
 fi
 
 admin=fixtures/admin.kubeconfig
@@ -102,8 +124,7 @@ EOF
 # admin, keeps the retry out of test.sh: a denial there should mean a real denial.
 wait_for_grant() { # description, can-i arguments
   local what="$1"; shift
-  local i
-  for i in $(seq 1 60); do
+  for _ in $(seq 1 60); do
     if [[ "$("$kubectl" --kubeconfig "$admin" auth can-i "$@" \
              --as=httpsig-readiness --as-group=httpsig-demo 2>/dev/null)" == "yes" ]]; then
       return 0
@@ -116,3 +137,4 @@ wait_for_grant "view" list pods -n default
 wait_for_grant "CRD list" list customresourcedefinitions.apiextensions.k8s.io
 echo "up.sh: bound group httpsig-demo to view in namespace default, and it is in effect"
 echo "up.sh: ready. Run ./test.sh"
+echo "up.sh: tear down with: $kind delete cluster --name $cluster"

@@ -11,7 +11,7 @@ this branch. About five minutes for the node image, well under one for kubectl.
 
 ```
 KUBE_GIT_VERSION=v1.37.0-alpha.0.httpsig KUBE_GIT_TREE_STATE=clean \
-  kind build node-image --image kindest/node:httpsig-dev /path/to/kubernetes
+  kind build node-image --image "$(./env.sh image)" /path/to/kubernetes
 make WHAT=cmd/kubectl
 ```
 
@@ -19,12 +19,19 @@ make WHAT=cmd/kubectl
 build derives an empty version and kind stops with `failed to parse source
 version: could not parse "" as version`.
 
-The image name has to match the one in `kind.yaml`. If kind falls back to its own
-default node image, the failure arrives indirectly: an older kubelet panics on the
-unrecognized feature gate, no static pods are created, and kubeadm reports a
+The image name has to be the one `up.sh` will ask for, which is why the command
+above reads it from `env.sh` rather than spelling it out. If kind falls back to its
+own default node image, the failure arrives indirectly: an older kubelet panics on
+the unrecognized feature gate, no static pods are created, and kubeadm reports a
 connection refused from an API server that never started. A component handed a
 feature gate it does not recognize refuses to start rather than ignoring it, which
 is why the gate is set only on the API server.
+
+The cluster name and the image tag both default to the current git branch, so two
+branches checked out on one machine can run their clusters at the same time without
+either noticing. It also stops a branch from testing an image another branch built,
+which would otherwise pass or fail without saying so. `./env.sh` prints both names,
+and `HTTPSIG_CLUSTER` or `HTTPSIG_NODE_IMAGE` overrides either.
 
 A released kubectl will not work either, and that fails quietly rather than
 loudly: kubeconfig parsing ignores unknown fields, so it drops the
@@ -36,7 +43,7 @@ unauthorized, suspect the binary before the cluster.
 ```
 ./up.sh          # fixtures, cluster, kubeconfig, RBAC
 ./test.sh        # both keys: whoami, access review, tampered key
-kind delete cluster --name httpsig
+kind delete cluster --name "$(./env.sh cluster)"
 ```
 
 `up.sh` is safe to rerun. It reuses an existing cluster and leaves existing keys
@@ -47,8 +54,9 @@ alone, so the API server's configuration and the client's keys cannot drift.
 | File | What it is |
 | --- | --- |
 | `cmd/httpsig-demo` | The demo tool: credential plugin, key broker, and the ladder |
+| `env.sh` | The cluster name and node image tag, derived from the branch, and the one source every script reads them from |
 | `gen-fixtures.sh` | Builds the tool, generates the keys, derives the server's key, writes the authentication configuration |
-| `kind.yaml` | Cluster: the feature gate, the configuration file, and the mount |
+| `kind.yaml` | Cluster: the feature gate, the configuration file, and the mount. `up.sh` renders it into `fixtures/` with the names from `env.sh` |
 | `write-kubeconfig.sh` | The kubeconfig, one user per key |
 | `up.sh` / `test.sh` | Bring up, then check |
 

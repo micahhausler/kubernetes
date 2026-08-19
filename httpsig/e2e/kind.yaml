@@ -1,4 +1,11 @@
 # Written for kind v0.32.0 and a source build of this branch (Kubernetes 1.37).
+#
+# up.sh renders this into fixtures/kind.yaml, substituting the cluster name and
+# node image from env.sh, and hands kind the rendered copy. The values below are
+# the defaults for a branch named httpsig, so this file is still directly usable
+# with `kind create cluster --config kind.yaml`. Relative paths in extraMounts
+# resolve against the working directory rather than this file, so the rendered
+# copy under fixtures/ reads the same mount.
 apiVersion: kind.x-k8s.io/v1alpha4
 kind: Cluster
 name: httpsig

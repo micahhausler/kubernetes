@@ -734,16 +734,6 @@ type HTTPSignatureAuthenticator struct {
 	// authority. Unset means the scheme is taken from the connection.
 	// +optional
 	Scheme string `json:"scheme,omitempty"`
-
-	// maxNoncesPerKey caps how many recently seen nonces are remembered for
-	// each key. Unset means 1024.
-	//
-	// Nonces are remembered per key rather than in one shared set. A shared set
-	// keyed on values the client chooses lets one noisy or hostile client evict
-	// every other client's entries, which turns this cache into a replay
-	// enabling mechanism.
-	// +optional
-	MaxNoncesPerKey *int32 `json:"maxNoncesPerKey,omitempty"`
 }
 
 // HTTPSignatureKey is one verification key and the identity it authenticates.

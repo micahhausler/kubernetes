@@ -44,8 +44,8 @@ which deployments that leaves is an open question. `DECISIONS.md` Q1 has the arg
 
 The honest bound on all of this: a captured request can be replayed as itself, unchanged, until it
 ages out of the acceptance window. That matters most for reads, where replaying a `GET` returns the
-response again. Narrowing the window further needs a nonce cache shared by every API server, which
-this PoC does not have.
+response again. Replay protection is unimplemented, so the acceptance window is the whole of the
+bound. Narrowing it further needs state shared by every API server, which is not designed.
 
 One property belongs to the mechanism rather than to this PoC. Signing is an operation, not a value
 handed over, so the key can live in a TPM, a hardware token, or a non-exportable platform key and

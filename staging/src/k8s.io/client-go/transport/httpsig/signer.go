@@ -52,9 +52,11 @@ const Tag = "kubernetes"
 // accept does not need to be signable.
 const defaultMaxBodyBytes = int64(3 * 1024 * 1024)
 
-// nonceBytes is the length of the random nonce attached to each signature. A
-// nonce only has to be unique per key within the verifier's acceptance window;
-// 128 bits makes collision by chance not worth reasoning about.
+// nonceBytes is the length of the random nonce attached to each signature.
+// Nothing verifies nonce uniqueness today, so this is what the client offers a
+// verifier rather than a property either side relies on: it makes two signatures
+// over the same request distinguishable. 128 bits makes collision by chance not
+// worth reasoning about.
 const nonceBytes = 16
 
 // Config is a resolved client signing configuration. It holds what does not
@@ -322,6 +324,23 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err := httpsig.Sign(clone, cred.Signer, opts); err != nil {
 		return nil, fmt.Errorf("httpsig: signing request: %w", err)
 	}
+
+	// The signature fields are logged here because nothing else can. The
+	// debugging round tripper that answers -v7 and above wraps this one from
+	// the outside, and it reads the header map of the original request, so the
+	// fields set below it never reach its output. Level 7 is where that round
+	// tripper logs request headers, and these are request headers.
+	//
+	// Signature-Input is what a mismatch is usually diagnosed from: it carries
+	// the covered component list and the created, keyid, alg, nonce, and tag
+	// parameters, and it is the last line of the signature base verbatim. The
+	// signature itself is printed whole rather than masked, because a masked
+	// signature cannot be compared against what the verifier reconstructed,
+	// which is the only reason to be reading this line.
+	klog.FromContext(req.Context()).V(7).Info("Signed request with an HTTP message signature",
+		"signatureInput", clone.Header.Get("Signature-Input"),
+		"signature", clone.Header.Get("Signature"))
+
 	return rt.base.RoundTrip(clone)
 }
 

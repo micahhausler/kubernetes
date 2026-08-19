@@ -184,13 +184,6 @@ func TestValidateHTTPSignatureAuthenticator(t *testing.T) {
 		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.Tolerance = &metav1.Duration{Duration: -time.Second} },
 		want:   "must not be negative",
 	}, {
-		name: "zero maxNoncesPerKey",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			zero := int32(0)
-			c.MaxNoncesPerKey = &zero
-		},
-		want: "must be positive",
-	}, {
 		name:   "unknown scheme",
 		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.Scheme = "ftp" },
 		want:   "must be http or https",

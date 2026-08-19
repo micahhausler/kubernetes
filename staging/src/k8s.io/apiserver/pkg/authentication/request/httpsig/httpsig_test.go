@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -370,148 +371,6 @@ func TestBodyDigest(t *testing.T) {
 	})
 }
 
-func TestReplayIsRejected(t *testing.T) {
-	rt, c, config := signerFor(t)
-	auth, err := New(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
-
-	// A captured request, resent byte for byte.
-	replay, err := http.NewRequest("GET", "https://"+first.Host+first.RequestURI, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	replay = asServerRequest(replay)
-	for name, values := range first.Header {
-		for _, v := range values {
-			replay.Header.Add(name, v)
-		}
-	}
-
-	if _, ok, err := auth.AuthenticateRequest(first); !ok {
-		t.Fatalf("first request was rejected: %v", err)
-	}
-	_, ok, err := auth.AuthenticateRequest(replay)
-	if ok {
-		t.Fatal("a replayed request was accepted")
-	}
-	if err == nil || !strings.Contains(err.Error(), "nonce") {
-		t.Fatalf("want a nonce error, got %v", err)
-	}
-}
-
-// TestNoncesAreTrackedPerKey checks that one client cannot evict another's
-// records. A shared cache would let a noisy client make replay possible for
-// everyone else.
-func TestNoncesAreTrackedPerKey(t *testing.T) {
-	pubA, privA, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pubB, privB, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pemFor := func(pub ed25519.PublicKey) string {
-		der, err := x509.MarshalPKIXPublicKey(pub)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
-	}
-	one := int32(1)
-	auth, err := New(&apiserver.HTTPSignatureAuthenticator{
-		MaxNoncesPerKey: &one,
-		Keys: []apiserver.HTTPSignatureKey{{
-			KeyID: "key-a", Algorithm: string(httpsig.Ed25519), PublicKey: pemFor(pubA),
-			User: apiserver.HTTPSignatureUser{Username: "alice"},
-		}, {
-			KeyID: "key-b", Algorithm: string(httpsig.Ed25519), PublicKey: pemFor(pubB),
-			User: apiserver.HTTPSignatureUser{Username: "bob"},
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sign := func(priv ed25519.PrivateKey, keyID, nonce string) *http.Request {
-		signer, err := httpsig.NewSigner(httpsig.Ed25519, priv)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := httpsig.Sign(req, signer, httpsig.SignOptions{
-			Components: transporthttpsig.FloorComponents,
-			KeyID:      keyID,
-			Nonce:      nonce,
-			Created:    time.Now(),
-		}); err != nil {
-			t.Fatal(err)
-		}
-		return asServerRequest(req)
-	}
-
-	// Alice records a nonce. Bob then fills his own single-entry cache several
-	// times over, which would evict Alice's record from a shared cache.
-	if _, ok, err := auth.AuthenticateRequest(sign(privA, "key-a", "alice-nonce")); !ok {
-		t.Fatalf("alice's request was rejected: %v", err)
-	}
-	for i := 0; i < 5; i++ {
-		if _, ok, err := auth.AuthenticateRequest(sign(privB, "key-b", "bob-nonce-"+string(rune('a'+i)))); !ok {
-			t.Fatalf("bob's request %d was rejected: %v", i, err)
-		}
-	}
-	if _, ok, _ := auth.AuthenticateRequest(sign(privA, "key-a", "alice-nonce")); ok {
-		t.Error("alice's nonce was forgotten after another key's traffic, so her request could be replayed")
-	}
-}
-
-func TestRejectsMissingNonce(t *testing.T) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	der, err := x509.MarshalPKIXPublicKey(pub)
-	if err != nil {
-		t.Fatal(err)
-	}
-	auth, err := New(&apiserver.HTTPSignatureAuthenticator{
-		Keys: []apiserver.HTTPSignatureKey{{
-			KeyID: testKeyID, Algorithm: string(httpsig.Ed25519),
-			PublicKey: string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})),
-			User:      apiserver.HTTPSignatureUser{Username: testUser},
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer, err := httpsig.NewSigner(httpsig.Ed25519, priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := httpsig.Sign(req, signer, httpsig.SignOptions{
-		Components: transporthttpsig.FloorComponents,
-		KeyID:      testKeyID,
-		Created:    time.Now(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok, err := auth.AuthenticateRequest(asServerRequest(req)); ok {
-		t.Fatal("a signature with no nonce was accepted, so nothing could track its replay")
-	} else if err == nil || !strings.Contains(err.Error(), "nonce") {
-		t.Fatalf("want a nonce error, got %v", err)
-	}
-}
-
 func TestRejectsStaleSignature(t *testing.T) {
 	rt, c, config := signerFor(t)
 	config.MaxAge = &metav1.Duration{Duration: time.Second}
@@ -534,6 +393,97 @@ func TestRejectsStaleSignature(t *testing.T) {
 	if !errors.Is(err, httpsig.ErrExpired) {
 		t.Errorf("want an expiry error, got %v", err)
 	}
+}
+
+// stripCreated removes the created parameter from a signed request's
+// Signature-Input, which is the only way to produce a signature without one:
+// the signing library sets created unconditionally, defaulting a zero value to
+// the current time.
+//
+// This also invalidates the signature, because created is part of the signature
+// base. That is not a problem for the tests below, and is in fact what they
+// check: both rejections happen before the signature is verified, so a test
+// that got a signature mismatch instead would be reporting that the created
+// requirement had moved behind verification, or disappeared.
+func stripCreated(t *testing.T, req *http.Request) *http.Request {
+	t.Helper()
+	input := req.Header.Get("Signature-Input")
+	stripped := regexp.MustCompile(`;created=\d+`).ReplaceAllString(input, "")
+	if stripped == input {
+		t.Fatalf("Signature-Input carries no created parameter to remove: %q", input)
+	}
+	req.Header.Set("Signature-Input", stripped)
+	return req
+}
+
+// TestRejectsMissingCreated pins a requirement that no single site states.
+// Configuration cannot express it: maxAge is either unset and defaulted to five
+// minutes, or validated as positive, and the verifier requires created whenever
+// it has an age bound to apply. The requirement therefore holds through the
+// interaction of three places, and this is what fails if any of them moves.
+func TestRejectsMissingCreated(t *testing.T) {
+	// A static key. The rejection comes from the age policy, before the
+	// signature is verified.
+	t.Run("static key", func(t *testing.T) {
+		rt, c, config := signerFor(t)
+		auth, err := New(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := stripCreated(t, signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil))
+
+		_, ok, err := auth.AuthenticateRequest(req)
+		if ok {
+			t.Fatal("a signature with no created parameter was accepted, so its age could not have been bounded")
+		}
+		if !errors.Is(err, httpsig.ErrMissingCreated) {
+			t.Errorf("want a missing created error, got %v", err)
+		}
+	})
+
+	// A derived key rejects earlier and for its own reason: the verification
+	// key is derived from created, so there is nothing to verify against.
+	t.Run("derived key", func(t *testing.T) {
+		secret := "root-secret"
+		scope := map[string]string{"cell": "cell-a", "purpose": "apiserver"}
+		secretFile := filepath.Join(t.TempDir(), "root.secret")
+		if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		auth, err := New(&apiserver.HTTPSignatureAuthenticator{
+			KeyDerivation: testLadder(),
+			Keys: []apiserver.HTTPSignatureKey{{
+				KeyID:      testKeyID,
+				Algorithm:  string(httpsig.HMACSHA256),
+				SecretFile: secretFile,
+				Stage:      &apiserver.HTTPSignatureKeyStage{Scope: scope},
+				User:       apiserver.HTTPSignatureUser{Username: testUser},
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rt, c := derivedClient(t, testLadder(), transporthttpsig.Material{
+			KeyID:  testKeyID,
+			Secret: secret,
+			Stage:  &transporthttpsig.Stage{Scope: scope},
+		})
+		req := stripCreated(t, signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil))
+
+		_, ok, err := auth.AuthenticateRequest(req)
+		if ok {
+			t.Fatal("a derived signature with no created parameter was accepted")
+		}
+		// Specifically the derivation's own rejection, not the age policy's. A
+		// derived key cannot reach the age check, because there is no
+		// verification key to check against until created is known.
+		if err == nil || !strings.Contains(err.Error(), "verification key is derived from it") {
+			t.Errorf("want the derivation's own missing created error, got %v", err)
+		}
+		if errors.Is(err, httpsig.ErrMissingCreated) {
+			t.Error("the derived key reached the age policy, so it derived a verification key without a created timestamp")
+		}
+	})
 }
 
 func TestRejectsUnknownKeyID(t *testing.T) {
