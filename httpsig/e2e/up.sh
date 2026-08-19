@@ -40,6 +40,20 @@ kind="${HTTPSIG_KIND:-$HOME/go/bin/kind}"
 
 die() { echo "up.sh: $*" >&2; exit 1; }
 
+# Whatever the reason for stopping, the resolver does not outlive a failed run. A
+# resolver left listening on a socket a later run wants is the one way this demo
+# wedges rather than fails. A successful run leaves it up, because the cluster needs
+# it: the API server resolves every uncached key through it.
+on_exit() {
+  local status=$?
+  if [[ $status -ne 0 ]]; then
+    ./resolver.sh stop >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap on_exit EXIT
+
+
 [[ -x "$kubectl" ]] || die "no kubectl at $kubectl. Build one with: make -C $root WHAT=cmd/kubectl
 A released kubectl will not work: kubeconfig parsing ignores unknown fields, so it
 would drop the httpSignature block and send unauthenticated requests instead."
@@ -55,6 +69,20 @@ rendered=fixtures/kind.yaml
 sed -E "s|^name:.*|name: $cluster|; s|^(\s*)image:.*|\\1image: $image|" kind.yaml >"$rendered"
 grep -q "^name: $cluster\$" "$rendered" || die "could not set the cluster name in $rendered"
 grep -q "image: $image\$" "$rendered" || die "could not set the node image in $rendered"
+
+# The resolver starts before the cluster, and that ordering is not incidental.
+#
+# kube-apiserver fetches each resolver's metadata while it builds its
+# authenticator, and fails to start if it cannot. Started afterwards, the API
+# server would crash-loop through kubeadm init and the cluster would never come
+# up. Started first, it is simply there.
+#
+# It runs on the host rather than on the node. That is not what a real deployment
+# looks like, where it would be a pod or a node process beside the API server, but
+# it is clearer for a demo: its log is in a file you can read, its key file is on
+# the host where it was generated, and stopping it is killing a process. The
+# reachability is the same either way, because a unix socket crosses a bind mount.
+./resolver.sh start
 
 if "$kind" get clusters 2>/dev/null | grep -qx "$cluster"; then
   echo "up.sh: cluster $cluster already exists, reusing it"

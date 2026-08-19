@@ -98,60 +98,84 @@ cluster rather than the root secret. See D8.
 
 ## What an operator configures
 
-kube-apiserver reads its verification keys from `AuthenticationConfiguration`, the same file that
-already configures JWT and anonymous authentication. The `httpSignature` section is new and sits
-behind the `HTTPSignatureAuthentication` alpha feature gate.
+kube-apiserver is configured by an `httpSignature` list in `AuthenticationConfiguration`, the same
+file that already configures JWT and anonymous authentication, behind the
+`HTTPSignatureAuthentication` alpha feature gate. Editing the file takes effect without a restart.
 
-The PoC's demo configuration, trimmed to one asymmetric key:
+One entry, pointing at a resolver:
 
 ```yaml
 apiVersion: apiserver.config.k8s.io/v1
 kind: AuthenticationConfiguration
 httpSignature:
-  # Checked against the created timestamp in the signature, so a captured
-  # request can be replayed only until it ages out of this window.
+- endpoint: unix:///var/run/httpsig/resolver.sock
+  # Checked against the created timestamp in the signature, so a stale request is
+  # refused and the resolver knows how long to remember its nonce.
   maxAge: 1m
-  keys:
-  - keyID: demo-ecdsa-p384
-    algorithm: ecdsa-p384-sha384
-    publicKey: |
-      -----BEGIN PUBLIC KEY-----
-      MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEXM4XBQ2KMgl9J+F2v3eyB5J8uEsQ+tpg
-      ...
-      -----END PUBLIC KEY-----
-    user:
-      username: ecdsa-demo
-      groups:
-      - httpsig-demo
+  # Only key IDs whose first segment matches reach this resolver. Omitting this
+  # means it is asked about every key ID.
+  keyIDPrefixes: [corp]
+  # A value the client covers with its signature and this server passes on, for a
+  # resolver that decides identity from a session token rather than from a key ID.
+  relayedHeaders: [X-Session-Token]
 ```
 
-A key entry names the algorithm, the public key, and the identity that a request signed by that key
-authenticates as. A shared secret is referenced by file path instead, because a public key is not a
-secret and a shared secret is.
+No key material and no identity appears in this file. The resolver on that socket answers two
+questions, and the API server does all of the cryptography itself:
+
+- Which key verifies signatures bearing this key ID, and whose identity is it? The answer is a public
+  key, a shared secret, or a rung of a key derivation ladder, plus a username, UID, and groups, plus
+  how long the answer may be cached.
+- Has this nonce been used for this key before? This has to be an atomic check-and-record, and it is
+  why nonces left the API server: a per-process cache lets a captured request be replayed once against
+  every API server that has not seen it.
+
+A resolver with no nonce store is a real case, so `nonceHandling: Ignore` on an entry turns the second
+question off and the API server stops asking it. The replay window is then the maximum signature age.
+That is stated in configuration rather than faked with a resolver that always answers yes, because the
+latter costs a round trip and leaves nothing an operator can audit. Unset means on, a misspelling is an
+error rather than a silent default, and `apiserver_httpsig_resolver_nonce_tracking` reports which it is
+per resolver.
+
+The protocol is `k8s.io/externalhttpsig`, a small gRPC API in the shape the KMS provider and the
+external JWT signer already use. A resolver holds key material and never sees a request; the API server
+verifies signatures and never holds a key for longer than its cache says.
+
+What a resolver returns is a claim, not a conclusion. The API server refuses a username or group under
+the `system:` prefix, because whoever holds the resolver's socket can vend an identity to the cluster
+and claiming a name Kubernetes issues would be a larger grant than vending a key.
 
 ## What is not solved
 
-**Key lookup.** The static key list above is a stand-in so the rest can be demonstrated. It does not
-scale past a handful of identities. It has no revocation short of editing a file on every control
-plane node. And it puts human identities in server configuration.
+**Key distribution.** The API server knows how to ask. Deciding which party holds which key material
+and how it gets there is the resolver operator's problem.
 
-Getting a credential to the client has a real answer here. Getting verification material to the
-server does not. Everything unsolved sits on one side.
+There is a resolver in `e2e/cmd/httpsig-resolver`, backed by a YAML file, which the integration tests
+and the kind demo both run a real API server against. It is a demo: key material sits in plaintext next
+to the identity it authenticates, and nonce state is in memory in one process. Both are the shape of the
+answer rather than the answer, and its README says so.
 
-Two directions could replace the list, and `DECISIONS.md` section 6 works through both:
+**Bounding lookups from an unauthenticated caller.** A key lookup happens before any signature has
+verified, because verifying needs the key. Length caps, an age check before the lookup, collapsing
+concurrent duplicates, and a short memory of unknown key IDs all reduce the cost. Nothing caps the rate
+for a caller cycling through distinct key IDs. `DECISIONS.md` Q6 works through where that limit should
+live.
 
-- **An X.509 certificate as a user assertion.** The client sends a certificate alongside the
-  signature. The server validates it against a CA and reads the identity from the subject. This is
-  mTLS with the handshake replaced by a message signature, and for pods most of the delivery
-  machinery already exists in tree.
-- **An external lookup API.** The verifier asks a key distribution service what key verifies a given
-  key ID and who it belongs to, then checks the signature locally. Only the lookup is remote, and
-  its answer is cacheable because a key is stable where a token is not.
+**Ladder agreement between a client and a resolver.** Both state the derivation ladder, and they now
+have different owners: the resolver's copy comes from an identity system, the client's is authored into
+a kubeconfig. Both publish a digest of theirs, so comparing them is one metric read against one log
+line, but a mismatch still surfaces at the client as a signature that does not verify.
+
+An alternative direction that would replace key lookup rather than implement it is worked through in
+`DECISIONS.md` section 6: an X.509 certificate carried as a user assertion, which is mTLS with the
+handshake replaced by a message signature, and for pods most of the delivery machinery already exists
+in tree.
 
 ## Status
 
-Not yet a KEP. Not proposed upstream. A fork with working client and server plumbing, unit tests,
-integration tests against a real kube-apiserver, and a kind demo.
+Not yet a KEP. Not proposed upstream. A fork with working client and server plumbing, an external key
+resolution API, a file-backed resolver, unit tests, integration tests against a real kube-apiserver, and
+a kind demo that runs the whole arrangement.
 
 Five parts are meant to be read as proposals: the kubeconfig surface, the credential sources behind
 it, the wire format and coverage rules, the verifier, and the mapping from a verified key to an

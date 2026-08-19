@@ -27,6 +27,7 @@ import (
 
 	celgo "github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/operators"
+	"golang.org/x/net/http/httpguts"
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 
 	v1 "k8s.io/api/authorization/v1"
@@ -36,12 +37,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	api "k8s.io/apiserver/pkg/apis/apiserver"
 	authenticationcel "k8s.io/apiserver/pkg/authentication/cel"
-	"k8s.io/apiserver/pkg/authentication/request/httpsig"
 	authorizationcel "k8s.io/apiserver/pkg/authorization/cel"
 	"k8s.io/apiserver/pkg/cel"
 	"k8s.io/apiserver/pkg/features"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	transporthttpsig "k8s.io/client-go/transport/httpsig"
 	"k8s.io/client-go/util/cert"
+	kmsutil "k8s.io/kms/pkg/util"
 )
 
 // ValidateAuthenticationConfiguration validates a given AuthenticationConfiguration.
@@ -84,37 +86,98 @@ func ValidateAuthenticationConfiguration(compiler authenticationcel.Compiler, c 
 		}
 	}
 
-	allErrs = append(allErrs, validateHTTPSignatureAuthenticator(c.HTTPSignature, field.NewPath("httpSignature"),
+	allErrs = append(allErrs, validateHTTPSignatureAuthenticators(c.HTTPSignature, field.NewPath("httpSignature"),
 		utilfeature.DefaultFeatureGate.Enabled(features.HTTPSignatureAuthentication))...)
 
 	return allErrs
 }
 
-// maxHTTPSignatureKeys bounds the static key list. A list this long is a sign
-// the deployment needs a key directory rather than a longer file.
-const maxHTTPSignatureKeys = 64
+// maxHTTPSignatureResolvers bounds the resolver list. Resolvers are consulted in
+// order for a keyid whose prefixes admit it, so the list length is a multiplier on
+// what one unauthenticated request can cost. A deployment needing more than this
+// needs one resolver that fronts them, not a longer list.
+const maxHTTPSignatureResolvers = 8
 
-func validateHTTPSignatureAuthenticator(c *api.HTTPSignatureAuthenticator, fldPath *field.Path, featureEnabled bool) field.ErrorList {
+func validateHTTPSignatureAuthenticators(cs []api.HTTPSignatureAuthenticator, fldPath *field.Path, featureEnabled bool) field.ErrorList {
 	var allErrs field.ErrorList
-	if c == nil {
+	if len(cs) == 0 {
 		return allErrs
 	}
 	if !featureEnabled {
 		return append(allErrs, field.Forbidden(fldPath, "httpSignature is not supported when the HTTPSignatureAuthentication feature gate is disabled"))
 	}
-
-	if len(c.Keys) == 0 {
-		allErrs = append(allErrs, field.Required(fldPath.Child("keys"), "at least one key is required for the httpSignature authenticator to authenticate anything"))
-	}
-	if len(c.Keys) > maxHTTPSignatureKeys {
-		return append(allErrs, field.TooMany(fldPath.Child("keys"), len(c.Keys), maxHTTPSignatureKeys))
+	if len(cs) > maxHTTPSignatureResolvers {
+		return append(allErrs, field.TooMany(fldPath, len(cs), maxHTTPSignatureResolvers))
 	}
 
-	// Rejecting a non-positive maxAge also keeps the created parameter
-	// mandatory, because the verifier requires created only while it has an age
-	// bound to apply.
+	seenEndpoints := sets.New[string]()
+	seenPrefixes := sets.New[string]()
+	unprefixed := 0
+	for i, c := range cs {
+		path := fldPath.Index(i)
+		allErrs = append(allErrs, validateHTTPSignatureAuthenticator(c, path)...)
+
+		if len(c.Endpoint) > 0 {
+			if seenEndpoints.Has(c.Endpoint) {
+				allErrs = append(allErrs, field.Duplicate(path.Child("endpoint"), c.Endpoint))
+			}
+			seenEndpoints.Insert(c.Endpoint)
+		}
+
+		// Scheme and authority describe this server, not a resolver: the authority
+		// goes into the signature base, so two entries disagreeing would make the
+		// same request verify under one and fail under the other. Rather than
+		// choose between them, reject the state where they can disagree.
+		if c.Scheme != cs[0].Scheme {
+			allErrs = append(allErrs, field.Invalid(path.Child("scheme"), c.Scheme, fmt.Sprintf("must match httpSignature[0].scheme (%q): scheme describes this server rather than a resolver, so every entry has to state the same value", cs[0].Scheme)))
+		}
+		if c.Authority != cs[0].Authority {
+			allErrs = append(allErrs, field.Invalid(path.Child("authority"), c.Authority, fmt.Sprintf("must match httpSignature[0].authority (%q): authority describes this server rather than a resolver, and it is covered by every signature, so every entry has to state the same value", cs[0].Authority)))
+		}
+
+		if len(c.KeyIDPrefixes) == 0 {
+			unprefixed++
+			continue
+		}
+		for j, prefix := range c.KeyIDPrefixes {
+			prefixPath := path.Child("keyIDPrefixes").Index(j)
+			switch {
+			case len(prefix) == 0:
+				allErrs = append(allErrs, field.Required(prefixPath, "an empty prefix admits nothing; omit keyIDPrefixes to admit every keyID"))
+			case strings.Contains(prefix, "/"):
+				allErrs = append(allErrs, field.Invalid(prefixPath, prefix, "must not contain \"/\": a prefix is matched against the segment of a keyID before its first slash, so one containing a slash can never match"))
+			case seenPrefixes.Has(prefix):
+				// Two resolvers claiming one prefix means which serves a keyID
+				// depends on list order, and a key moved between resolvers would
+				// change identity silently.
+				allErrs = append(allErrs, field.Duplicate(prefixPath, prefix))
+			default:
+				seenPrefixes.Insert(prefix)
+			}
+		}
+	}
+
+	// More than one resolver asked about every keyID means every unknown keyID
+	// costs a call to each. One catch-all is a deliberate choice; two is a
+	// configuration that fans out without saying so.
+	if unprefixed > 1 {
+		allErrs = append(allErrs, field.Invalid(fldPath, unprefixed, "at most one entry may omit keyIDPrefixes: entries without prefixes are asked about every keyID, so more than one turns each unknown keyID into a call to each of them"))
+	}
+
+	return allErrs
+}
+
+func validateHTTPSignatureAuthenticator(c api.HTTPSignatureAuthenticator, fldPath *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+
+	if len(c.Endpoint) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("endpoint"), "a resolver endpoint is required: keys are not configured in this file"))
+	} else if _, err := kmsutil.ParseEndpoint(c.Endpoint); err != nil {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("endpoint"), c.Endpoint, err.Error()))
+	}
+
 	if c.MaxAge != nil && c.MaxAge.Duration <= 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("maxAge"), c.MaxAge.Duration.String(), "must be positive: it is the bound on how long a captured request can be replayed"))
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("maxAge"), c.MaxAge.Duration.String(), "must be positive: it bounds how stale a request may be, and how long a resolver is asked to remember a nonce"))
 	}
 	if c.Tolerance != nil && c.Tolerance.Duration < 0 {
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("tolerance"), c.Tolerance.Duration.String(), "must not be negative"))
@@ -123,47 +186,51 @@ func validateHTTPSignatureAuthenticator(c *api.HTTPSignatureAuthenticator, fldPa
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("scheme"), c.Scheme, "must be http or https"))
 	}
 
-	seenKeyIDs := sets.New[string]()
-	seenUsernames := sets.New[string]()
-	for i, k := range c.Keys {
-		keyPath := fldPath.Child("keys").Index(i)
-		if len(k.KeyID) == 0 {
-			allErrs = append(allErrs, field.Required(keyPath.Child("keyID"), ""))
-		} else if seenKeyIDs.Has(k.KeyID) {
-			allErrs = append(allErrs, field.Duplicate(keyPath.Child("keyID"), k.KeyID))
-		}
-		seenKeyIDs.Insert(k.KeyID)
+	// Checked against a closed set rather than compared against Ignore alone. A typo
+	// would otherwise fall through to the default, which is the safe value, so it
+	// would silently leave replay protection on for an operator who meant to turn it
+	// off. Silently doing the safe thing is still silently doing the wrong thing, and
+	// the operator would go looking in the resolver for the cause.
+	switch c.NonceHandling {
+	case "", api.NonceHandlingConsume, api.NonceHandlingIgnore:
+	default:
+		allErrs = append(allErrs, field.NotSupported(fldPath.Child("nonceHandling"), c.NonceHandling,
+			[]api.NonceHandling{api.NonceHandlingConsume, api.NonceHandlingIgnore}))
+	}
 
-		if len(k.User.Username) == 0 {
-			allErrs = append(allErrs, field.Required(keyPath.Child("user", "username"), ""))
-		} else {
-			// system: names are issued by Kubernetes itself. A static key that
-			// claimed one would let a configuration file mint an identity the
-			// cluster's own authorization rules are written around.
-			if strings.HasPrefix(k.User.Username, "system:") {
-				allErrs = append(allErrs, field.Invalid(keyPath.Child("user", "username"), k.User.Username, "may not start with system:, which is reserved for identities Kubernetes issues"))
-			}
-			if seenUsernames.Has(k.User.Username) {
-				allErrs = append(allErrs, field.Duplicate(keyPath.Child("user", "username"), k.User.Username))
-			}
-			seenUsernames.Insert(k.User.Username)
-		}
-		for j, group := range k.User.Groups {
-			if len(group) == 0 {
-				allErrs = append(allErrs, field.Required(keyPath.Child("user", "groups").Index(j), ""))
-			}
-			if strings.HasPrefix(group, "system:") {
-				allErrs = append(allErrs, field.Invalid(keyPath.Child("user", "groups").Index(j), group, "may not start with system:, which is reserved for groups Kubernetes issues"))
-			}
-		}
-
-		// The algorithm registry and the key encodings live in the verifier, so
-		// they are checked by building the verifier rather than by a second copy
-		// of the rules here. This also rejects a key file that cannot be read.
-		if err := httpsig.ValidateKey(k, c.KeyDerivation); err != nil {
-			allErrs = append(allErrs, field.Invalid(keyPath, "", err.Error()))
+	seenHeaders := sets.New[string]()
+	for i, name := range c.RelayedHeaders {
+		headerPath := fldPath.Child("relayedHeaders").Index(i)
+		lower := strings.ToLower(name)
+		switch {
+		case len(name) == 0:
+			allErrs = append(allErrs, field.Required(headerPath, ""))
+		case !httpguts.ValidHeaderFieldName(name):
+			allErrs = append(allErrs, field.Invalid(headerPath, name, "is not a valid HTTP header field name"))
+		case transporthttpsig.IsReservedHeader(name):
+			// These have their own configuration paths. Relaying one would be a way
+			// to route around the path that governs it.
+			allErrs = append(allErrs, field.Invalid(headerPath, name, "may not be relayed: it has its own configuration path, and relaying it would be a way to route around that path"))
+		case seenHeaders.Has(lower):
+			allErrs = append(allErrs, field.Duplicate(headerPath, name))
+		default:
+			seenHeaders.Insert(lower)
 		}
 	}
+
+	if c.Cache != nil {
+		cachePath := fldPath.Child("cache")
+		if c.Cache.MaxKeys != nil && *c.Cache.MaxKeys <= 0 {
+			allErrs = append(allErrs, field.Invalid(cachePath.Child("maxKeys"), *c.Cache.MaxKeys, "must be positive: a cache that holds no keys makes a resolver call per request"))
+		}
+		if c.Cache.MaxAge != nil && c.Cache.MaxAge.Duration < 0 {
+			allErrs = append(allErrs, field.Invalid(cachePath.Child("maxAge"), c.Cache.MaxAge.Duration.String(), "must not be negative; zero disables caching of resolved keys"))
+		}
+		if c.Cache.NegativeMaxAge != nil && c.Cache.NegativeMaxAge.Duration < 0 {
+			allErrs = append(allErrs, field.Invalid(cachePath.Child("negativeMaxAge"), c.Cache.NegativeMaxAge.Duration.String(), "must not be negative; zero disables caching of unserved keyIDs"))
+		}
+	}
+
 	return allErrs
 }
 

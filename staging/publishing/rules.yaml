@@ -425,6 +425,8 @@ rules:
       branch: master
     - repository: component-base
       branch: master
+    - repository: externalhttpsig
+      branch: master
     - repository: kms
       branch: master
     source:
@@ -513,6 +515,8 @@ rules:
     - repository: client-go
       branch: master
     - repository: apiserver
+      branch: master
+    - repository: externalhttpsig
       branch: master
     - repository: component-base
       branch: master
@@ -621,6 +625,8 @@ rules:
     - repository: client-go
       branch: master
     - repository: apiserver
+      branch: master
+    - repository: externalhttpsig
       branch: master
     - repository: code-generator
       branch: master
@@ -857,6 +863,8 @@ rules:
     - repository: client-go
       branch: master
     - repository: apiserver
+      branch: master
+    - repository: externalhttpsig
       branch: master
     - repository: code-generator
       branch: master
@@ -1518,6 +1526,8 @@ rules:
       branch: master
     - repository: apiserver
       branch: master
+    - repository: externalhttpsig
+      branch: master
     - repository: kms
       branch: master
     source:
@@ -1612,6 +1622,8 @@ rules:
     - repository: streaming
       branch: master
     - repository: apiserver
+      branch: master
+    - repository: externalhttpsig
       branch: master
     - repository: client-go
       branch: master
@@ -2126,6 +2138,8 @@ rules:
       branch: master
     - repository: apiserver
       branch: master
+    - repository: externalhttpsig
+      branch: master
     - repository: client-go
       branch: master
     - repository: component-base
@@ -2222,6 +2236,8 @@ rules:
     - repository: streaming
       branch: master
     - repository: apiserver
+      branch: master
+    - repository: externalhttpsig
       branch: master
     - repository: api
       branch: master
@@ -2350,6 +2366,8 @@ rules:
     - repository: client-go
       branch: master
     - repository: apiserver
+      branch: master
+    - repository: externalhttpsig
       branch: master
     - repository: component-helpers
       branch: master
@@ -2532,6 +2550,13 @@ rules:
       branch: release-1.37
       dirs:
       - staging/src/k8s.io/endpointslice
+- destination: externalhttpsig
+  branches:
+  - name: master
+    source:
+      branch: master
+      dirs:
+      - staging/src/k8s.io/externalhttpsig
 - destination: externaljwt
   branches:
   - name: master

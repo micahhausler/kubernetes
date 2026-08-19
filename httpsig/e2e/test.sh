@@ -38,16 +38,45 @@ export KUBE_FEATURE_ClientsAllowHTTPSignature=true
 
 failures=0
 
-# A property of the layout rather than of a request: the API server is given a
-# key folded through the date step, so the root secret is not in the directory it
-# mounts. This is what the ladder buys in this configuration. A shared secret
-# otherwise lets the verifier mint signatures indistinguishable from the
-# client's; here it could do so only for the one day its rung names.
-if grep -rqs "httpsig-kind-demo-not-a-real-secret" fixtures/node/; then
-  echo "  FAIL the root secret is in fixtures/node/, which the API server mounts"
+# Properties of the layout rather than of any request, checked because they are
+# what the external key API is for and because a regression in them would not
+# show up as a failing request.
+#
+# The root secret is nowhere near the node: the resolver holds a key folded
+# through the date step, so even it can mint signatures only for the one day its
+# rung names. A shared secret otherwise lets a verifier produce signatures
+# indistinguishable from the client's.
+if grep -rqs "httpsig-kind-demo-not-a-real-secret" fixtures/node/ fixtures/resolver/; then
+  echo "  FAIL the root secret reached a file that is generated rather than held"
   failures=1
 else
-  echo "  ok   the API server never sees the root HMAC secret"
+  echo "  ok   neither the node nor the resolver holds the root HMAC secret"
+fi
+
+# And the stronger property, which the static key list could not have: the
+# directory the control plane mounts holds no key material at all. Before the move
+# to a resolver this held a derived HMAC key and every public key.
+node_files="$(find fixtures/node -type f -printf '%f\n' | sort | tr '\n' ' ')"
+if [[ "$node_files" == "authentication-config.yaml " ]]; then
+  echo "  ok   the control plane mounts one file, and it holds no key material"
+else
+  echo "  FAIL fixtures/node holds more than the authentication config: $node_files"
+  failures=1
+fi
+if grep -rqsE "BEGIN (PUBLIC|EC|RSA|PRIVATE) KEY|secretBase64|secretFile" fixtures/node/; then
+  echo "  FAIL key material appears in the directory the control plane mounts"
+  failures=1
+else
+  echo "  ok   no key, public or private, in the API server's configuration"
+fi
+
+# The resolver is what answers for those keys, so a demo that passed with it dead
+# would be proving something other than what it claims.
+if ./resolver.sh status >/dev/null 2>&1; then
+  echo "  ok   the resolver is running and holding the keys"
+else
+  echo "  FAIL the resolver is not running. Run ./up.sh, or ./resolver.sh start"
+  failures=1
 fi
 check() {
   local what="$1" want="$2" got="$3"

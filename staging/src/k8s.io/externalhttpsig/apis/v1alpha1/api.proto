@@ -1,0 +1,382 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// To regenerate api.pb.go run `hack/update-codegen.sh protobindings`
+syntax = "proto3";
+
+package v1alpha1;
+
+option go_package = "k8s.io/externalhttpsig/apis/v1alpha1";
+
+import "google/protobuf/timestamp.proto";
+
+// This service is served by a process on a local Unix Domain Socket. It resolves
+// the keys that verify HTTP message signatures (RFC 9421) on requests to
+// kube-apiserver, and it records the nonces those signatures carry.
+//
+// The division of labor is fixed and is the reason this API is worth having.
+// kube-apiserver does all of the cryptography: it builds the signature base,
+// verifies the signature, enforces which components a signature must cover, and
+// checks the body digest. A resolver holds key material and nonce state. It
+// never sees a request and it never decides whether a signature is valid.
+//
+// Two consequences follow, and an implementation that ignores either is unsafe:
+//
+// Every value in a ResolveKeyRequest is an unverified claim. The request is
+// dispatched before any signature has been verified, because verifying requires
+// the key this call returns. A key ID, an algorithm, and a relayed header value
+// are all peer-chosen input. Treat them as lookup input, never as authorization.
+//
+// A ConsumeNonce call must be an atomic check-and-record, not a read. Several
+// kube-apiservers front one cluster and each will call this for the same
+// signature at most once. If two concurrent calls for the same key ID and nonce
+// can both return accepted, the replay window is as wide as the number of API
+// servers, which is the situation this RPC exists to close.
+service ExternalHTTPSignatureService {
+    // Metadata is called once at startup, and then polled as a health check.
+    //
+    // It carries the facts about a resolver that are not per key: the key
+    // derivation ladder its symmetric material is derived through, and any
+    // narrowing of signature age it wants to impose. kube-apiserver will not
+    // serve signature-authenticated requests for this resolver until one call
+    // has succeeded, so a resolver that cannot yet answer should fail rather
+    // than answer with defaults.
+    rpc Metadata(MetadataRequest) returns (MetadataResponse) {}
+
+    // ResolveKey returns the key that verifies signatures bearing a key ID, and
+    // the identity a request so signed authenticates as.
+    //
+    // kube-apiserver calls this for a key ID it has no cached answer for, and
+    // caches the response for the duration the response states. Return NOT_FOUND
+    // for a key ID this resolver does not serve or no longer serves: a key that
+    // has been revoked is a key that does not resolve. Do not return a response
+    // that describes the absence of a key, because a caller that mishandles such
+    // a response authenticates a request it should have rejected.
+    rpc ResolveKey(ResolveKeyRequest) returns (ResolveKeyResponse) {}
+
+    // ConsumeNonce records that a nonce has been used for a key, and reports
+    // whether it had been used already.
+    //
+    // kube-apiserver calls this only after a signature has verified, so unlike
+    // ResolveKey this is not reachable by an unauthenticated caller. It is called
+    // at most once per accepted request.
+    //
+    // This must be atomic: two concurrent calls with the same key ID and nonce
+    // must not both return accepted. An implementation may forget a nonce once
+    // the expires_at the request carries has passed, because kube-apiserver will
+    // not accept a signature bearing it after that.
+    //
+    // An error, including an unreachable resolver, causes kube-apiserver to
+    // reject the request. There is no configuration that makes it accept one
+    // instead: anti-replay that can be turned off by making this call fail is
+    // not anti-replay.
+    rpc ConsumeNonce(ConsumeNonceRequest) returns (ConsumeNonceResponse) {}
+}
+
+message MetadataRequest {}
+
+message MetadataResponse {
+    // key_derivation is the HMAC key derivation ladder this resolver's symmetric
+    // material is derived through. Set it only if this resolver vends material
+    // for hmac-sha256 that is a rung of a ladder rather than a whole secret.
+    //
+    // A ladder is not secret. It describes a derivation for a whole deployment,
+    // and every party that derives states the same one: this resolver, and every
+    // client that signs. kube-apiserver holds no copy of its own, so this is the
+    // only statement of it the server sees. kube-apiserver logs a digest of the
+    // parsed ladder and exposes it as a metric label, so an operator can compare
+    // it against the digest a client logs for its own copy. Two parties that
+    // disagree about a ladder otherwise fail as a bare signature mismatch, with
+    // nothing in the error to say why.
+    KeyDerivation key_derivation = 1;
+
+    // max_signature_age_seconds bounds how old any signature this resolver's keys
+    // verify may be, measured from its created parameter. kube-apiserver applies
+    // the smaller of this and its own configured maximum age, so this can only
+    // narrow the replay window and never widen it. Zero or negative means this
+    // resolver states no opinion.
+    int64 max_signature_age_seconds = 2;
+
+    // refresh_hint_seconds is how often kube-apiserver should call Metadata
+    // again. The same call is the resolver's health check, so this also sets how
+    // quickly an unhealthy resolver is noticed. Zero or negative means
+    // kube-apiserver uses its own interval.
+    int64 refresh_hint_seconds = 3;
+}
+
+// KeyDerivation is an HMAC key derivation ladder: a chain of HMAC steps that
+// turns a root secret into a signing key scoped to a purpose and, with a date
+// step, to a day. It contains no secret.
+//
+// The field names and the closed sets of values here are the same ones a client
+// states in its kubeconfig, so one ladder document describes both sides.
+message KeyDerivation {
+    // kind discriminates the derivation form. Only "hmac-ladder" is defined.
+    string kind = 1;
+
+    // hash is the HMAC hash used to derive: "sha-256" or "sha-512". The signature
+    // algorithm is always hmac-sha256; this governs derivation only.
+    string hash = 2;
+
+    // secret_prefix is prepended to the root secret before the first step. It
+    // applies only when the material is the root secret, never to a rung.
+    string secret_prefix = 3;
+
+    // steps are the rungs, applied in order. Each step's input is fed to HMAC
+    // keyed by the previous step's output, and the last output is the key that
+    // verifies a signature.
+    repeated KeyDerivationStep steps = 4;
+}
+
+// KeyDerivationStep is one rung of a ladder. Exactly one of literal, scope, or
+// date supplies the step's input.
+//
+// Step names are arbitrary labels chosen by whoever writes the ladder. Nothing
+// treats a name, a prefix, or a literal as meaningful.
+message KeyDerivationStep {
+    // name identifies the step. Names are unique within a ladder and key the
+    // scope map of a DerivedKey. A name may not contain "/", because step values
+    // are joined by slashes into the key ID a signature carries.
+    string name = 1;
+
+    // literal is a fixed input value, the same for every party.
+    string literal = 2;
+
+    // scope marks the input as a deployment-scoped value, such as a cell or a
+    // purpose name, supplied by each party's own position on the ladder.
+    bool scope = 3;
+
+    // date names a date format from a closed set: "YYYYMMDD" or "YYYY-MM-DD".
+    // The input is the signature's created timestamp rendered in UTC, so a signer
+    // and a verifier render the same value without consulting their own clocks.
+    // The set is deliberately not a strftime or Go layout string: a ladder is
+    // read by implementations in any language, and a format token has to mean the
+    // same thing to all of them.
+    string date = 4;
+}
+
+message ResolveKeyRequest {
+    // key_id is the keyid parameter the signature carries, exactly as it appeared
+    // on the wire. kube-apiserver does not parse it, beyond taking the segment
+    // before the first "/" to decide which resolver to ask. A derived key's
+    // key_id is the key's name followed by each ladder step's claimed value,
+    // joined by "/", and decomposing that is this resolver's job because this
+    // resolver is the party that holds the ladder.
+    //
+    // This is peer-chosen input of bounded length. Do not interpret it as a path,
+    // a query, or a template.
+    string key_id = 1;
+
+    // algorithm is the alg parameter the signature carries, named as in the IANA
+    // "HTTP Signature Algorithms" registry: ed25519, ecdsa-p256-sha256,
+    // ecdsa-p384-sha384, rsa-pss-sha512, rsa-v1_5-sha256, or hmac-sha256.
+    //
+    // It is advisory, and it is a claim. It lets a resolver holding more than one
+    // key for a name choose, or reject early. The authoritative algorithm is the
+    // one this resolver states in the response, which kube-apiserver checks the
+    // signature's claim against.
+    string algorithm = 2;
+
+    // created is the created parameter the signature carries. A resolver that
+    // vends date-scoped material derives for this date rather than for its own
+    // clock, so that a signature created either side of a date boundary resolves
+    // to the key it was signed with.
+    //
+    // kube-apiserver has already rejected a signature whose created is outside
+    // its configured maximum age and clock tolerance, so this is bounded, but it
+    // is still a value the peer chose within those bounds.
+    google.protobuf.Timestamp created = 3;
+
+    // relayed_headers holds values for the request headers kube-apiserver is
+    // configured to relay, keyed by lowercase header name. Nothing else about the
+    // request is sent: not the method, not the path, not the body.
+    //
+    // This is how key material or tenancy context can travel in a request header
+    // rather than sitting in a file, such as a rotating session token. Two rules
+    // make it safe to have. kube-apiserver relays only the headers its own
+    // configuration names, so a resolver cannot ask for more of the request. And
+    // a relayed header must be covered by the signature, which kube-apiserver
+    // checks before dispatching this call, so an intermediary cannot inject one.
+    //
+    // Covered is not the same as verified. Verification needs the key this call
+    // returns, so at the time this call is made the value is still only a claim.
+    map<string, string> relayed_headers = 4;
+
+    // uid is a unique identifier for this call, for correlating a resolver's logs
+    // with kube-apiserver's. It identifies the call, not the request, not the key,
+    // and not the user.
+    string uid = 5;
+
+    // api_server_id is the identity of the calling kube-apiserver, for a
+    // resolver's own audit trail.
+    string api_server_id = 6;
+}
+
+message ResolveKeyResponse {
+    // algorithm is the algorithm this key verifies, named as in the IANA "HTTP
+    // Signature Algorithms" registry. Required.
+    //
+    // This is the authoritative value and the signature's own alg claim is
+    // checked against it. Without it a peer could claim hmac-sha256 for a key
+    // whose material is an asymmetric public key and have the public key treated
+    // as a shared secret, which is the algorithm confusion class of attack. A
+    // resolver that echoes the request's algorithm rather than stating its key's
+    // own reopens that.
+    string algorithm = 1;
+
+    // Exactly one of these carries the key material, and which one is determined
+    // by algorithm: public_key for the asymmetric algorithms, secret or
+    // derived_key for hmac-sha256.
+    oneof material {
+        // public_key is a public key in PKIX, ASN.1 DER form, the encoding
+        // x509.MarshalPKIXPublicKey produces. Not PEM: a PEM block type is a
+        // second statement of the key kind and a second thing to disagree with
+        // algorithm. A public key is not secret.
+        bytes public_key = 2;
+
+        // secret is a shared secret for hmac-sha256, used as given with no
+        // derivation. Any ladder in Metadata does not apply to it.
+        //
+        // A shared secret lets whoever holds it produce signatures
+        // indistinguishable from the client's. Prefer derived_key, which bounds
+        // that, or an asymmetric algorithm, which removes it.
+        bytes secret = 3;
+
+        // derived_key is a rung of the ladder Metadata states, together with its
+        // position on that ladder. kube-apiserver folds the remaining steps per
+        // request, using the signature's created timestamp for any date step.
+        //
+        // This bounds what a compromise of kube-apiserver's memory yields: only
+        // what the rung's scope covers, and for a rung past a date step, only
+        // until that date rolls.
+        DerivedKey derived_key = 4;
+    }
+
+    // user is the identity a request signed by this key authenticates as.
+    // Required.
+    //
+    // This is a claim crossing a trust boundary, not a conclusion.
+    // kube-apiserver validates it on arrival and rejects an empty username, and
+    // any username or group under the "system:" prefix, which is reserved for
+    // identities Kubernetes issues. No prefix is added, so a resolver operator
+    // owns avoiding collision with names other authenticators issue.
+    UserInfo user = 5;
+
+    // cache_ttl_seconds is how long kube-apiserver may reuse this response
+    // without calling again. Zero or negative means do not cache, which is the
+    // right answer when the response depended on a relayed header value that
+    // rotates.
+    //
+    // A cached key stays usable after it is revoked, so this is the revocation
+    // window and this resolver sets it. kube-apiserver caps it by its own
+    // configured maximum, and caches nothing longer.
+    int64 cache_ttl_seconds = 6;
+
+    // max_signature_age_seconds bounds how old a signature verified by this key
+    // may be. kube-apiserver applies the smallest of this, the value in
+    // MetadataResponse, and its own configured maximum, so this can only narrow
+    // the replay window for this one key. Zero or negative means no opinion.
+    int64 max_signature_age_seconds = 7;
+}
+
+// DerivedKey is a rung of a key derivation ladder and its position on it. The
+// bytes of derived material cannot say what was folded into them, so the position
+// travels with them.
+message DerivedKey {
+    // key is the rung: the raw output of the step named by from. Required.
+    bytes key = 1;
+
+    // from names the ladder step whose output key is. Empty means key is the root
+    // secret and kube-apiserver folds the whole ladder per request.
+    string from = 2;
+
+    // scope holds values for the ladder's scope steps, and assertions for the
+    // date steps at or before from, keyed by step name.
+    //
+    // A value for a step at or before from asserts what is already folded into
+    // key; a value for a scope step after from is an input still to be folded. It
+    // must cover exactly those. A missing value and an unexpected value are both
+    // errors, because either one means this resolver and kube-apiserver disagree
+    // about what the material is.
+    map<string, string> scope = 3;
+}
+
+// UserInfo is an identity a key authenticates as.
+message UserInfo {
+    // username is the user name. Required, and must not begin with "system:".
+    string username = 1;
+
+    // uid is a unique identifier for the user.
+    string uid = 2;
+
+    // groups are the groups the user belongs to. No group may begin with
+    // "system:". The "system:authenticated" group is added by kube-apiserver and
+    // does not need to be listed.
+    repeated string groups = 3;
+
+    // extra holds additional information about the user, keyed by an arbitrary
+    // name. kube-apiserver passes it to authorization and records it in the audit
+    // log without interpreting it.
+    map<string, ExtraValue> extra = 4;
+}
+
+// ExtraValue is the multi-valued form every value in UserInfo.extra takes, because
+// proto3 maps cannot hold a repeated value directly.
+message ExtraValue {
+    repeated string items = 1;
+}
+
+message ConsumeNonceRequest {
+    // key_id is the keyid parameter of the signature that carried this nonce,
+    // exactly as it appeared on the wire. Nonces are scoped per key: the same
+    // nonce value used by two different keys is two different facts, and a
+    // resolver that pooled them would let one client's traffic reject another's.
+    string key_id = 1;
+
+    // nonce is the nonce parameter the signature carries. Unlike everything in a
+    // ResolveKeyRequest, this arrives having been covered by a signature that
+    // already verified, so it is the value the key holder chose.
+    string nonce = 2;
+
+    // created is the created parameter the signature carries.
+    google.protobuf.Timestamp created = 3;
+
+    // expires_at is when kube-apiserver will stop accepting any signature bearing
+    // this nonce, being created plus the effective maximum signature age plus the
+    // configured clock tolerance. A resolver may forget the nonce after this and
+    // still be correct; forgetting it earlier reopens the replay window.
+    google.protobuf.Timestamp expires_at = 4;
+
+    // uid is a unique identifier for this call, for correlating logs. It
+    // identifies the call, not the request.
+    string uid = 5;
+
+    // api_server_id is the identity of the calling kube-apiserver.
+    string api_server_id = 6;
+}
+
+message ConsumeNonceResponse {
+    // accepted reports that this nonce had not been used for this key and has now
+    // been recorded. False means the request is rejected as a replay.
+    bool accepted = 1;
+
+    // reason describes why accepted is false, for kube-apiserver's log. It states
+    // a policy outcome, such as a nonce having been seen before. It is not the
+    // place for a transport or storage failure: those belong in the gRPC status,
+    // where kube-apiserver counts them separately, because a resolver outage
+    // reported as a rejection reads in the logs as a replay attack.
+    string reason = 2;
+}

@@ -17,295 +17,291 @@ limitations under the License.
 package validation
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/apis/apiserver"
 )
 
-func testPublicKeyPEM(t *testing.T) string {
-	t.Helper()
-	pub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	der, err := x509.MarshalPKIXPublicKey(pub)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
-}
-
-func validHTTPSignatureConfig(t *testing.T) *apiserver.HTTPSignatureAuthenticator {
-	t.Helper()
-	return &apiserver.HTTPSignatureAuthenticator{
-		Keys: []apiserver.HTTPSignatureKey{{
-			KeyID:     "alice-key",
-			Algorithm: "ed25519",
-			PublicKey: testPublicKeyPEM(t),
-			User: apiserver.HTTPSignatureUser{
-				Username: "alice",
-				Groups:   []string{"signers"},
-			},
-		}},
+func validHTTPSignatureConfig() apiserver.HTTPSignatureAuthenticator {
+	return apiserver.HTTPSignatureAuthenticator{
+		Endpoint: "unix:///var/run/httpsig-resolver.sock",
 	}
 }
 
-// TestValidateHTTPSignatureFeatureGate covers the rule that keeps an alpha
-// section from taking effect by accident: the field exists in the served config
-// versions, so the gate is the only thing standing between a configuration file
-// and a live authenticator.
-func TestValidateHTTPSignatureFeatureGate(t *testing.T) {
-	config := validHTTPSignatureConfig(t)
+func int32Ptr(i int32) *int32 { return &i }
 
-	errs := validateHTTPSignatureAuthenticator(config, nil, false)
-	if len(errs) == 0 {
-		t.Fatal("want an error when the feature gate is disabled")
-	}
-	if !strings.Contains(errs.ToAggregate().Error(), "feature gate is disabled") {
-		t.Errorf("error does not name the feature gate: %v", errs.ToAggregate())
-	}
-
-	if errs := validateHTTPSignatureAuthenticator(config, nil, true); len(errs) != 0 {
-		t.Errorf("want no errors for a valid config with the gate enabled, got %v", errs.ToAggregate())
-	}
-
-	// An absent section is not an error whether the gate is on or off, otherwise
-	// enabling the gate would be required to run at all.
-	if errs := validateHTTPSignatureAuthenticator(nil, nil, false); len(errs) != 0 {
-		t.Errorf("an absent httpSignature section must not be an error: %v", errs.ToAggregate())
-	}
-}
-
-func TestValidateHTTPSignatureAuthenticator(t *testing.T) {
-	dir := t.TempDir()
-	secretFile := filepath.Join(dir, "secret")
-	if err := os.WriteFile(secretFile, []byte("shared-secret"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	// A ladder scoping by cell, with no date step, so these cases test scope
-	// handling rather than expiry.
-	ladder := func() *apiserver.HTTPSignatureKeyDerivation {
-		return &apiserver.HTTPSignatureKeyDerivation{
-			Kind: "hmac-ladder",
-			Hash: "sha-256",
-			Steps: []apiserver.HTTPSignatureKeyDerivationStep{
-				{Name: "cell", Scope: true},
-				{Name: "terminator", Literal: "k8s_request"},
-			},
-		}
-	}
-	pubPEM := testPublicKeyPEM(t)
-
+func TestValidateHTTPSignatureAuthenticators(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		mutate func(*apiserver.HTTPSignatureAuthenticator)
-		want   string
-	}{{
-		name:   "valid",
-		mutate: func(*apiserver.HTTPSignatureAuthenticator) {},
-	}, {
-		name: "valid hmac key",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.Keys[0].Algorithm = "hmac-sha256"
-			c.Keys[0].PublicKey = ""
-			c.Keys[0].SecretFile = secretFile
+		name    string
+		configs []apiserver.HTTPSignatureAuthenticator
+		gate    bool
+		// wantErr is a substring of the expected error, or empty for no error.
+		wantErr string
+	}{
+		{
+			name:    "valid",
+			configs: []apiserver.HTTPSignatureAuthenticator{validHTTPSignatureConfig()},
+			gate:    true,
 		},
-	}, {
-		name:   "no keys",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.Keys = nil },
-		want:   "at least one key is required",
-	}, {
-		name: "too many keys",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			for i := 0; i < maxHTTPSignatureKeys+1; i++ {
-				c.Keys = append(c.Keys, apiserver.HTTPSignatureKey{
-					KeyID:     "k" + string(rune('a'+i%26)) + string(rune('a'+i/26)),
-					Algorithm: "ed25519", PublicKey: pubPEM,
-					User: apiserver.HTTPSignatureUser{Username: "u" + string(rune('a'+i%26)) + string(rune('a'+i/26))},
-				})
-			}
+		{
+			name:    "absent section is fine with the gate off",
+			configs: nil,
+			gate:    false,
 		},
-		want: "Too many",
-	}, {
-		name:   "no keyID",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.Keys[0].KeyID = "" },
-		want:   "keyID",
-	}, {
-		name: "duplicate keyID",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			second := c.Keys[0]
-			second.User.Username = "bob"
-			c.Keys = append(c.Keys, second)
+		{
+			name:    "present section needs the gate",
+			configs: []apiserver.HTTPSignatureAuthenticator{validHTTPSignatureConfig()},
+			gate:    false,
+			wantErr: "HTTPSignatureAuthentication feature gate is disabled",
 		},
-		want: "Duplicate value",
-	}, {
-		name: "duplicate username",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			second := c.Keys[0]
-			second.KeyID = "bob-key"
-			c.Keys = append(c.Keys, second)
+		{
+			name:    "endpoint is required",
+			configs: []apiserver.HTTPSignatureAuthenticator{{}},
+			gate:    true,
+			wantErr: "keys are not configured in this file",
 		},
-		want: "Duplicate value",
-	}, {
-		name:   "no username",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.Keys[0].User.Username = "" },
-		want:   "username",
-	}, {
-		name:   "system username",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.Keys[0].User.Username = "system:masters-impostor" },
-		want:   "may not start with system:",
-	}, {
-		name:   "system group",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.Keys[0].User.Groups = []string{"system:masters"} },
-		want:   "may not start with system:",
-	}, {
-		name:   "empty group",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.Keys[0].User.Groups = []string{""} },
-		want:   "groups[0]",
-	}, {
-		name:   "zero maxAge",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.MaxAge = &metav1.Duration{} },
-		want:   "must be positive",
-	}, {
-		name:   "negative maxAge",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.MaxAge = &metav1.Duration{Duration: -time.Minute} },
-		want:   "must be positive",
-	}, {
-		name:   "negative tolerance",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.Tolerance = &metav1.Duration{Duration: -time.Second} },
-		want:   "must not be negative",
-	}, {
-		name:   "unknown scheme",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.Scheme = "ftp" },
-		want:   "must be http or https",
-	}, {
-		name: "malformed public key",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.Keys[0].PublicKey = "-----BEGIN PUBLIC KEY-----\nnope\n-----END PUBLIC KEY-----\n"
+		{
+			name:    "endpoint must be a unix socket",
+			configs: []apiserver.HTTPSignatureAuthenticator{{Endpoint: "https://resolver.example.com"}},
+			gate:    true,
+			wantErr: "unsupported scheme",
 		},
-		want: "publicKey",
-	}, {
-		name:   "unknown algorithm",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.Keys[0].Algorithm = "ed448" },
-		want:   "ed448",
-	}, {
-		// A ladder describes the deployment, so an asymmetric key sitting beside
-		// one is fine: the ladder simply does not apply to it. Claiming a
-		// position on the ladder is what an asymmetric key cannot do.
-		name: "a ladder alongside an asymmetric key",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.KeyDerivation = ladder()
+		{
+			name: "abstract socket is accepted",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///@httpsig-resolver"},
+			},
+			gate: true,
 		},
-	}, {
-		name: "an asymmetric key claiming a position on the ladder",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.KeyDerivation = ladder()
-			c.Keys[0].Stage = &apiserver.HTTPSignatureKeyStage{
-				Scope: map[string]string{"cell": "cell-a"},
-			}
+		{
+			name: "duplicate endpoints",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"one"}},
+				{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"two"}},
+			},
+			gate:    true,
+			wantErr: "Duplicate value",
 		},
-		want: "hmac-sha256 only",
-	}, {
-		name: "stage without a derivation",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.Keys[0].Algorithm = "hmac-sha256"
-			c.Keys[0].PublicKey = ""
-			c.Keys[0].SecretFile = secretFile
-			c.Keys[0].Stage = &apiserver.HTTPSignatureKeyStage{Scope: map[string]string{"cell": "a"}}
+		{
+			name: "two catch-all resolvers fan out",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock"},
+				{Endpoint: "unix:///b.sock"},
+			},
+			gate:    true,
+			wantErr: "at most one entry may omit keyIDPrefixes",
 		},
-		want: "requires httpSignature.keyDerivation",
-	}, {
-		name: "valid derivation from the root secret",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.Keys[0].Algorithm = "hmac-sha256"
-			c.Keys[0].PublicKey = ""
-			c.Keys[0].SecretFile = secretFile
-			c.KeyDerivation = ladder()
-			c.Keys[0].Stage = &apiserver.HTTPSignatureKeyStage{Scope: map[string]string{"cell": "cell-a"}}
+		{
+			name: "one catch-all alongside a prefixed resolver is fine",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"corp"}},
+				{Endpoint: "unix:///b.sock"},
+			},
+			gate: true,
 		},
-	}, {
-		name: "derivation with a scope the ladder does not take",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.Keys[0].Algorithm = "hmac-sha256"
-			c.Keys[0].PublicKey = ""
-			c.Keys[0].SecretFile = secretFile
-			c.KeyDerivation = ladder()
-			c.Keys[0].Stage = &apiserver.HTTPSignatureKeyStage{Scope: map[string]string{
-				"cell": "cell-a", "zone": "z1",
-			}}
+		{
+			name: "duplicate prefix across resolvers",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"corp"}},
+				{Endpoint: "unix:///b.sock", KeyIDPrefixes: []string{"corp"}},
+			},
+			gate:    true,
+			wantErr: "Duplicate value",
 		},
-		want: "does not take from this stage",
-	}, {
-		name: "derivation missing a scope value",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.Keys[0].Algorithm = "hmac-sha256"
-			c.Keys[0].PublicKey = ""
-			c.Keys[0].SecretFile = secretFile
-			c.KeyDerivation = ladder()
+		{
+			name: "prefix with a slash can never match",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"corp/cell-a"}},
+			},
+			gate:    true,
+			wantErr: "can never match",
 		},
-		want: "must be non-empty",
-	}, {
-		// The ladder is validated where it is stated, so a server operator learns
-		// their ladder is wrong at startup rather than from rejected requests.
-		name: "invalid derivation",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.Keys[0].Algorithm = "hmac-sha256"
-			c.Keys[0].PublicKey = ""
-			c.Keys[0].SecretFile = secretFile
-			bad := ladder()
-			bad.Steps[0].Date = "20060102"
-			c.KeyDerivation = bad
+		{
+			name: "empty prefix",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{""}},
+			},
+			gate:    true,
+			wantErr: "omit keyIDPrefixes",
 		},
-		want: "date",
-	}, {
-		// A rung is raw bytes, so its file holds base64. A plain secret would
-		// decode to something arbitrary and fail as a signature mismatch.
-		name: "staged secret file that is not base64",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.Keys[0].Algorithm = "hmac-sha256"
-			c.Keys[0].PublicKey = ""
-			c.Keys[0].SecretFile = secretFile
-			c.KeyDerivation = ladder()
-			c.Keys[0].Stage = &apiserver.HTTPSignatureKeyStage{
-				From:  "cell",
-				Scope: map[string]string{"cell": "cell-a"},
-			}
+		{
+			name: "disagreeing authority",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"one"}, Authority: "one.example.com"},
+				{Endpoint: "unix:///b.sock", KeyIDPrefixes: []string{"two"}, Authority: "two.example.com"},
+			},
+			gate:    true,
+			wantErr: "describes this server rather than a resolver",
 		},
-		want: "must hold base64",
-	}, {
-		name: "hmac with an unreadable secret file",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.Keys[0].Algorithm = "hmac-sha256"
-			c.Keys[0].PublicKey = ""
-			c.Keys[0].SecretFile = "/nonexistent/secret"
+		{
+			name: "disagreeing scheme",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"one"}, Scheme: "https"},
+				{Endpoint: "unix:///b.sock", KeyIDPrefixes: []string{"two"}, Scheme: "http"},
+			},
+			gate:    true,
+			wantErr: "describes this server rather than a resolver",
 		},
-		want: "reading secretFile",
-	}} {
+		{
+			name: "agreeing scheme and authority",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"one"}, Scheme: "https", Authority: "api.example.com"},
+				{Endpoint: "unix:///b.sock", KeyIDPrefixes: []string{"two"}, Scheme: "https", Authority: "api.example.com"},
+			},
+			gate: true,
+		},
+		{
+			name: "bad scheme",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", Scheme: "ftp"},
+			},
+			gate:    true,
+			wantErr: "must be http or https",
+		},
+		{
+			name: "zero maxAge",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", MaxAge: &metav1.Duration{}},
+			},
+			gate:    true,
+			wantErr: "must be positive",
+		},
+		{
+			name: "negative tolerance",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", Tolerance: &metav1.Duration{Duration: -time.Second}},
+			},
+			gate:    true,
+			wantErr: "must not be negative",
+		},
+		{
+			name: "reserved relayed header",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"Authorization"}},
+			},
+			gate:    true,
+			wantErr: "route around that path",
+		},
+		{
+			name: "reserved impersonation prefix",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"Impersonate-Extra-Scopes"}},
+			},
+			gate:    true,
+			wantErr: "route around that path",
+		},
+		{
+			name: "duplicate relayed header differing only in case",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"X-Token", "x-token"}},
+			},
+			gate:    true,
+			wantErr: "Duplicate value",
+		},
+		{
+			name: "invalid relayed header name",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"X Token"}},
+			},
+			gate:    true,
+			wantErr: "not a valid HTTP header field name",
+		},
+		{
+			name: "valid relayed header",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"X-Session-Token"}},
+			},
+			gate: true,
+		},
+		{
+			name: "zero cache maxKeys",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", Cache: &apiserver.HTTPSignatureCache{MaxKeys: int32Ptr(0)}},
+			},
+			gate:    true,
+			wantErr: "must be positive",
+		},
+		{
+			name: "negative cache maxAge",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", Cache: &apiserver.HTTPSignatureCache{MaxAge: &metav1.Duration{Duration: -time.Second}}},
+			},
+			gate:    true,
+			wantErr: "must not be negative",
+		},
+		{
+			name: "zero cache maxAge disables caching and is allowed",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", Cache: &apiserver.HTTPSignatureCache{MaxAge: &metav1.Duration{}}},
+			},
+			gate: true,
+		},
+		{
+			name: "nonceHandling Consume",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", NonceHandling: apiserver.NonceHandlingConsume},
+			},
+			gate: true,
+		},
+		{
+			name: "nonceHandling Ignore",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", NonceHandling: apiserver.NonceHandlingIgnore},
+			},
+			gate: true,
+		},
+		{
+			// A typo would otherwise fall through to the safe default, leaving replay
+			// protection on for an operator who meant to turn it off and sending them
+			// to the resolver to find out why.
+			name: "nonceHandling typo",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", NonceHandling: "ignore"},
+			},
+			gate:    true,
+			wantErr: "Unsupported value",
+		},
+		{
+			name: "nonceHandling nonsense",
+			configs: []apiserver.HTTPSignatureAuthenticator{
+				{Endpoint: "unix:///a.sock", NonceHandling: "Disabled"},
+			},
+			gate:    true,
+			wantErr: "Unsupported value",
+		},
+		{
+			name:    "too many resolvers",
+			configs: manyResolvers(maxHTTPSignatureResolvers + 1),
+			gate:    true,
+			wantErr: "Too many",
+		},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			config := validHTTPSignatureConfig(t)
-			tc.mutate(config)
-			errs := validateHTTPSignatureAuthenticator(config, nil, true)
-			if tc.want == "" {
-				if len(errs) != 0 {
-					t.Fatalf("want no errors, got %v", errs.ToAggregate())
-				}
-				return
-			}
-			if len(errs) == 0 {
-				t.Fatalf("want an error mentioning %q, got none", tc.want)
-			}
-			if !strings.Contains(errs.ToAggregate().Error(), tc.want) {
-				t.Errorf("error %v does not mention %q", errs.ToAggregate(), tc.want)
+			errs := validateHTTPSignatureAuthenticators(tc.configs, field.NewPath("httpSignature"), tc.gate)
+			got := errs.ToAggregate()
+			switch {
+			case tc.wantErr == "" && got != nil:
+				t.Fatalf("unexpected error: %v", got)
+			case tc.wantErr != "" && got == nil:
+				t.Fatalf("expected an error containing %q, got none", tc.wantErr)
+			case tc.wantErr != "" && !strings.Contains(got.Error(), tc.wantErr):
+				t.Fatalf("expected an error containing %q, got: %v", tc.wantErr, got)
 			}
 		})
 	}
+}
+
+func manyResolvers(n int) []apiserver.HTTPSignatureAuthenticator {
+	out := make([]apiserver.HTTPSignatureAuthenticator, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, apiserver.HTTPSignatureAuthenticator{
+			Endpoint:      "unix:///resolver-" + string(rune('a'+i)) + ".sock",
+			KeyIDPrefixes: []string{"prefix-" + string(rune('a'+i))},
+		})
+	}
+	return out
 }

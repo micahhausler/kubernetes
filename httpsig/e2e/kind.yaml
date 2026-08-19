@@ -16,6 +16,12 @@ nodes:
   # heard of any of this, and the failure is indirect: the kubelet panics on the
   # unrecognized feature gate, no static pods are created, and kubeadm reports a
   # connection refused from an API server that was never started.
+  #
+  # This tag and the cluster name above are defaults. env.sh derives both from the
+  # current branch and up.sh substitutes them, because a node image tag is a Docker
+  # tag and therefore global to the machine: two branches sharing one means
+  # whichever built last decides which API server a cluster runs, and that failure
+  # is silent.
   image: kindest/node:httpsig-dev
   # A JSON patch rather than a strategic merge patch, because in kubeadm v1beta4
   # extraArgs is a list of name/value pairs with no merge key. A merge patch would
@@ -48,10 +54,28 @@ nodes:
           hostPath: /httpsig
           mountPath: /httpsig
           readOnly: true
+        # The resolver's socket. Read only, which still permits connect: connecting
+        # to a unix socket is a permission check on the inode, not a write to the
+        # filesystem. So the API server can reach the resolver and cannot replace
+        # it with a listener of its own.
+        - name: httpsig-socket
+          hostPath: /httpsig-socket
+          mountPath: /httpsig-socket
+          readOnly: true
   # Resolved against the working directory, so run kind from this directory.
-  # This mount is the server's whole view of the key material: the HMAC secret it
-  # shares with the client, and nothing else. The client's private key is not here.
   extraMounts:
+  # The node's whole view of the configuration. After the move to a resolver this
+  # holds no key material at all: one authentication configuration naming a socket.
+  # Compare fixtures/resolver, which holds the keys and is mounted nowhere.
   - hostPath: ./fixtures/node
     containerPath: /httpsig
+    readOnly: true
+  # The directory the resolver's socket lives in. The resolver runs on the host and
+  # creates the socket there; the node only connects to it.
+  #
+  # Read only here too. A socket is reachable through a read-only mount, so the
+  # weaker mount costs nothing and means nothing in the node can unlink the socket
+  # and take the resolver's place.
+  - hostPath: ./fixtures/socket
+    containerPath: /httpsig-socket
     readOnly: true

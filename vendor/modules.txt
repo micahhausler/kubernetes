@@ -1117,6 +1117,8 @@ gopkg.in/yaml.v3
 ## explicit; go 1.26.0
 # k8s.io/endpointslice v0.0.0 => ./staging/src/k8s.io/endpointslice
 ## explicit; go 1.26.0
+# k8s.io/externalhttpsig v0.0.0 => ./staging/src/k8s.io/externalhttpsig
+## explicit; go 1.26.0
 # k8s.io/externaljwt v0.0.0 => ./staging/src/k8s.io/externaljwt
 ## explicit; go 1.26.0
 # k8s.io/gengo/v2 v2.0.0-20260408192533-25e2208e0dc3

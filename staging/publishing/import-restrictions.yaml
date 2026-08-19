@@ -122,6 +122,7 @@
   - k8s.io/utils
   - k8s.io/klog
   - k8s.io/kms
+  - k8s.io/externalhttpsig
 
 - baseImportPath: "./staging/src/k8s.io/metrics"
   allowedImports:
@@ -348,6 +349,10 @@
   - k8s.io/klog/v2
   - k8s.io/streaming
   - k8s.io/utils
+
+- baseImportPath: "./staging/src/k8s.io/externalhttpsig"
+  allowedImports:
+  - k8s.io/externalhttpsig
 
 - baseImportPath: "./staging/src/k8s.io/externaljwt"
   allowedImports:

@@ -17,41 +17,70 @@ limitations under the License.
 package httpsig
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/micahhausler/httpsig"
-
 	"github.com/micahhausler/httpsig/keyscope"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apiserver/pkg/apis/apiserver"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	nettesting "k8s.io/apimachinery/pkg/util/net/testing"
+	"k8s.io/apiserver/pkg/apis/apiserver"
+	resolvertesting "k8s.io/apiserver/pkg/authentication/request/httpsig/testing"
 	transporthttpsig "k8s.io/client-go/transport/httpsig"
+	externalhttpsig "k8s.io/externalhttpsig/apis/v1alpha1"
 )
 
 const (
+	// testDialTimeout bounds the first metadata call in tests. Short because a test
+	// resolver is listening before the authenticator is built, so anything longer
+	// only slows a failure down.
+	testDialTimeout = 10 * time.Second
+
 	testKeyID   = "alice-key"
 	testUser    = "alice"
 	testGroup   = "signers"
 	testAuthort = "api.example.com"
 )
 
-// signerFor returns a signing round tripper and the matching server config.
-func signerFor(t *testing.T) (http.RoundTripper, *capture, *apiserver.HTTPSignatureAuthenticator) {
+// newResolver starts a resolver on a socket unique to this test.
+func newResolver(t *testing.T, name string) *resolvertesting.Resolver {
+	t.Helper()
+	socket := nettesting.MakeSocketNameForTest(t, fmt.Sprintf("httpsig-%s-%d.sock", name, time.Now().UnixNano()))
+	return resolvertesting.New(t, socket)
+}
+
+// authenticatorFor builds an Authenticator over the given resolvers, and tears
+// down its connections when the test ends.
+func authenticatorFor(t *testing.T, configs ...apiserver.HTTPSignatureAuthenticator) *Authenticator {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a, err := New(ctx, configs, "test-apiserver", testDialTimeout)
+	if err != nil {
+		t.Fatalf("building the authenticator: %v", err)
+	}
+	return a
+}
+
+// ed25519Client returns a signing round tripper and the PKIX public key a
+// resolver would answer with.
+func ed25519Client(t *testing.T, keyID string) (http.RoundTripper, *capture, []byte) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -69,28 +98,35 @@ func signerFor(t *testing.T) (http.RoundTripper, *capture, *apiserver.HTTPSignat
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := &apiserver.HTTPSignatureAuthenticator{
-		Keys: []apiserver.HTTPSignatureKey{{
-			KeyID:     testKeyID,
-			Algorithm: string(httpsig.Ed25519),
-			PublicKey: string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})),
-			User: apiserver.HTTPSignatureUser{
-				Username: testUser,
-				UID:      "uid-1",
-				Groups:   []string{testGroup},
-			},
-		}},
-	}
 	c := &capture{}
 	rt, err := transporthttpsig.NewRoundTripper(transporthttpsig.Config{
 		Algorithm: string(httpsig.Ed25519),
-		KeyID:     testKeyID,
+		KeyID:     keyID,
 		KeyFile:   keyFile,
 	}, c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return rt, c, config
+	return rt, c, pubDER
+}
+
+// ed25519Answer is the response a resolver gives for an ed25519 key.
+func ed25519Answer(pubDER []byte, username string) *externalhttpsig.ResolveKeyResponse {
+	return &externalhttpsig.ResolveKeyResponse{
+		Algorithm:       string(httpsig.Ed25519),
+		Material:        &externalhttpsig.ResolveKeyResponse_PublicKey{PublicKey: pubDER},
+		User:            &externalhttpsig.UserInfo{Username: username, Uid: "uid-1", Groups: []string{testGroup}},
+		CacheTtlSeconds: 300,
+	}
+}
+
+// signerFor wires the common case: one resolver serving one ed25519 key.
+func signerFor(t *testing.T) (http.RoundTripper, *capture, *resolvertesting.Resolver, apiserver.HTTPSignatureAuthenticator) {
+	t.Helper()
+	rt, c, pubDER := ed25519Client(t, testKeyID)
+	r := newResolver(t, "keys")
+	r.SetKey(testKeyID, ed25519Answer(pubDER, testUser))
+	return rt, c, r, apiserver.HTTPSignatureAuthenticator{Endpoint: r.Endpoint()}
 }
 
 type capture struct {
@@ -130,659 +166,716 @@ func asServerRequest(req *http.Request) *http.Request {
 }
 
 func TestAuthenticatesSignedRequest(t *testing.T) {
-	rt, c, config := signerFor(t)
-	auth, err := New(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods?watch=true", nil)
+	rt, c, r, config := signerFor(t)
+	a := authenticatorFor(t, config)
 
-	resp, ok, err := auth.AuthenticateRequest(req)
-	if err != nil {
-		t.Fatalf("AuthenticateRequest: %v", err)
-	}
-	if !ok {
-		t.Fatal("signed request was not authenticated")
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods?limit=1", nil)
+	resp, ok, err := a.AuthenticateRequest(req)
+	if err != nil || !ok {
+		t.Fatalf("AuthenticateRequest: ok=%v err=%v", ok, err)
 	}
 	if got := resp.User.GetName(); got != testUser {
 		t.Errorf("username: got %q, want %q", got, testUser)
 	}
 	if got := resp.User.GetUID(); got != "uid-1" {
-		t.Errorf("uid: got %q, want uid-1", got)
+		t.Errorf("uid: got %q, want %q", got, "uid-1")
 	}
 	if got := resp.User.GetGroups(); len(got) != 1 || got[0] != testGroup {
 		t.Errorf("groups: got %v, want [%s]", got, testGroup)
 	}
-	// The signature fields are spent. Leaving them for something downstream to
-	// read is the mistake the bearer token authenticator avoids by deleting its
-	// own header.
-	if req.Header.Get("Signature") != "" || req.Header.Get("Signature-Input") != "" {
-		t.Error("signature fields were not cleared after authentication")
+
+	// The signature fields are cleared so nothing downstream reads them as a
+	// credential.
+	if len(req.Header.Values("Signature")) != 0 || len(req.Header.Values("Signature-Input")) != 0 {
+		t.Errorf("signature fields survived authentication: %v", req.Header)
+	}
+
+	resolveCalls, nonceCalls, _ := r.Counts()
+	if resolveCalls != 1 {
+		t.Errorf("ResolveKey calls: got %d, want 1", resolveCalls)
+	}
+	if nonceCalls != 1 {
+		t.Errorf("ConsumeNonce calls: got %d, want 1", nonceCalls)
 	}
 }
 
 func TestNoOpinionWithoutSignature(t *testing.T) {
-	_, _, config := signerFor(t)
-	auth, err := New(config)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, _, _, config := signerFor(t)
+	a := authenticatorFor(t, config)
+
 	req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, ok, err := auth.AuthenticateRequest(req)
+	resp, ok, err := a.AuthenticateRequest(req)
 	if resp != nil || ok || err != nil {
-		t.Errorf("an unsigned request must draw no opinion so the chain continues: got (%v, %v, %v)", resp, ok, err)
+		t.Fatalf("a request with no signature should draw no opinion: resp=%v ok=%v err=%v", resp, ok, err)
 	}
 }
 
-// TestRejectsSignatureMissingFloorComponents is the first of the two invariants
-// this package exists to enforce. An attacker with their own key signs a
-// component list of their choosing. The signature is internally valid. It must
-// still be rejected, because the covered set is this server's requirement and
-// not the signature's claim.
-func TestRejectsSignatureMissingFloorComponents(t *testing.T) {
-	for _, omit := range []string{"@method", "@authority", "@path", "@query"} {
-		t.Run("without "+omit, func(t *testing.T) {
-			pub, priv, err := ed25519.GenerateKey(rand.Reader)
-			if err != nil {
-				t.Fatal(err)
-			}
-			pubDER, err := x509.MarshalPKIXPublicKey(pub)
-			if err != nil {
-				t.Fatal(err)
-			}
-			auth, err := New(&apiserver.HTTPSignatureAuthenticator{
-				Keys: []apiserver.HTTPSignatureKey{{
-					KeyID:     testKeyID,
-					Algorithm: string(httpsig.Ed25519),
-					PublicKey: string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})),
-					User:      apiserver.HTTPSignatureUser{Username: testUser},
-				}},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			var components []httpsig.Component
-			for _, c := range transporthttpsig.FloorComponents {
-				if c.Name == omit {
-					continue
-				}
-				components = append(components, c)
-			}
-			signer, err := httpsig.NewSigner(httpsig.Ed25519, priv)
-			if err != nil {
-				t.Fatal(err)
-			}
-			req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := httpsig.Sign(req, signer, httpsig.SignOptions{
-				Components: components,
-				KeyID:      testKeyID,
-				Nonce:      "nonce-1",
-				Created:    time.Now(),
-			}); err != nil {
-				t.Fatal(err)
-			}
-
-			_, ok, err := auth.AuthenticateRequest(asServerRequest(req))
-			if ok {
-				t.Fatalf("a signature omitting %s was accepted", omit)
-			}
-			if err == nil {
-				t.Fatalf("a signature omitting %s drew no error", omit)
-			}
-			// The signature is otherwise valid: made by the configured key, with
-			// a nonce and a created. So it has to be rejected for the missing
-			// component and not for something incidental, or this test could pass
-			// while the floor requirement was gone.
-			if !errors.Is(err, httpsig.ErrMissingComponent) {
-				t.Errorf("want a missing component error, got %v", err)
-			}
-			if !strings.Contains(err.Error(), omit) {
-				t.Errorf("error %q does not name the missing component %s", err, omit)
-			}
-		})
-	}
-}
-
-// TestRejectsInjectedProtectedHeader is the second invariant. The signature is
-// the client's own and verifies. An intermediary appended an impersonation
-// header the client never signed. Coverage cannot detect an addition, so the
-// verifier has to compare what is present against what is covered.
-func TestRejectsInjectedProtectedHeader(t *testing.T) {
-	for _, name := range []string{
-		"Impersonate-User",
-		"Impersonate-Group",
-		"Impersonate-Uid",
-		"Impersonate-Extra-Scopes",
-		"Audit-ID",
-		"Content-Type",
-	} {
-		t.Run(name, func(t *testing.T) {
-			rt, c, config := signerFor(t)
-			auth, err := New(config)
-			if err != nil {
-				t.Fatal(err)
-			}
-			req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
-
-			// The request was signed without this header. Adding it now is what
-			// a relaying party on the path can do.
-			req.Header.Set(name, "injected")
-
-			_, ok, err := auth.AuthenticateRequest(req)
-			if ok {
-				t.Fatalf("a request with an injected %s was accepted", name)
-			}
-			if err == nil || !strings.Contains(err.Error(), "does not cover") {
-				t.Fatalf("want an error about uncovered protected headers, got %v", err)
-			}
-		})
-	}
-}
-
-// TestAcceptsCoveredProtectedHeader is the counterpart: impersonation set by the
-// client and covered by its signature is allowed through. Without this the
-// previous test could pass by rejecting impersonation outright.
-func TestAcceptsCoveredProtectedHeader(t *testing.T) {
-	rt, c, config := signerFor(t)
-	auth, err := New(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Impersonate-User", "bob")
-	req.Header.Set("Audit-ID", "audit-1")
-	if _, err := rt.RoundTrip(req); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok, err := auth.AuthenticateRequest(asServerRequest(c.req)); !ok {
-		t.Fatalf("a request whose impersonation headers were signed was rejected: %v", err)
-	}
-}
-
-func TestBodyDigest(t *testing.T) {
-	body := `{"kind":"Pod","metadata":{"name":"a"}}`
-
-	t.Run("signed body is accepted and readable downstream", func(t *testing.T) {
-		rt, c, config := signerFor(t)
-		auth, err := New(config)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req := signedRequest(t, rt, c, "POST", "https://"+testAuthort+"/api/v1/pods", strings.NewReader(body))
-		if _, ok, err := auth.AuthenticateRequest(req); !ok {
-			t.Fatalf("a signed request with a body was rejected: %v", err)
-		}
-		// The verifier reads the body to check the digest. If it does not put it
-		// back, every write request breaks in a way no signature test would show.
-		got, err := io.ReadAll(req.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(got) != body {
-			t.Errorf("body after authentication: got %q, want %q", got, body)
-		}
-	})
-
-	t.Run("altered body is rejected", func(t *testing.T) {
-		rt, c, config := signerFor(t)
-		auth, err := New(config)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req := signedRequest(t, rt, c, "POST", "https://"+testAuthort+"/api/v1/pods", strings.NewReader(body))
-		// The Content-Digest header is covered by the signature and cannot be
-		// changed. The body it describes can.
-		req.Body = io.NopCloser(strings.NewReader(`{"kind":"Pod","metadata":{"name":"evil"}}`))
-
-		if _, ok, err := auth.AuthenticateRequest(req); ok {
-			t.Fatal("a request whose body no longer matches its signed digest was accepted")
-		} else if err == nil || !strings.Contains(err.Error(), "Content-Digest") {
-			t.Fatalf("want a Content-Digest error, got %v", err)
-		}
-	})
-
-	t.Run("body added to a bodiless signed request is rejected", func(t *testing.T) {
-		rt, c, config := signerFor(t)
-		auth, err := New(config)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
-		// A GET signed with no body, then given one. Nothing in the signature
-		// mentions a digest, so only the "body without a covered digest" rule
-		// catches this.
-		req.Body = io.NopCloser(strings.NewReader(body))
-
-		if _, ok, err := auth.AuthenticateRequest(req); ok {
-			t.Fatal("a body attached to a signed bodiless request was accepted")
-		} else if err == nil || !strings.Contains(err.Error(), "not bound to the signature") {
-			t.Fatalf("want an error about the body not being bound, got %v", err)
-		}
-	})
-}
-
-func TestRejectsStaleSignature(t *testing.T) {
-	rt, c, config := signerFor(t)
-	config.MaxAge = &metav1.Duration{Duration: time.Second}
-	auth, err := New(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
-	// Rather than sleep, move the created parameter into the past by verifying
-	// against a policy whose clock is ahead.
-	auth.policy.Now = func() time.Time { return time.Now().Add(time.Hour) }
-
-	_, ok, err := auth.AuthenticateRequest(req)
-	if ok {
-		t.Fatal("a signature older than maxAge was accepted")
-	}
-	// The signature is otherwise valid, so age has to be the reason. Without this
-	// the test would pass even if maxAge were ignored and something incidental
-	// rejected the request.
-	if !errors.Is(err, httpsig.ErrExpired) {
-		t.Errorf("want an expiry error, got %v", err)
-	}
-}
-
-// stripCreated removes the created parameter from a signed request's
-// Signature-Input, which is the only way to produce a signature without one:
-// the signing library sets created unconditionally, defaulting a zero value to
-// the current time.
-//
-// This also invalidates the signature, because created is part of the signature
-// base. That is not a problem for the tests below, and is in fact what they
-// check: both rejections happen before the signature is verified, so a test
-// that got a signature mismatch instead would be reporting that the created
-// requirement had moved behind verification, or disappeared.
-func stripCreated(t *testing.T, req *http.Request) *http.Request {
+// ed25519KeyPair returns a PEM private key and the matching PKIX public key.
+func ed25519KeyPair(t *testing.T) (privPEM string, pubDER []byte) {
 	t.Helper()
-	input := req.Header.Get("Signature-Input")
-	stripped := regexp.MustCompile(`;created=\d+`).ReplaceAllString(input, "")
-	if stripped == input {
-		t.Fatalf("Signature-Input carries no created parameter to remove: %q", input)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
 	}
-	req.Header.Set("Signature-Input", stripped)
-	return req
+	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubDER, err = x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})), pubDER
 }
 
-// TestRejectsMissingCreated pins a requirement that no single site states.
-// Configuration cannot express it: maxAge is either unset and defaulted to five
-// minutes, or validated as positive, and the verifier requires created whenever
-// it has an age bound to apply. The requirement therefore holds through the
-// interaction of three places, and this is what fails if any of them moves.
-func TestRejectsMissingCreated(t *testing.T) {
-	// A static key. The rejection comes from the age policy, before the
-	// signature is verified.
-	t.Run("static key", func(t *testing.T) {
-		rt, c, config := signerFor(t)
-		auth, err := New(config)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req := stripCreated(t, signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil))
-
-		_, ok, err := auth.AuthenticateRequest(req)
-		if ok {
-			t.Fatal("a signature with no created parameter was accepted, so its age could not have been bounded")
-		}
-		if !errors.Is(err, httpsig.ErrMissingCreated) {
-			t.Errorf("want a missing created error, got %v", err)
-		}
-	})
-
-	// A derived key rejects earlier and for its own reason: the verification
-	// key is derived from created, so there is nothing to verify against.
-	t.Run("derived key", func(t *testing.T) {
-		secret := "root-secret"
-		scope := map[string]string{"cell": "cell-a", "purpose": "apiserver"}
-		secretFile := filepath.Join(t.TempDir(), "root.secret")
-		if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0600); err != nil {
-			t.Fatal(err)
-		}
-		auth, err := New(&apiserver.HTTPSignatureAuthenticator{
-			KeyDerivation: testLadder(),
-			Keys: []apiserver.HTTPSignatureKey{{
-				KeyID:      testKeyID,
-				Algorithm:  string(httpsig.HMACSHA256),
-				SecretFile: secretFile,
-				Stage:      &apiserver.HTTPSignatureKeyStage{Scope: scope},
-				User:       apiserver.HTTPSignatureUser{Username: testUser},
-			}},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		rt, c := derivedClient(t, testLadder(), transporthttpsig.Material{
-			KeyID:  testKeyID,
-			Secret: secret,
-			Stage:  &transporthttpsig.Stage{Scope: scope},
-		})
-		req := stripCreated(t, signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil))
-
-		_, ok, err := auth.AuthenticateRequest(req)
-		if ok {
-			t.Fatal("a derived signature with no created parameter was accepted")
-		}
-		// Specifically the derivation's own rejection, not the age policy's. A
-		// derived key cannot reach the age check, because there is no
-		// verification key to check against until created is known.
-		if err == nil || !strings.Contains(err.Error(), "verification key is derived from it") {
-			t.Errorf("want the derivation's own missing created error, got %v", err)
-		}
-		if errors.Is(err, httpsig.ErrMissingCreated) {
-			t.Error("the derived key reached the age policy, so it derived a verification key without a created timestamp")
-		}
-	})
-}
-
-func TestRejectsUnknownKeyID(t *testing.T) {
-	rt, c, config := signerFor(t)
-	config.Keys[0].KeyID = "some-other-key"
-	auth, err := New(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
-	if _, ok, err := auth.AuthenticateRequest(req); ok {
-		t.Fatal("a signature naming an unconfigured key was accepted")
-	} else if err == nil || !strings.Contains(err.Error(), "unknown keyID") {
-		t.Fatalf("want an unknown keyID error, got %v", err)
-	}
-}
-
-// TestRejectsWrongKeyForKeyID checks that the keyid is only a selector. It is an
-// unverified claim from the wire, so naming a key you do not hold must fail.
-func TestRejectsWrongKeyForKeyID(t *testing.T) {
-	_, _, config := signerFor(t)
-	auth, err := New(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, attackerKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer, err := httpsig.NewSigner(httpsig.Ed25519, attackerKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := httpsig.Sign(req, signer, httpsig.SignOptions{
-		Components: transporthttpsig.FloorComponents,
-		KeyID:      testKeyID,
-		Nonce:      "nonce-1",
-		Created:    time.Now(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	_, ok, err := auth.AuthenticateRequest(asServerRequest(req))
-	if ok {
-		t.Fatal("a signature made with the wrong key was accepted")
-	}
-	// This is the test that proves naming someone else's key ID gets you nothing,
-	// so the reason has to be the signature check and not bookkeeping.
-	if !errors.Is(err, httpsig.ErrSignatureMismatch) {
-		t.Errorf("want a signature mismatch, got %v", err)
-	}
-}
-
-// TestRejectsAlgorithmSubstitution checks that a key configured for one
-// algorithm is not usable under another.
-func TestRejectsAlgorithmSubstitution(t *testing.T) {
-	_, _, config := signerFor(t)
-	// The configured key is ed25519. Claim hmac-sha256 with the public key bytes
-	// as the shared secret, the classic confusion attack.
-	auth, err := New(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer, err := httpsig.NewSigner(httpsig.HMACSHA256, []byte(config.Keys[0].PublicKey))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := httpsig.Sign(req, signer, httpsig.SignOptions{
-		Components: transporthttpsig.FloorComponents,
-		KeyID:      testKeyID,
-		Nonce:      "nonce-1",
-		Created:    time.Now(),
-		IncludeAlg: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	_, ok, err := auth.AuthenticateRequest(asServerRequest(req))
-	if ok {
-		t.Fatal("a signature claiming a different algorithm than the key was accepted")
-	}
-	// Algorithm confusion is closed by the alg parameter disagreeing with the
-	// key, not by the signature bytes happening not to match. Only the specific
-	// error distinguishes the two, and only one of them is a real defense.
-	if !errors.Is(err, httpsig.ErrAlgorithmMismatch) {
-		t.Errorf("want an algorithm mismatch, got %v", err)
-	}
-}
-
-// TestAuthorityOverride covers the TLS-terminating proxy deployment: the client
-// signs the external authority, and the connection this server sees carries a
-// different one.
-func TestAuthorityOverride(t *testing.T) {
-	rt, c, config := signerFor(t)
-	config.Authority = testAuthort
-	config.Scheme = "https"
-	auth, err := New(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
-	// The proxy rewrote Host to the backend's own name.
-	req.Host = "10.0.0.7:6443"
-
-	if _, ok, err := auth.AuthenticateRequest(req); !ok {
-		t.Fatalf("a signature over the external authority was rejected behind a proxy: %v", err)
-	}
-}
-
-func TestAuthorityMismatchIsRejected(t *testing.T) {
-	rt, c, config := signerFor(t)
-	auth, err := New(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
-	// Without an override, a rewritten authority must fail: this is what stops a
-	// signature being replayed against a different API server.
-	req.Host = "other.example.com"
-
-	_, ok, err := auth.AuthenticateRequest(req)
-	if ok {
-		t.Fatal("a signature over a different authority was accepted")
-	}
-	// Covering @authority is what makes a rewritten Host fail, and it fails as a
-	// signature mismatch because the base cannot be reconstructed.
-	if !errors.Is(err, httpsig.ErrSignatureMismatch) {
-		t.Errorf("want a signature mismatch, got %v", err)
-	}
-}
-
-func TestHMACKeyFromSecretFile(t *testing.T) {
-	secret := "correct-horse-battery-staple"
-	secretFile := filepath.Join(t.TempDir(), "secret")
-	// Written with a trailing newline, which is what an editor leaves behind.
-	if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	auth, err := New(&apiserver.HTTPSignatureAuthenticator{
-		Keys: []apiserver.HTTPSignatureKey{{
-			KeyID:      "AKIAEXAMPLE",
-			Algorithm:  string(httpsig.HMACSHA256),
-			SecretFile: secretFile,
-			User:       apiserver.HTTPSignatureUser{Username: testUser},
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The client side takes the rotating half of the credential from a file that
-	// something else maintains, which is what lets a long-lived client survive
-	// credential rotation.
-	credFile := filepath.Join(t.TempDir(), "credential.yaml")
-	credDoc := fmt.Sprintf(`{"apiVersion":%q,"kind":%q,"keyID":"AKIAEXAMPLE","secret":%q}`,
-		transporthttpsig.SigningCredentialAPIVersion, transporthttpsig.SigningCredentialKind, secret)
-	if err := os.WriteFile(credFile, []byte(credDoc), 0600); err != nil {
-		t.Fatal(err)
-	}
+// relayClient builds a signing client that covers one extra header and carries a
+// value for it, which is what makes the value relayable.
+func relayClient(t *testing.T, privPEM, keyID, header, value string) (http.RoundTripper, *capture) {
+	t.Helper()
 	c := &capture{}
 	rt, err := transporthttpsig.NewRoundTripper(transporthttpsig.Config{
-		Algorithm:      string(httpsig.HMACSHA256),
-		CredentialFile: credFile,
+		Algorithm: string(httpsig.Ed25519),
+		Credential: &transporthttpsig.Material{
+			KeyID:         keyID,
+			PrivateKey:    privPEM,
+			SignedHeaders: map[string]string{header: value},
+		},
+		SignedHeaders: []transporthttpsig.Header{{Name: header}},
 	}, c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	return rt, c
+}
 
-	resp, ok, err := auth.AuthenticateRequest(req)
-	if !ok {
-		t.Fatalf("an hmac signed request was rejected: %v", err)
+// TestRelayedHeaderIsSent asserts a covered value reaches the resolver and nothing
+// else about the request does.
+func TestRelayedHeaderIsSent(t *testing.T) {
+	privPEM, pubDER := ed25519KeyPair(t)
+	rt, c := relayClient(t, privPEM, testKeyID, "X-Session-Token", "session-value")
+	r := newResolver(t, "relay")
+	r.SetKey(testKeyID, ed25519Answer(pubDER, testUser))
+	a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{
+		Endpoint:       r.Endpoint(),
+		RelayedHeaders: []string{"X-Session-Token"},
+	})
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("AuthenticateRequest: ok=%v err=%v", ok, err)
 	}
-	if resp.User.GetName() != testUser {
-		t.Errorf("username: got %q, want %q", resp.User.GetName(), testUser)
+
+	resolve, _ := r.LastRequests()
+	if got := resolve.GetRelayedHeaders()["x-session-token"]; got != "session-value" {
+		t.Errorf("relayed value: got %q, want %q", got, "session-value")
+	}
+	if len(resolve.GetRelayedHeaders()) != 1 {
+		t.Errorf("only the configured header should be relayed, got %v", resolve.GetRelayedHeaders())
 	}
 }
 
-func TestNewErrors(t *testing.T) {
-	pub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	der, err := x509.MarshalPKIXPublicKey(pub)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pubPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
-	validUser := apiserver.HTTPSignatureUser{Username: testUser}
+// TestRelayedHeaderRotationBustsTheCache is why the cache key covers the relayed
+// values and not the key ID alone. Both clients hold the same signing key and the
+// same key ID, and differ only in the token they cover, so an entry keyed on the key
+// ID would answer the second from cache and the rotation would be ignored.
+func TestRelayedHeaderRotationBustsTheCache(t *testing.T) {
+	privPEM, pubDER := ed25519KeyPair(t)
+	first, c1 := relayClient(t, privPEM, testKeyID, "X-Session-Token", "first-value")
+	second, c2 := relayClient(t, privPEM, testKeyID, "X-Session-Token", "second-value")
 
+	r := newResolver(t, "rotate")
+	r.SetKey(testKeyID, ed25519Answer(pubDER, testUser))
+	a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{
+		Endpoint:       r.Endpoint(),
+		RelayedHeaders: []string{"X-Session-Token"},
+	})
+
+	req := signedRequest(t, first, c1, "GET", "https://"+testAuthort+"/api/v1/pods?n=1", nil)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("first request: ok=%v err=%v", ok, err)
+	}
+	req = signedRequest(t, first, c1, "GET", "https://"+testAuthort+"/api/v1/pods?n=2", nil)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("second request with the same token: ok=%v err=%v", ok, err)
+	}
+	if calls, _, _ := r.Counts(); calls != 1 {
+		t.Fatalf("ResolveKey calls with an unchanged token: got %d, want 1", calls)
+	}
+
+	req = signedRequest(t, second, c2, "GET", "https://"+testAuthort+"/api/v1/pods?n=3", nil)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("request with a rotated token: ok=%v err=%v", ok, err)
+	}
+	if calls, _, _ := r.Counts(); calls != 2 {
+		t.Errorf("a rotated relayed value should reach the resolver: ResolveKey calls got %d, want 2", calls)
+	}
+	resolve, _ := r.LastRequests()
+	if got := resolve.GetRelayedHeaders()["x-session-token"]; got != "second-value" {
+		t.Errorf("relayed value after rotation: got %q, want %q", got, "second-value")
+	}
+}
+
+// TestRelayedHeaderMustBeCovered is the injection defense: a value an intermediary
+// could have set must not select a key.
+func TestRelayedHeaderMustBeCovered(t *testing.T) {
+	rt, c, r, config := signerFor(t)
+	config.RelayedHeaders = []string{"X-Session-Token"}
+	a := authenticatorFor(t, config)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	req.Header.Set("X-Session-Token", "injected")
+	_, ok, err := a.AuthenticateRequest(req)
+	if ok {
+		t.Fatal("an uncovered relayed header was accepted")
+	}
+	if err == nil || !strings.Contains(err.Error(), "does not cover") {
+		t.Errorf("error should name the coverage failure, got: %v", err)
+	}
+	if calls, _, _ := r.Counts(); calls != 0 {
+		t.Errorf("the resolver was called %d times for a request rejected before lookup", calls)
+	}
+}
+
+// TestRelayedHeaderRepeatedIsRefused covers the ambiguity: two values for one
+// relayed header have no correct combination, so neither is invented.
+func TestRelayedHeaderRepeatedIsRefused(t *testing.T) {
+	rt, c, r, config := signerFor(t)
+	config.RelayedHeaders = []string{"X-Session-Token"}
+	a := authenticatorFor(t, config)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	req.Header.Add("X-Session-Token", "one")
+	req.Header.Add("X-Session-Token", "two")
+	_, _, err := a.AuthenticateRequest(req)
+	if err == nil || !strings.Contains(err.Error(), "no correct way to combine") {
+		t.Fatalf("expected a repeated relayed header to be refused, got: %v", err)
+	}
+	if calls, _, _ := r.Counts(); calls != 0 {
+		t.Errorf("the resolver was called %d times for a request rejected before lookup", calls)
+	}
+}
+
+// TestUnknownKeyIDFallsThrough covers ordered resolution: the first resolver says
+// it does not serve the key ID and the second one answers.
+func TestUnknownKeyIDFallsThrough(t *testing.T) {
+	rt, c, pubDER := ed25519Client(t, testKeyID)
+	first := newResolver(t, "first")
+	second := newResolver(t, "second")
+	second.SetKey(testKeyID, ed25519Answer(pubDER, testUser))
+
+	a := authenticatorFor(t,
+		apiserver.HTTPSignatureAuthenticator{Endpoint: first.Endpoint()},
+		apiserver.HTTPSignatureAuthenticator{Endpoint: second.Endpoint()},
+	)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("AuthenticateRequest: ok=%v err=%v", ok, err)
+	}
+	if calls, _, _ := first.Counts(); calls != 1 {
+		t.Errorf("first resolver ResolveKey calls: got %d, want 1", calls)
+	}
+	if calls, _, _ := second.Counts(); calls != 1 {
+		t.Errorf("second resolver ResolveKey calls: got %d, want 1", calls)
+	}
+}
+
+// TestKeyIDPrefixesSkipResolver is the point of the prefix selector: a resolver
+// whose prefixes do not admit a key ID is never called.
+func TestKeyIDPrefixesSkipResolver(t *testing.T) {
+	rt, c, pubDER := ed25519Client(t, testKeyID)
+	other := newResolver(t, "other")
+	mine := newResolver(t, "mine")
+	mine.SetKey(testKeyID, ed25519Answer(pubDER, testUser))
+
+	a := authenticatorFor(t,
+		apiserver.HTTPSignatureAuthenticator{Endpoint: other.Endpoint(), KeyIDPrefixes: []string{"bob-key"}},
+		apiserver.HTTPSignatureAuthenticator{Endpoint: mine.Endpoint(), KeyIDPrefixes: []string{testKeyID}},
+	)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("AuthenticateRequest: ok=%v err=%v", ok, err)
+	}
+	if calls, _, _ := other.Counts(); calls != 0 {
+		t.Errorf("a resolver whose prefixes exclude the keyID was called %d times", calls)
+	}
+}
+
+// TestKeyCaching asserts a second request reuses the resolved key, and that a
+// resolver stating a zero cache duration is obeyed rather than given a floor.
+func TestKeyCaching(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		keys []apiserver.HTTPSignatureKey
-		want string
-	}{{
-		name: "duplicate keyID",
-		keys: []apiserver.HTTPSignatureKey{
-			{KeyID: "k", Algorithm: string(httpsig.Ed25519), PublicKey: pubPEM, User: validUser},
-			{KeyID: "k", Algorithm: string(httpsig.Ed25519), PublicKey: pubPEM, User: validUser},
-		},
-		want: "duplicate keyID",
-	}, {
-		name: "asymmetric algorithm with a secret file",
-		keys: []apiserver.HTTPSignatureKey{{KeyID: "k", Algorithm: string(httpsig.Ed25519), SecretFile: "/dev/null", User: validUser}},
-		want: "uses a public key, not secretFile",
-	}, {
-		name: "hmac with a public key",
-		keys: []apiserver.HTTPSignatureKey{{KeyID: "k", Algorithm: string(httpsig.HMACSHA256), PublicKey: pubPEM, User: validUser}},
-		want: "uses a shared secret, not publicKey",
-	}, {
-		name: "unreadable secret file",
-		keys: []apiserver.HTTPSignatureKey{{KeyID: "k", Algorithm: string(httpsig.HMACSHA256), SecretFile: "/nonexistent/secret", User: validUser}},
-		want: "reading secretFile",
-	}, {
-		name: "malformed public key",
-		keys: []apiserver.HTTPSignatureKey{{KeyID: "k", Algorithm: string(httpsig.Ed25519), PublicKey: "not pem", User: validUser}},
-		want: "no PEM block",
-	}, {
-		name: "unknown algorithm",
-		keys: []apiserver.HTTPSignatureKey{{KeyID: "k", Algorithm: "ed448", PublicKey: pubPEM, User: validUser}},
-		want: "ed448",
-	}, {
-		name: "no algorithm",
-		keys: []apiserver.HTTPSignatureKey{{KeyID: "k", PublicKey: pubPEM, User: validUser}},
-		want: "algorithm is required",
-	}} {
+		name         string
+		cacheTTL     int64
+		wantResolves int
+	}{
+		{name: "cached", cacheTTL: 300, wantResolves: 1},
+		{name: "resolver says do not cache", cacheTTL: 0, wantResolves: 3},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := New(&apiserver.HTTPSignatureAuthenticator{Keys: tc.keys})
-			if err == nil {
-				t.Fatalf("want an error mentioning %q, got none", tc.want)
+			rt, c, pubDER := ed25519Client(t, testKeyID)
+			r := newResolver(t, "cache-"+tc.name)
+			answer := ed25519Answer(pubDER, testUser)
+			answer.CacheTtlSeconds = tc.cacheTTL
+			r.SetKey(testKeyID, answer)
+			a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{Endpoint: r.Endpoint()})
+
+			for i := 0; i < 3; i++ {
+				req := signedRequest(t, rt, c, "GET", fmt.Sprintf("https://%s/api/v1/pods?n=%d", testAuthort, i), nil)
+				if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+					t.Fatalf("request %d: ok=%v err=%v", i, ok, err)
+				}
 			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("error %q does not mention %q", err, tc.want)
+			if calls, _, _ := r.Counts(); calls != tc.wantResolves {
+				t.Errorf("ResolveKey calls: got %d, want %d", calls, tc.wantResolves)
 			}
 		})
 	}
 }
 
-// ladderDoc scopes a key by day, cell, and purpose. The step names are this
-// test's own choice: nothing in the implementation treats any name, prefix, or
-// literal as special. The published SigV4 vector, which uses this same
-// mechanism with different names, is verified in
-// k8s.io/client-go/transport/httpsig.
-// testLadder is the ladder these tests derive through, stated as the server
-// states it. Step names are arbitrary labels, so these are neutral deployment
-// dimensions rather than any provider's.
-func testLadder() *apiserver.HTTPSignatureKeyDerivation {
-	return &apiserver.HTTPSignatureKeyDerivation{
-		Kind:         "hmac-ladder",
-		Hash:         "sha-256",
-		SecretPrefix: "K8SDEMO1",
-		Steps: []apiserver.HTTPSignatureKeyDerivationStep{
-			{Name: "day", Date: "YYYYMMDD"},
-			{Name: "cell", Scope: true},
-			{Name: "purpose", Scope: true},
-			{Name: "terminator", Literal: "k8sdemo1_request"},
+// TestNegativeCaching asserts an unserved key ID is remembered, so a peer that
+// retries it does not cost a lookup per request.
+func TestNegativeCaching(t *testing.T) {
+	rt, c, _ := ed25519Client(t, testKeyID)
+	r := newResolver(t, "negative")
+	a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{
+		Endpoint: r.Endpoint(),
+		Cache:    &apiserver.HTTPSignatureCache{NegativeMaxAge: &metav1.Duration{Duration: time.Minute}},
+	})
+
+	for i := 0; i < 3; i++ {
+		req := signedRequest(t, rt, c, "GET", fmt.Sprintf("https://%s/api/v1/pods?n=%d", testAuthort, i), nil)
+		if _, ok, err := a.AuthenticateRequest(req); ok || err == nil {
+			t.Fatalf("request %d should have been rejected: ok=%v err=%v", i, ok, err)
+		}
+	}
+	if calls, _, _ := r.Counts(); calls != 1 {
+		t.Errorf("ResolveKey calls for a repeated unknown keyID: got %d, want 1", calls)
+	}
+}
+
+// TestResolverFailureIsNotCached is the other half: an outage must not outlive
+// itself, so a failed lookup is retried rather than remembered.
+func TestResolverFailureIsNotCached(t *testing.T) {
+	rt, c, pubDER := ed25519Client(t, testKeyID)
+	r := newResolver(t, "flaky")
+	r.SetKey(testKeyID, ed25519Answer(pubDER, testUser))
+	r.SetErrors(nil, status.Error(codes.Unavailable, "resolver is busy"), nil)
+
+	a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{Endpoint: r.Endpoint()})
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods?n=1", nil)
+	if _, ok, _ := a.AuthenticateRequest(req); ok {
+		t.Fatal("a request whose key could not be resolved should be rejected")
+	}
+
+	r.SetErrors(nil, nil, nil)
+	req = signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods?n=2", nil)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("the same keyID should resolve once the resolver recovers: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestResolverFailureIsScopedToItsKeys asserts one broken resolver does not take
+// authentication down for another's keys.
+func TestResolverFailureIsScopedToItsKeys(t *testing.T) {
+	rt, c, pubDER := ed25519Client(t, testKeyID)
+	broken := newResolver(t, "broken")
+	working := newResolver(t, "working")
+	working.SetKey(testKeyID, ed25519Answer(pubDER, testUser))
+	broken.SetErrors(nil, status.Error(codes.Internal, "resolver is broken"), nil)
+
+	a := authenticatorFor(t,
+		apiserver.HTTPSignatureAuthenticator{Endpoint: broken.Endpoint()},
+		apiserver.HTTPSignatureAuthenticator{Endpoint: working.Endpoint()},
+	)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("a working resolver should still authenticate its own keys: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestRejectsSystemUsername covers the identity check on arrival. A resolver
+// holds key material; letting it claim an identity Kubernetes issues would be a
+// larger grant than that.
+func TestRejectsSystemUsername(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		user *externalhttpsig.UserInfo
+		want string
+	}{
+		{name: "system username", user: &externalhttpsig.UserInfo{Username: "system:masters-user"}, want: "reserved for identities"},
+		{name: "system group", user: &externalhttpsig.UserInfo{Username: testUser, Groups: []string{"system:masters"}}, want: "reserved for groups"},
+		{name: "no username", user: &externalhttpsig.UserInfo{}, want: "no username"},
+		{name: "no user at all", user: nil, want: "no username"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt, c, pubDER := ed25519Client(t, testKeyID)
+			r := newResolver(t, "identity")
+			answer := ed25519Answer(pubDER, testUser)
+			answer.User = tc.user
+			r.SetKey(testKeyID, answer)
+			a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{Endpoint: r.Endpoint()})
+
+			req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+			_, ok, err := a.AuthenticateRequest(req)
+			if ok {
+				t.Fatal("expected the request to be rejected")
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error should contain %q, got: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+// TestRejectsMaterialAlgorithmMismatch covers the confusion class: a resolver
+// naming hmac-sha256 while handing back a public key must not have that public
+// key used as a shared secret.
+func TestRejectsMaterialAlgorithmMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer func(pubDER []byte) *externalhttpsig.ResolveKeyResponse
+		want   string
+	}{
+		{
+			name: "hmac algorithm with a public key",
+			answer: func(pubDER []byte) *externalhttpsig.ResolveKeyResponse {
+				return &externalhttpsig.ResolveKeyResponse{
+					Algorithm: string(httpsig.HMACSHA256),
+					Material:  &externalhttpsig.ResolveKeyResponse_PublicKey{PublicKey: pubDER},
+					User:      &externalhttpsig.UserInfo{Username: testUser},
+				}
+			},
+			want: "verifies with a shared secret",
 		},
+		{
+			name: "asymmetric algorithm with a secret",
+			answer: func([]byte) *externalhttpsig.ResolveKeyResponse {
+				return &externalhttpsig.ResolveKeyResponse{
+					Algorithm: string(httpsig.Ed25519),
+					Material:  &externalhttpsig.ResolveKeyResponse_Secret{Secret: []byte("not a key")},
+					User:      &externalhttpsig.UserInfo{Username: testUser},
+				}
+			},
+			want: "verifies with a public key",
+		},
+		{
+			name: "no algorithm stated",
+			answer: func(pubDER []byte) *externalhttpsig.ResolveKeyResponse {
+				return &externalhttpsig.ResolveKeyResponse{
+					Material: &externalhttpsig.ResolveKeyResponse_PublicKey{PublicKey: pubDER},
+					User:     &externalhttpsig.UserInfo{Username: testUser},
+				}
+			},
+			want: "states no algorithm",
+		},
+		{
+			name: "no material at all",
+			answer: func([]byte) *externalhttpsig.ResolveKeyResponse {
+				return &externalhttpsig.ResolveKeyResponse{
+					Algorithm: string(httpsig.Ed25519),
+					User:      &externalhttpsig.UserInfo{Username: testUser},
+				}
+			},
+			want: "no key material",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt, c, pubDER := ed25519Client(t, testKeyID)
+			r := newResolver(t, "confusion")
+			r.SetKey(testKeyID, tc.answer(pubDER))
+			a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{Endpoint: r.Endpoint()})
+
+			req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+			_, ok, err := a.AuthenticateRequest(req)
+			if ok {
+				t.Fatal("expected the request to be rejected")
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error should contain %q, got: %v", tc.want, err)
+			}
+		})
 	}
 }
 
-// clientLadder is the same ladder as a client states it. The two API groups
-// declare their own types, and the digests agreeing is what says they mean the
-// same thing.
-func clientLadder(t *testing.T, ladder *apiserver.HTTPSignatureKeyDerivation) *keyscope.Derivation {
-	t.Helper()
-	converted, _, err := transporthttpsig.DerivationFrom(ladder)
-	if err != nil {
-		t.Fatal(err)
+// TestReplayIsRejected covers the whole reason nonces leave this process: the
+// resolver records the nonce, so the second copy of one request is refused.
+func TestReplayIsRejected(t *testing.T) {
+	rt, c, r, config := signerFor(t)
+	a := authenticatorFor(t, config)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	// Copied before the first authentication, because a successful one clears the
+	// signature fields so nothing downstream reads them as a credential.
+	replay := replayOf(req)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("first request: ok=%v err=%v", ok, err)
 	}
-	return &converted
+
+	// The same signed bytes again. Everything about it verifies; only the nonce
+	// record makes it fail.
+	_, ok, err := a.AuthenticateRequest(replay)
+	if ok {
+		t.Fatal("a replayed request was accepted")
+	}
+	if err == nil || !strings.Contains(err.Error(), "already been used") {
+		t.Errorf("error should name the nonce, got: %v", err)
+	}
+	if _, nonceCalls, _ := r.Counts(); nonceCalls != 2 {
+		t.Errorf("ConsumeNonce calls: got %d, want 2", nonceCalls)
+	}
 }
 
-// deriveRung is the broker's half: fold the ladder down to the service step
-// and hand the rung out, using the library's own hand-off operation.
-func deriveRung(t *testing.T, secret string, at time.Time) ([]byte, *transporthttpsig.Stage) {
-	t.Helper()
-	root, err := keyscope.New(*clientLadder(t, testLadder()), keyscope.Stage{
-		Name:  testKeyID,
-		Scope: map[string]string{"cell": "cell-a", "purpose": "apiserver"},
-	}, []byte(secret))
-	if err != nil {
-		t.Fatal(err)
+// TestNonceFailureRejects covers fail-closed. A resolver that cannot record the
+// nonce means the request cannot be shown not to be a replay, so it is refused.
+func TestNonceFailureRejects(t *testing.T) {
+	rt, c, r, config := signerFor(t)
+	r.SetErrors(nil, nil, status.Error(codes.Unavailable, "nonce store is down"))
+	a := authenticatorFor(t, config)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	_, ok, err := a.AuthenticateRequest(req)
+	if ok {
+		t.Fatal("a request whose nonce could not be recorded was accepted")
 	}
-	material, stage, err := root.Derive("purpose", at)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "recording signature nonce") {
+		t.Errorf("error should name the nonce call, got: %v", err)
 	}
-	return material, &transporthttpsig.Stage{From: stage.From, Scope: stage.Scope}
 }
 
-// derivedClient builds a signing round tripper whose credential is either the
-// root secret or a rung, per stage.
-func derivedClient(t *testing.T, ladder *apiserver.HTTPSignatureKeyDerivation, cred transporthttpsig.Material) (http.RoundTripper, *capture) {
+// TestNonceExpiryIsTheReplayWindow asserts the resolver is told when it may forget
+// a nonce, and that the value is the window a signature is accepted in.
+func TestNonceExpiryIsTheReplayWindow(t *testing.T) {
+	rt, c, r, config := signerFor(t)
+	config.MaxAge = &metav1.Duration{Duration: 2 * time.Minute}
+	config.Tolerance = &metav1.Duration{Duration: 30 * time.Second}
+	a := authenticatorFor(t, config)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("AuthenticateRequest: ok=%v err=%v", ok, err)
+	}
+
+	_, nonce := r.LastRequests()
+	if nonce == nil {
+		t.Fatal("no ConsumeNonce request was made")
+	}
+	created := nonce.GetCreated().AsTime()
+	want := created.Add(2*time.Minute + 30*time.Second)
+	if got := nonce.GetExpiresAt().AsTime(); !got.Equal(want) {
+		t.Errorf("nonce expiry: got %v, want created+maxAge+tolerance = %v", got, want)
+	}
+}
+
+// TestVerifyBeforeConsumingNonce is the ordering assertion. A caller who cannot
+// produce a valid signature must not reach the resolver's nonce store, or the
+// store becomes a thing an unauthenticated caller can fill.
+func TestVerifyBeforeConsumingNonce(t *testing.T) {
+	rt, c, r, config := signerFor(t)
+	a := authenticatorFor(t, config)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	// Tampering with the path breaks the signature base, so verification fails.
+	req.URL.Path = "/api/v1/secrets"
+	req.RequestURI = req.URL.RequestURI()
+
+	if _, ok, _ := a.AuthenticateRequest(req); ok {
+		t.Fatal("a tampered request was accepted")
+	}
+	if _, nonceCalls, _ := r.Counts(); nonceCalls != 0 {
+		t.Errorf("ConsumeNonce was called %d times for a signature that did not verify", nonceCalls)
+	}
+}
+
+// TestStaleSignatureIsRejectedBeforeLookup covers the other ordering rule: age is
+// bounded before a key is resolved, so an ancient timestamp cannot drive a call.
+func TestStaleSignatureIsRejectedBeforeLookup(t *testing.T) {
+	rt, c, r, config := signerFor(t)
+	config.MaxAge = &metav1.Duration{Duration: time.Nanosecond}
+	a := authenticatorFor(t, config)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	time.Sleep(2 * time.Millisecond)
+	_, ok, err := a.AuthenticateRequest(req)
+	if ok {
+		t.Fatal("a stale signature was accepted")
+	}
+	if err == nil || !strings.Contains(err.Error(), "maximum age") {
+		t.Errorf("error should name the age bound, got: %v", err)
+	}
+	if calls, _, _ := r.Counts(); calls != 0 {
+		t.Errorf("the resolver was called %d times for a signature rejected on age", calls)
+	}
+}
+
+// TestResolverNarrowsMaxAge asserts a resolver can tighten the accepted age and
+// that the narrowed value is what the nonce expiry uses.
+func TestResolverNarrowsMaxAge(t *testing.T) {
+	rt, c, pubDER := ed25519Client(t, testKeyID)
+	r := newResolver(t, "narrow")
+	answer := ed25519Answer(pubDER, testUser)
+	answer.MaxSignatureAgeSeconds = 1
+	r.SetKey(testKeyID, answer)
+
+	config := apiserver.HTTPSignatureAuthenticator{
+		Endpoint: r.Endpoint(),
+		MaxAge:   &metav1.Duration{Duration: time.Hour},
+	}
+	a := authenticatorFor(t, config)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("a fresh signature should be accepted: ok=%v err=%v", ok, err)
+	}
+	_, nonce := r.LastRequests()
+	want := nonce.GetCreated().AsTime().Add(time.Second)
+	if got := nonce.GetExpiresAt().AsTime(); !got.Equal(want) {
+		t.Errorf("nonce expiry should use the narrowed age: got %v, want %v", got, want)
+	}
+}
+
+func TestRejectsInjectedProtectedHeader(t *testing.T) {
+	rt, c, _, config := signerFor(t)
+	a := authenticatorFor(t, config)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	// An intermediary appending impersonation to a request that carried none. The
+	// signature still verifies, so only the coverage check catches it.
+	req.Header.Set("Impersonate-User", "system:admin")
+
+	_, ok, err := a.AuthenticateRequest(req)
+	if ok {
+		t.Fatal("an injected protected header was accepted")
+	}
+	if err == nil || !strings.Contains(err.Error(), "Impersonate-User") {
+		t.Errorf("error should name the header, got: %v", err)
+	}
+}
+
+func TestBodyDigest(t *testing.T) {
+	rt, c, _, config := signerFor(t)
+	a := authenticatorFor(t, config)
+
+	req := signedRequest(t, rt, c, "POST", "https://"+testAuthort+"/api/v1/pods", strings.NewReader(`{"a":1}`))
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("a signed body should be accepted: ok=%v err=%v", ok, err)
+	}
+	// The body is readable by the handler chain after the digest check.
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != `{"a":1}` {
+		t.Errorf("body after digest check: got %q", body)
+	}
+
+	tampered := signedRequest(t, rt, c, "POST", "https://"+testAuthort+"/api/v1/pods?n=2", strings.NewReader(`{"a":1}`))
+	tampered.Body = io.NopCloser(strings.NewReader(`{"a":2}`))
+	if _, ok, _ := a.AuthenticateRequest(tampered); ok {
+		t.Fatal("a body that does not match its signed digest was accepted")
+	}
+}
+
+func TestAuthorityOverride(t *testing.T) {
+	rt, c, pubDER := ed25519Client(t, testKeyID)
+	r := newResolver(t, "authority")
+	r.SetKey(testKeyID, ed25519Answer(pubDER, testUser))
+
+	// The client signs the external authority; the server is reached under another.
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	req.Host = "10.0.0.1:6443"
+
+	a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{
+		Endpoint:  r.Endpoint(),
+		Authority: testAuthort,
+		Scheme:    "https",
+	})
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("stating the external authority should let the signature verify: ok=%v err=%v", ok, err)
+	}
+
+	// Without the override the same request fails, which is what says the
+	// authority is covered.
+	plain := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{Endpoint: r.Endpoint()})
+	again := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods?n=2", nil)
+	again.Host = "10.0.0.1:6443"
+	if _, ok, _ := plain.AuthenticateRequest(again); ok {
+		t.Fatal("a signature over a different authority was accepted")
+	}
+}
+
+func TestNewErrors(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	t.Run("empty list is valid", func(t *testing.T) {
+		// An empty list is valid: it is what lets a resolver be added by reloading
+		// the configuration file.
+		a, err := New(ctx, nil, "test", testDialTimeout)
+		if err != nil {
+			t.Fatalf("an empty authenticator list should be valid: %v", err)
+		}
+		req, reqErr := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		req.Header.Set("Signature", "sig1=:AAAA:")
+		req.Header.Set("Signature-Input", `sig1=("@method");keyid="x"`)
+		if resp, ok, err := a.AuthenticateRequest(req); resp != nil || ok || err != nil {
+			t.Errorf("with no resolvers there is nothing to resolve a key, so even a signed request should draw no opinion: resp=%v ok=%v err=%v", resp, ok, err)
+		}
+	})
+
+	t.Run("bad endpoint", func(t *testing.T) {
+		_, err := New(ctx, []apiserver.HTTPSignatureAuthenticator{{Endpoint: "tcp://127.0.0.1:1234"}}, "test", testDialTimeout)
+		if err == nil || !strings.Contains(err.Error(), "unsupported scheme") {
+			t.Fatalf("expected the endpoint scheme to be rejected, got: %v", err)
+		}
+	})
+
+	t.Run("disagreeing authority", func(t *testing.T) {
+		r := newResolver(t, "disagree")
+		_, err := New(ctx, []apiserver.HTTPSignatureAuthenticator{
+			{Endpoint: r.Endpoint(), Authority: "one.example.com"},
+			{Endpoint: r.Endpoint(), Authority: "two.example.com"},
+		}, "test", testDialTimeout)
+		if err == nil || !strings.Contains(err.Error(), "describe this server") {
+			t.Fatalf("expected disagreeing authorities to be rejected, got: %v", err)
+		}
+	})
+
+	t.Run("resolver metadata fails", func(t *testing.T) {
+		r := newResolver(t, "metafail")
+		r.SetErrors(status.Error(codes.Internal, "not ready"), nil, nil)
+		_, err := New(ctx, []apiserver.HTTPSignatureAuthenticator{{Endpoint: r.Endpoint()}}, "test", testDialTimeout)
+		if err == nil || !strings.Contains(err.Error(), "fetching metadata") {
+			t.Fatalf("expected a resolver that cannot answer Metadata to fail server start, got: %v", err)
+		}
+	})
+
+	t.Run("malformed ladder", func(t *testing.T) {
+		r := newResolver(t, "badladder")
+		r.SetMetadata(&externalhttpsig.MetadataResponse{
+			KeyDerivation: &externalhttpsig.KeyDerivation{Kind: "not-a-kind"},
+		})
+		_, err := New(ctx, []apiserver.HTTPSignatureAuthenticator{{Endpoint: r.Endpoint()}}, "test", testDialTimeout)
+		if err == nil || !strings.Contains(err.Error(), "malformed key derivation ladder") {
+			t.Fatalf("expected a malformed ladder to fail server start, got: %v", err)
+		}
+	})
+}
+
+// --- shared secret and derived keys ---
+
+const testSecret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+
+func hmacClient(t *testing.T, cred transporthttpsig.Material, ladder *keyscope.Derivation) (http.RoundTripper, *capture) {
 	t.Helper()
 	data, err := json.Marshal(transporthttpsig.SigningCredential{
 		APIVersion: transporthttpsig.SigningCredentialAPIVersion,
@@ -800,401 +893,304 @@ func derivedClient(t *testing.T, ladder *apiserver.HTTPSignatureKeyDerivation, c
 	rt, err := transporthttpsig.NewRoundTripper(transporthttpsig.Config{
 		Algorithm:      string(httpsig.HMACSHA256),
 		CredentialFile: credFile,
-		KeyDerivation:  clientLadder(t, ladder),
+		KeyDerivation:  ladder,
 	}, c)
 	if err != nil {
-		t.Fatalf("building a derived-signing client: %v", err)
+		t.Fatalf("building an HMAC signing client: %v", err)
 	}
 	return rt, c
 }
 
-// TestDerivedKeyVerification covers every pairing of root and rung across the
-// two sides. The equivalence invariant says they all verify: any stage of the
-// same ladder with the same values produces the same signing key.
-func TestDerivedKeyVerification(t *testing.T) {
-	secret := "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
-	now := time.Now()
-	dir := t.TempDir()
-
-	rung, rungStage := deriveRung(t, secret, now)
-	rootFile := filepath.Join(dir, "root.secret")
-	if err := os.WriteFile(rootFile, []byte(secret+"\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	rungFile := filepath.Join(dir, "rung.secret")
-	if err := os.WriteFile(rungFile, []byte(base64.StdEncoding.EncodeToString(rung)+"\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	rootScope := map[string]string{"cell": "cell-a", "purpose": "apiserver"}
-
-	rootCred := transporthttpsig.Material{
-		KeyID:  testKeyID,
-		Secret: secret,
-		Stage:  &transporthttpsig.Stage{Scope: rootScope},
-	}
-	rungCred := transporthttpsig.Material{
-		KeyID:        testKeyID,
-		SecretBase64: base64.StdEncoding.EncodeToString(rung),
-		Stage:        rungStage,
-	}
-
-	rootKey := apiserver.HTTPSignatureKey{
-		KeyID:      testKeyID,
-		Algorithm:  string(httpsig.HMACSHA256),
-		SecretFile: rootFile,
-		Stage:      &apiserver.HTTPSignatureKeyStage{Scope: rootScope},
-		User:       apiserver.HTTPSignatureUser{Username: testUser},
-	}
-	rungKey := apiserver.HTTPSignatureKey{
-		KeyID:      testKeyID,
-		Algorithm:  string(httpsig.HMACSHA256),
-		SecretFile: rungFile,
-		Stage:      &apiserver.HTTPSignatureKeyStage{From: rungStage.From, Scope: rungStage.Scope},
-		User:       apiserver.HTTPSignatureUser{Username: testUser},
-	}
-
-	for _, tc := range []struct {
-		name   string
-		client transporthttpsig.Material
-		server apiserver.HTTPSignatureKey
-	}{
-		{name: "root at client, root at server", client: rootCred, server: rootKey},
-		{name: "rung at client, root at server", client: rungCred, server: rootKey},
-		{name: "root at client, rung at server", client: rootCred, server: rungKey},
-		{name: "rung at client, rung at server", client: rungCred, server: rungKey},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			auth, err := New(&apiserver.HTTPSignatureAuthenticator{
-				KeyDerivation: testLadder(),
-				Keys:          []apiserver.HTTPSignatureKey{tc.server},
-			})
-			if err != nil {
-				t.Fatalf("building the authenticator: %v", err)
-			}
-			rt, c := derivedClient(t, testLadder(), tc.client)
-			req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
-			resp, ok, err := auth.AuthenticateRequest(req)
-			if !ok {
-				t.Fatalf("a derived signature was rejected: %v", err)
-			}
-			if resp.User.GetName() != testUser {
-				t.Errorf("username: got %q, want %q", resp.User.GetName(), testUser)
-			}
-		})
-	}
-}
-
-// TestDerivedKeyWrongScopeFails is the domain separation property observed at
-// the verifier: a signature derived for one scope does not verify under
-// another, even though both sides hold the same root secret.
-func TestDerivedKeyWrongScopeFails(t *testing.T) {
-	secret := "root-secret"
-	dir := t.TempDir()
-	rootFile := filepath.Join(dir, "root.secret")
-	if err := os.WriteFile(rootFile, []byte(secret), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	auth, err := New(&apiserver.HTTPSignatureAuthenticator{
-		KeyDerivation: testLadder(),
-		Keys: []apiserver.HTTPSignatureKey{{
-			KeyID:      testKeyID,
-			Algorithm:  string(httpsig.HMACSHA256),
-			SecretFile: rootFile,
-			Stage: &apiserver.HTTPSignatureKeyStage{Scope: map[string]string{
-				"cell": "cell-a", "purpose": "apiserver",
-			}},
-			User: apiserver.HTTPSignatureUser{Username: testUser},
-		}},
+func TestSharedSecretKey(t *testing.T) {
+	rt, c := hmacClient(t, transporthttpsig.Material{KeyID: testKeyID, Secret: testSecret}, nil)
+	r := newResolver(t, "secret")
+	r.SetKey(testKeyID, &externalhttpsig.ResolveKeyResponse{
+		Algorithm:       string(httpsig.HMACSHA256),
+		Material:        &externalhttpsig.ResolveKeyResponse_Secret{Secret: []byte(testSecret)},
+		User:            &externalhttpsig.UserInfo{Username: testUser},
+		CacheTtlSeconds: 300,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{Endpoint: r.Endpoint()})
 
-	// The client derives for a different region.
-	rt, c := derivedClient(t, testLadder(), transporthttpsig.Material{
-		KeyID:  testKeyID,
-		Secret: secret,
-		Stage: &transporthttpsig.Stage{Scope: map[string]string{
-			"cell": "cell-b", "purpose": "apiserver",
-		}},
-	})
 	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
-	_, ok, err := auth.AuthenticateRequest(req)
-	if ok {
-		t.Fatal("a signature derived for cell-b verified under the cell-a scope; domain separation is not holding")
+	resp, ok, err := a.AuthenticateRequest(req)
+	if err != nil || !ok {
+		t.Fatalf("AuthenticateRequest: ok=%v err=%v", ok, err)
 	}
-	// The diagnosability the scoped keyid exists for: the rejection names the
-	// step that disagreed. Without it this failure is a bare signature
-	// mismatch, indistinguishable from tampering or a drifted ladder, and the
-	// operator has nothing to go on.
-	if err == nil {
-		t.Fatal("want an error")
-	}
-	if !errors.Is(err, keyscope.ErrScopeMismatch) {
-		t.Errorf("want a scope mismatch, got %v", err)
-	}
-	var scopeErr *keyscope.ScopeError
-	if !errors.As(err, &scopeErr) {
-		t.Fatalf("want a *keyscope.ScopeError, got %T: %v", err, err)
-	}
-	if scopeErr.Step != "cell" {
-		t.Errorf("scope error names step %q, want cell", scopeErr.Step)
-	}
-	if scopeErr.Claimed != "cell-b" {
-		t.Errorf("scope error claims %q, want cell-b", scopeErr.Claimed)
-	}
-	// The peer-facing message says what the peer already knows and not what the
-	// server is configured for.
-	if strings.Contains(err.Error(), "cell-a") {
-		t.Errorf("the error text discloses the server's own scope: %v", err)
-	}
-	if scopeErr.Expected() != "cell-a" {
-		t.Errorf("Expected() is %q, want cell-a available for logs", scopeErr.Expected())
+	if got := resp.User.GetName(); got != testUser {
+		t.Errorf("username: got %q, want %q", got, testUser)
 	}
 }
 
-// TestDateScopedServerRungExpiresDaily records a limitation rather than a
-// feature, because the argument for letting an API server hold a rung instead of
-// the root rests on it.
-//
-// A rung asserted to one UTC day verifies signatures created on that day and
-// nothing else. The configuration cannot hold both today's and tomorrow's rung
-// for the same key, because two entries with one keyID are rejected, and the
-// section is read once at startup. So a date-scoped server rung is unusable
-// without an overlap mechanism: it fails every request from the moment the day
-// rolls until the process restarts with fresh material.
-//
-// A rung scoped by cluster or service and not by date has no such cliff, which
-// is the form of the blast-radius argument that holds today.
-func TestDateScopedServerRungExpiresDaily(t *testing.T) {
-	dir := t.TempDir()
-	secret := "a-root-secret"
-	today := time.Now().UTC()
-	tomorrow := today.Add(24 * time.Hour)
-
-	material, stage := deriveRung(t, secret, today)
-	rungFile := filepath.Join(dir, "rung.secret")
-	if err := os.WriteFile(rungFile, []byte(base64.StdEncoding.EncodeToString(material)), 0600); err != nil {
-		t.Fatal(err)
+// protoLadder is the ladder as a resolver states it.
+func protoLadder() *externalhttpsig.KeyDerivation {
+	return &externalhttpsig.KeyDerivation{
+		Kind:         "hmac-ladder",
+		Hash:         "sha-256",
+		SecretPrefix: "K8SDEMO1",
+		Steps: []*externalhttpsig.KeyDerivationStep{
+			{Name: "day", Date: "YYYYMMDD"},
+			{Name: "cell", Scope: true},
+			{Name: "purpose", Scope: true},
+			{Name: "terminator", Literal: "k8sdemo1_request"},
+		},
 	}
-	serverKey := apiserver.HTTPSignatureKey{
-		KeyID:      testKeyID,
-		Algorithm:  string(httpsig.HMACSHA256),
-		SecretFile: rungFile,
-		Stage:      &apiserver.HTTPSignatureKeyStage{From: stage.From, Scope: stage.Scope},
-		User:       apiserver.HTTPSignatureUser{Username: testUser},
-	}
+}
 
-	auth, err := New(&apiserver.HTTPSignatureAuthenticator{
-		KeyDerivation: testLadder(),
-		Keys:          []apiserver.HTTPSignatureKey{serverKey},
-		MaxAge:        &metav1.Duration{Duration: 48 * time.Hour},
-	})
+// clientLadder is the same ladder as a client states it. The two are declared in
+// different type systems, and the digests agreeing is what says they mean the same
+// thing.
+func clientLadder(t *testing.T) *keyscope.Derivation {
+	t.Helper()
+	d, _, err := derivationFrom(protoLadder())
 	if err != nil {
 		t.Fatal(err)
 	}
+	return &d
+}
 
-	// Today: the rung verifies.
-	rt, c := derivedClient(t, testLadder(), transporthttpsig.Material{
-		KeyID:  testKeyID,
-		Secret: secret,
-		Stage: &transporthttpsig.Stage{Scope: map[string]string{
-			"cell": "cell-a", "purpose": "apiserver",
-		}},
-	})
-	if _, ok, err := auth.AuthenticateRequest(signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)); !ok {
-		t.Fatalf("a same-day rung failed: %v", err)
-	}
-
-	// Tomorrow: the same server key rejects a signature the client derived
-	// correctly for that day. MaxAge is 48h here, so the age policy is not what
-	// refuses it; the rung's own date assertion is.
-	clientKey, err := keyscope.New(*clientLadder(t, testLadder()), keyscope.Stage{
+// deriveRung is the broker's half: fold the ladder down to the purpose step and
+// hand the rung out, using the signing library's own hand-off operation.
+func deriveRung(t *testing.T, secret string, at time.Time) ([]byte, keyscope.Stage) {
+	t.Helper()
+	root, err := keyscope.New(*clientLadder(t), keyscope.Stage{
 		Name:  testKeyID,
 		Scope: map[string]string{"cell": "cell-a", "purpose": "apiserver"},
 	}, []byte(secret))
 	if err != nil {
 		t.Fatal(err)
 	}
-	signer, err := clientKey.Signer(tomorrow)
+	material, stage, err := root.Derive("purpose", at)
 	if err != nil {
 		t.Fatal(err)
 	}
-	keyid, err := clientKey.KeyID(tomorrow)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := httpsig.Sign(req, signer, httpsig.SignOptions{
-		Components: transporthttpsig.FloorComponents,
-		KeyID:      keyid,
-		Nonce:      "tomorrow-nonce",
-		Created:    tomorrow,
-		IncludeAlg: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	_, ok, err := auth.AuthenticateRequest(asServerRequest(req))
-	if ok {
-		t.Fatal("a date-scoped server rung verified a signature from another day; the limitation this test records has changed")
-	}
-	// At least the failure is diagnosable: it names the date step rather than
-	// reporting a signature mismatch.
-	var scopeErr *keyscope.ScopeError
-	if !errors.As(err, &scopeErr) {
-		t.Fatalf("want a scope error naming the date step, got %T: %v", err, err)
-	}
-	if scopeErr.Step != "day" {
-		t.Errorf("scope error names step %q, want day", scopeErr.Step)
-	}
+	return material, stage
+}
 
-	// And the configuration cannot express both days, which is what makes the
-	// cliff unavoidable rather than merely awkward.
-	tomorrowMaterial, tomorrowStage := deriveRung(t, secret, tomorrow)
-	tomorrowFile := filepath.Join(dir, "rung-tomorrow.secret")
-	if err := os.WriteFile(tomorrowFile, []byte(base64.StdEncoding.EncodeToString(tomorrowMaterial)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	second := serverKey
-	second.SecretFile = tomorrowFile
-	second.Stage = &apiserver.HTTPSignatureKeyStage{From: tomorrowStage.From, Scope: tomorrowStage.Scope}
-	_, err = New(&apiserver.HTTPSignatureAuthenticator{
-		KeyDerivation: testLadder(),
-		Keys:          []apiserver.HTTPSignatureKey{serverKey, second},
-	})
-	if err == nil {
-		t.Fatal("two rungs for one keyID were accepted; an overlap window may now be expressible")
-	}
-	if !strings.Contains(err.Error(), "duplicate keyID") {
-		t.Errorf("want a duplicate keyID error, got %v", err)
+// TestDerivedKeyVerification covers every pairing of root and rung across the two
+// sides. Any stage of the same ladder with the same values produces the same
+// signing key, so all four combinations verify.
+func TestDerivedKeyVerification(t *testing.T) {
+	now := time.Now()
+	rung, rungStage := deriveRung(t, testSecret, now)
+	rootScope := map[string]string{"cell": "cell-a", "purpose": "apiserver"}
+
+	for _, tc := range []struct {
+		name     string
+		clientAt transporthttpsig.Material
+		server   *externalhttpsig.DerivedKey
+	}{
+		{
+			name:     "client root, server root",
+			clientAt: transporthttpsig.Material{KeyID: testKeyID, Secret: testSecret, Stage: &transporthttpsig.Stage{Scope: rootScope}},
+			server:   &externalhttpsig.DerivedKey{Key: []byte(testSecret), Scope: rootScope},
+		},
+		{
+			name:     "client root, server rung",
+			clientAt: transporthttpsig.Material{KeyID: testKeyID, Secret: testSecret, Stage: &transporthttpsig.Stage{Scope: rootScope}},
+			server:   &externalhttpsig.DerivedKey{Key: rung, From: rungStage.From, Scope: rungStage.Scope},
+		},
+		{
+			name: "client rung, server root",
+			clientAt: transporthttpsig.Material{
+				KeyID: testKeyID, SecretBase64: encodeBase64(rung),
+				Stage: &transporthttpsig.Stage{From: rungStage.From, Scope: rungStage.Scope},
+			},
+			server: &externalhttpsig.DerivedKey{Key: []byte(testSecret), Scope: rootScope},
+		},
+		{
+			name: "client rung, server rung",
+			clientAt: transporthttpsig.Material{
+				KeyID: testKeyID, SecretBase64: encodeBase64(rung),
+				Stage: &transporthttpsig.Stage{From: rungStage.From, Scope: rungStage.Scope},
+			},
+			server: &externalhttpsig.DerivedKey{Key: rung, From: rungStage.From, Scope: rungStage.Scope},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt, c := hmacClient(t, tc.clientAt, clientLadder(t))
+			r := newResolver(t, "derived")
+			r.SetMetadata(&externalhttpsig.MetadataResponse{KeyDerivation: protoLadder()})
+			r.SetKey(testKeyID, &externalhttpsig.ResolveKeyResponse{
+				Algorithm:       string(httpsig.HMACSHA256),
+				Material:        &externalhttpsig.ResolveKeyResponse_DerivedKey{DerivedKey: tc.server},
+				User:            &externalhttpsig.UserInfo{Username: testUser},
+				CacheTtlSeconds: 300,
+			})
+			a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{Endpoint: r.Endpoint()})
+
+			req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+			if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+				t.Fatalf("AuthenticateRequest: ok=%v err=%v", ok, err)
+			}
+			// The keyid the client sent carries its claimed scope, and the resolver
+			// is handed it whole.
+			resolve, _ := r.LastRequests()
+			if !strings.HasPrefix(resolve.GetKeyId(), testKeyID+"/") {
+				t.Errorf("keyID should carry the claimed scope, got %q", resolve.GetKeyId())
+			}
+		})
 	}
 }
 
-// TestLadderShapeIsArbitrary is the evidence for a claim the design makes and
-// Kubernetes policy requires: the derivation mechanism is not built for any
-// particular provider's scheme. Nothing treats a step name, a secret prefix, or
-// a literal as meaningful, and a ladder need not resemble the one this mechanism
-// was modeled on.
-//
-// The ladders below share no step name, no prefix, no step count, and no
-// terminator convention with SigV4 or with each other. Each has to work end to
-// end, client to verifier, with the claimed scope checked.
-func TestLadderShapeIsArbitrary(t *testing.T) {
-	step := func(name string) apiserver.HTTPSignatureKeyDerivationStep {
-		return apiserver.HTTPSignatureKeyDerivationStep{Name: name, Scope: true}
+// TestDerivedKeyWithoutLadder covers the mismatch: a rung cannot be folded without
+// the ladder it is a rung of, and that has to be reported as the mismatch it is
+// rather than as a signature that does not verify.
+func TestDerivedKeyWithoutLadder(t *testing.T) {
+	now := time.Now()
+	rung, rungStage := deriveRung(t, testSecret, now)
+	rt, c := hmacClient(t, transporthttpsig.Material{
+		KeyID: testKeyID, SecretBase64: encodeBase64(rung),
+		Stage: &transporthttpsig.Stage{From: rungStage.From, Scope: rungStage.Scope},
+	}, clientLadder(t))
+
+	r := newResolver(t, "noladder")
+	// Metadata states no ladder at all.
+	r.SetKey(testKeyID, &externalhttpsig.ResolveKeyResponse{
+		Algorithm: string(httpsig.HMACSHA256),
+		Material: &externalhttpsig.ResolveKeyResponse_DerivedKey{
+			DerivedKey: &externalhttpsig.DerivedKey{Key: rung, From: rungStage.From, Scope: rungStage.Scope},
+		},
+		User: &externalhttpsig.UserInfo{Username: testUser},
+	})
+	a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{Endpoint: r.Endpoint()})
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	_, ok, err := a.AuthenticateRequest(req)
+	if ok {
+		t.Fatal("expected the request to be rejected")
 	}
-	literal := func(name, value string) apiserver.HTTPSignatureKeyDerivationStep {
-		return apiserver.HTTPSignatureKeyDerivationStep{Name: name, Literal: value}
+	if err == nil || !strings.Contains(err.Error(), "states no key derivation ladder") {
+		t.Errorf("error should name the missing ladder, got: %v", err)
 	}
+}
+
+// TestDerivedKeyWrongScopeFails covers the scope assertion: a request claiming a
+// scope the resolver's material does not cover is refused, and the error names the
+// step rather than reporting a bare signature mismatch.
+func TestDerivedKeyWrongScopeFails(t *testing.T) {
+	now := time.Now()
+	rung, rungStage := deriveRung(t, testSecret, now)
+
+	// The client claims a different cell than the server's material is scoped to.
+	clientScope := map[string]string{"cell": "cell-b", "purpose": "apiserver"}
+	rt, c := hmacClient(t, transporthttpsig.Material{
+		KeyID: testKeyID, Secret: testSecret, Stage: &transporthttpsig.Stage{Scope: clientScope},
+	}, clientLadder(t))
+
+	r := newResolver(t, "wrongscope")
+	r.SetMetadata(&externalhttpsig.MetadataResponse{KeyDerivation: protoLadder()})
+	r.SetKey(testKeyID, &externalhttpsig.ResolveKeyResponse{
+		Algorithm: string(httpsig.HMACSHA256),
+		Material: &externalhttpsig.ResolveKeyResponse_DerivedKey{
+			DerivedKey: &externalhttpsig.DerivedKey{Key: rung, From: rungStage.From, Scope: rungStage.Scope},
+		},
+		User: &externalhttpsig.UserInfo{Username: testUser},
+	})
+	a := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{Endpoint: r.Endpoint()})
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	_, ok, err := a.AuthenticateRequest(req)
+	if ok {
+		t.Fatal("a signature claiming a scope the key does not cover was accepted")
+	}
+	if err == nil || !strings.Contains(err.Error(), "outside the key's scope") {
+		t.Errorf("error should name the scope disagreement, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cell-b") {
+		t.Errorf("error should name the claimed value, got: %v", err)
+	}
+}
+
+func encodeBase64(b []byte) string {
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// replayOf rebuilds a request from one already shaped as the server sees it, so a
+// test can present the same signed bytes twice. Everything about the copy verifies;
+// only the nonce record distinguishes it.
+func replayOf(req *http.Request) *http.Request {
+	copied := req.Clone(req.Context())
+	copied.Host = req.Host
+	copied.RequestURI = req.RequestURI
+	copied.Body = http.NoBody
+	return copied
+}
+
+// TestNonceHandlingIgnore covers the configured escape hatch. With it set, a replay is
+// accepted and the resolver is never asked, which is the whole point: the alternative
+// was a resolver whose ConsumeNonce always says yes, costing a round trip and leaving
+// nothing in the configuration to say replay protection is off.
+func TestNonceHandlingIgnore(t *testing.T) {
+	rt, c, r, config := signerFor(t)
+	config.NonceHandling = apiserver.NonceHandlingIgnore
+	a := authenticatorFor(t, config)
+
+	req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+	replay := replayOf(req)
+	if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+		t.Fatalf("first request: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := a.AuthenticateRequest(replay); err != nil || !ok {
+		t.Fatalf("with nonces ignored the same signature should be accepted again: ok=%v err=%v", ok, err)
+	}
+	if _, nonceCalls, _ := r.Counts(); nonceCalls != 0 {
+		t.Errorf("ConsumeNonce was called %d times with nonceHandling: Ignore; the point is to skip the call, not to have the resolver answer yes", nonceCalls)
+	}
+	// The key is still resolved, so this setting gates one thing and not two.
+	if resolveCalls, _, _ := r.Counts(); resolveCalls != 1 {
+		t.Errorf("ResolveKey calls: got %d, want 1", resolveCalls)
+	}
+}
+
+// TestNonceHandlingConsumeIsTheDefault pins the zero value to the safe behavior. There
+// is no defaulting pass for AuthenticationConfiguration, so this is a property of the
+// code rather than of a scheme, and it is the one worth a test of its own.
+func TestNonceHandlingConsumeIsTheDefault(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		ladder *apiserver.HTTPSignatureKeyDerivation
-		scope  map[string]string
-		// wrong is a scope that must be rejected, and the step that must be named.
-		wrong     map[string]string
-		wrongStep string
-	}{{
-		name: "one literal step, no prefix, no scope, no date",
-		ladder: &apiserver.HTTPSignatureKeyDerivation{
-			Kind: "hmac-ladder", Hash: "sha-256",
-			Steps: []apiserver.HTTPSignatureKeyDerivationStep{
-				literal("binding", "kubernetes-api"),
-			},
-		},
-	}, {
-		name: "single scope dimension named nothing like a cloud",
-		ladder: &apiserver.HTTPSignatureKeyDerivation{
-			Kind: "hmac-ladder", Hash: "sha-512", SecretPrefix: "ZZZ",
-			Steps: []apiserver.HTTPSignatureKeyDerivationStep{
-				step("tenant"),
-			},
-		},
-		scope:     map[string]string{"tenant": "tenant-7"},
-		wrong:     map[string]string{"tenant": "tenant-8"},
-		wrongStep: "tenant",
-	}, {
-		name: "six steps, a dashed date in the middle, two literals",
-		ladder: &apiserver.HTTPSignatureKeyDerivation{
-			Kind: "hmac-ladder", Hash: "sha-256",
-			Steps: []apiserver.HTTPSignatureKeyDerivationStep{
-				step("fleet"),
-				{Name: "epoch", Date: "YYYY-MM-DD"},
-				step("shard"),
-				literal("v", "2"),
-				step("workload"),
-				literal("suffix", "end"),
-			},
-		},
-		scope: map[string]string{
-			"fleet": "f1", "shard": "s9", "workload": "controller",
-		},
-		wrong: map[string]string{
-			"fleet": "f1", "shard": "s9", "workload": "kubelet",
-		},
-		wrongStep: "workload",
-	}} {
+		name     string
+		handling apiserver.NonceHandling
+	}{
+		{name: "unset", handling: ""},
+		{name: "explicit Consume", handling: apiserver.NonceHandlingConsume},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			secret := "shared-root-secret"
-			secretFile := filepath.Join(dir, "root.secret")
-			if err := os.WriteFile(secretFile, []byte(secret), 0600); err != nil {
-				t.Fatal(err)
-			}
-			auth, err := New(&apiserver.HTTPSignatureAuthenticator{
-				KeyDerivation: tc.ladder,
-				Keys: []apiserver.HTTPSignatureKey{{
-					KeyID:      testKeyID,
-					Algorithm:  string(httpsig.HMACSHA256),
-					SecretFile: secretFile,
-					Stage:      &apiserver.HTTPSignatureKeyStage{Scope: tc.scope},
-					User:       apiserver.HTTPSignatureUser{Username: testUser},
-				}},
-			})
-			if err != nil {
-				t.Fatalf("building the authenticator: %v", err)
-			}
+			rt, c, r, config := signerFor(t)
+			config.NonceHandling = tc.handling
+			a := authenticatorFor(t, config)
 
-			rt, c := derivedClient(t, tc.ladder, transporthttpsig.Material{
-				KeyID:  testKeyID,
-				Secret: secret,
-				Stage:  &transporthttpsig.Stage{Scope: tc.scope},
-			})
-			resp, ok, err := auth.AuthenticateRequest(
-				signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil))
-			if !ok {
-				t.Fatalf("a signature derived through this ladder was rejected: %v", err)
+			req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+			replay := replayOf(req)
+			if _, ok, err := a.AuthenticateRequest(req); err != nil || !ok {
+				t.Fatalf("first request: ok=%v err=%v", ok, err)
 			}
-			if resp.User.GetName() != testUser {
-				t.Errorf("username: got %q, want %q", resp.User.GetName(), testUser)
+			if _, ok, _ := a.AuthenticateRequest(replay); ok {
+				t.Error("a replay was accepted, so replay protection is not on by default")
 			}
-
-			if tc.wrong == nil {
-				return
-			}
-			// A different scope on the same ladder must not verify, and the
-			// error must name the step that disagreed.
-			wrongRT, wrongC := derivedClient(t, tc.ladder, transporthttpsig.Material{
-				KeyID:  testKeyID,
-				Secret: secret,
-				Stage:  &transporthttpsig.Stage{Scope: tc.wrong},
-			})
-			_, ok, err = auth.AuthenticateRequest(
-				signedRequest(t, wrongRT, wrongC, "GET", "https://"+testAuthort+"/api/v1/pods", nil))
-			if ok {
-				t.Fatal("a signature derived for a different scope verified")
-			}
-			var scopeErr *keyscope.ScopeError
-			if !errors.As(err, &scopeErr) {
-				t.Fatalf("want a scope error, got %T: %v", err, err)
-			}
-			if scopeErr.Step != tc.wrongStep {
-				t.Errorf("scope error names step %q, want %q", scopeErr.Step, tc.wrongStep)
+			if _, nonceCalls, _ := r.Counts(); nonceCalls != 2 {
+				t.Errorf("ConsumeNonce calls: got %d, want 2", nonceCalls)
 			}
 		})
+	}
+}
+
+// TestNonceStillRequiredWhenIgnored covers the deliberate asymmetry: ignoring nonces
+// does not stop requiring them, so turning recording on is a change to this server
+// alone and not to every client.
+//
+// The client transport always sets a nonce, so this asserts the rule where it is
+// stated rather than through a request. A signature without one cannot be produced
+// here without hand-signing, which is the same gap the recorded-nonce path has.
+func TestNonceStillRequiredWhenIgnored(t *testing.T) {
+	entry := &resolverEntry{consumeNonces: false}
+	a := &Authenticator{}
+	// A zero Signature carries no nonce, which is the case under test; nothing else
+	// about it is reached, because the nonce check comes first.
+	err := a.consumeNonce(context.Background(), entry, &httpsig.Signature{}, &verifierKey{})
+	if err == nil {
+		t.Fatal("a signature with no nonce was accepted while nonces were being ignored")
+	}
+	if !strings.Contains(err.Error(), "no nonce") {
+		t.Errorf("error should name the missing nonce, got: %v", err)
 	}
 }

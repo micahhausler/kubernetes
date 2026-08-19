@@ -945,6 +945,7 @@ function codegen::protobindings() {
         "staging/src/k8s.io/kubelet/pkg/apis/pluginregistration"
         "pkg/kubelet/pluginmanager/pluginwatcher/example_plugin_apis"
         "staging/src/k8s.io/cri-api/pkg/apis/runtime"
+        "staging/src/k8s.io/externalhttpsig/apis"
         "staging/src/k8s.io/externaljwt/apis"
         "staging/src/k8s.io/kubelet/pkg/apis/dra-health"
     )

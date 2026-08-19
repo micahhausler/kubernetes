@@ -11,20 +11,21 @@ credential sources behind it, the signing round tripper, the wire format and cov
 verifier, and the mapping from a verified key to an identity. Those are the parts
 meant to be read as proposals.
 
-Key distribution and key lookup are **unsolved and out of scope**, and the static key list in the API
-server's configuration is a naïve stand-in that exists so the rest can be demonstrated. It does not
-scale, it has no revocation beyond editing a file on every control plane node, it puts identities in
-server configuration, and a change to it does not take effect without a restart. Q4 is the missing
-design. The reload gap recorded in D4 is a defect in the plumbing around the stand-in.
+Key lookup was the gap this document opened with, and it is now built. The static key list is gone.
+An `httpSignature` entry names a resolver on a Unix socket, which answers for a key ID with the key
+that verifies signatures bearing it and the identity it authenticates, and which records the nonces
+those signatures carry. See D11 for the API and D12 for what it deleted.
 
-The asymmetry says where the gap is. Getting a credential to the **signer** has a real answer here:
-an exec plugin, or a broker handing out a scoped rung, with a versioned protocol and expiry handling
-(D3, D10). Getting verification material to the **verifier** has none. Everything unsolved is on one
-side, and the eventual answer is a lookup the API server calls rather than a list it is configured
-with (Q4).
+Key *distribution* remains out of scope, and that distinction is worth holding. Getting verification
+material to the verifier is answered: it asks. Deciding which party holds which key material, and how
+it gets there, is the resolver operator's problem and this document does not have a view on it.
 
-A demo of the working parts, on a kind cluster with a source-built API server and kubectl, is in
-`e2e/`. It is where the reload gap in D4 was found.
+A resolver implementation is in `e2e/cmd/httpsig-resolver`, backed by a YAML file. It is a demo rather
+than a key management system, and its own README says where that line is. It is what the integration
+tests point a real API server at over a real socket.
+
+The kind demo in `e2e/` runs against it end to end, and it is where the arrangement is easiest to see:
+the directory the control plane mounts holds one file naming a socket, and no key material at all.
 
 ## 1. What this adds
 
@@ -270,45 +271,101 @@ and keeps the option open.
 
 ### D4: server configuration lives in `AuthenticationConfiguration`
 
-The verifier is configured by a new `httpSignature` section in `AuthenticationConfiguration`
+The verifier is configured by an `httpSignature` section in `AuthenticationConfiguration`
 (`apiserver.config.k8s.io`), alongside `JWT` and `Anonymous`, gated by the
-`HTTPSignatureAuthentication` alpha feature gate. The section carries the acceptance policy (maximum
-signature age, clock tolerance, and the external authority and scheme for a server behind a
-TLS-terminating proxy), the derivation ladder, and a list of keys. Each key states its own
-algorithm, its public key inline or a path to a shared secret file, where its own material sits on
-the ladder, and the user name, UID, and groups it authenticates as.
+`HTTPSignatureAuthentication` alpha feature gate. It is a list, and each entry names one resolver:
+its endpoint, which key IDs reach it, which request headers are relayed to it, how long its answers
+may be cached, and the acceptance policy for the keys it vends.
 
-The API server reads the `httpSignature` section once at startup and builds the verifier from it. The
-file watcher that hot-reloads JWT authenticators does not rebuild it,
-and it does not refuse the change either: it validates the new section, ignores it, and logs a
-successful reload. Demonstrated on the kind cluster in `e2e/`, where correcting a bad key made the
-server log a reload at that moment and then keep rejecting requests until the process restarted.
+No key material and no identity appears in this file. That was the original shape and D11 removed it.
 
-Accepting a change and then ignoring it is worse than refusing it, so making the reload fail loudly
-is the part worth doing first, and it does not depend on Q4. Supporting reload properly means
-swapping the verifier under an atomic pointer. That belongs with Q4 rather than in front of it,
-because the static key list is the thing being reloaded and it is a placeholder.
+**Scheme and authority are per entry and are required to agree.** Both describe *this server*, not any
+resolver: the authority goes into the signature base, so two entries stating different values would
+make one request verify under one entry and fail under another. There is no field position that
+expresses "stated once for the whole section" without adding a sibling to the list, so the data model
+tolerates the repetition and validation removes the ability to disagree. Two independently settable
+fields are a place for them to disagree; the fix is to make the disagreement unrepresentable rather
+than to pick a winner.
 
-A static key list is a PoC choice, not a proposal. It avoids the problem of defining an external
-lookup API. The verifier holds its keys in a map and indexes that map in one function, so replacing
-the static list with something else is a contained change. It is not an interface today, and calling
-it one would overstate what is built. Informer-backed lookup of cluster objects, the bootstrap token
-authenticator's pattern, is the likely successor and needs its own design.
+**Reload works.** The signature authenticator sits behind an `atomic.Pointer` and the union reads it
+per request, the same indirection the JWT authenticator uses, so a resolver can be added, removed, or
+repointed by editing the file. Three things follow from that mechanism and are worth stating:
 
-### D5: replay protection is unimplemented
+- It is in the chain even when no resolver is configured, because an authenticator absent from the
+  chain cannot be swapped into it later. With an empty list it draws no opinion about any request,
+  including one carrying a signature, so a stray `Signature` header cannot break authentication that
+  has nothing to do with signatures.
+- A new generation is built and health-gated before either it or the new JWT authenticator is swapped
+  in, so a reload is all or nothing. A file that changed both sections and applied one would leave
+  the server in a state no configuration describes.
+- The old generation's connections and metadata polls are cancelled after the same grace period the
+  JWT side uses, because a request that read the old pointer may still be mid-lookup.
 
-The acceptance window is the whole of the replay bound. A captured request can be replayed as itself,
-unchanged, against any API server until its signature ages out.
+This closes what this section previously recorded as a defect: a change to `httpSignature` was
+validated, ignored, and reported as a successful reload. That was found on the kind cluster in `e2e/`,
+where correcting a bad key made the server log a reload and then keep rejecting requests until the
+process restarted. Accepting a change and then ignoring it is worse than refusing it, and the metric
+saying `status="success"` while nothing had been applied was the part that made it a defect rather
+than a limitation.
 
-Detecting a replay means recognising a signature the fleet has already accepted, which takes state
-shared by every API server. A per-instance cache does not provide that: with more than one API server
-a captured request is replayable once against each instance that has not seen it. Building one and
-calling the result replay protection would claim a property the deployment does not have, which is
-worse than not building it, because the claim is what an operator would rely on.
+The nonce question that section deferred to Q4 dissolved rather than got answered: nonce records live
+at the resolver now, so a key surviving a configuration change has no local cache to preserve.
 
-Whether Kubernetes should have shared state for this, or should state non-replayability as a non-goal
-and leave the window as the bound, is Q6. The client attaches a `nonce` to every signature either
-way, so whatever consumes one later needs no change on the client side.
+### D5: nonce records live at the resolver, and recording is optional but not local
+
+Superseded by D11. The per-process nonce cache is gone, along with `maxNoncesPerKey`.
+
+What that cache could honestly claim was narrow, and worth restating because the replacement is what
+the claim needed: a nonce was remembered by one API server process, so with more than one API server
+and no shared state a captured request could be replayed once against each server that had not seen
+it, until its signature aged out. Sizing the cache, bucketing per key, and choosing an eviction policy
+were all work in service of a guarantee that did not hold.
+
+`ConsumeNonce` is an atomic check-and-record at the resolver, which is the only place the fact can be
+recorded once for a cluster. Two decisions around it:
+
+- **A failed call fails closed, and no setting changes that.** An error, including an unreachable
+  resolver, rejects the request. The cost is real and is the right cost: a resolver outage rejects
+  requests whose keys are still cached and still valid. This is distinct from the setting below, and
+  the distinction is the point: configuration can say not to record nonces, but it cannot say to accept
+  a request whose nonce this server tried and failed to record. An outage is not a policy decision.
+- **It is called after the signature verifies**, last of everything. A caller who cannot produce a
+  valid signature never reaches the resolver's nonce store, so filling it is not something an
+  unauthenticated caller can do. A test asserts the call count is zero for a tampered request, because
+  this property lives in call order and call order is not self-documenting.
+
+**Two questions that were run together, and have different answers.** This section previously said
+there was no option at all, on the grounds that offering one would let the same configuration file
+describe a cluster with replay protection and one without. That argument was wrong, and it was wrong in
+a way worth recording rather than quietly fixing.
+
+*Per-API-server nonce tracking* is still refused, and the reasoning above is why: it offers a guarantee
+that does not hold.
+
+*Turning recording off* is now `nonceHandling: Ignore`, per resolver. The argument against it did not
+survive contact with the alternative. A deployment whose resolver has no nonce store could always
+implement `ConsumeNonce` as a stub that returns accepted, so the configuration file could already
+describe a cluster without replay protection. What it could not do was *say so*. The stub is strictly
+worse on three counts: it is a resolver that lies about the RPC's contract, it costs a round trip per
+request for nothing, and an operator auditing the cluster would have to read a resolver's source to
+find out. Refusing the field was protecting a property that was already bypassable, just invisibly.
+
+Three things make the option defensible rather than a hole:
+
+- **The zero value is Consume.** There is no defaulting pass for `AuthenticationConfiguration`, so this
+  lives in the code rather than in a scheme, which also means a caller constructing the internal struct
+  gets replay protection. A test pins it.
+- **A typo is an error, not a default.** The value is checked against a closed set, because
+  `nonceHandling: ignore` falling through to the safe value would leave protection on for an operator
+  who meant to turn it off, and send them looking in the resolver for the reason.
+- **It is discoverable without reading the file.** A startup log line names the resolver, and
+  `apiserver_httpsig_resolver_nonce_tracking` is 0 or 1 per resolver, because "which of my clusters
+  have replay protection off" is a fleet question and logs do not answer fleet questions.
+
+**The nonce stays required when it is ignored.** A signature without one is rejected either way. It
+costs a client nothing, it is covered by the signature regardless, and it means turning recording on is
+a change to this server alone rather than to every client. So the setting gates exactly one thing, the
+call, and not two.
 
 ### D6: new operational dependency on client clock sanity
 
@@ -699,6 +756,206 @@ Three costs are real and recorded rather than solved:
   the old exclusivity check is stricter and simpler than what it replaced: exactly one credential
   source among `keyFile`, `credentialFile`, and `exec`.
 
+### D11: keys come from a resolver on a socket, which also records nonces
+
+An `httpSignature` entry names a resolver process on a local Unix domain socket, in the shape the KMS
+provider and the external JWT signer already use: `k8s.io/externalhttpsig`, a staging module with no
+`k8s.io` dependencies so a resolver author imports it without pulling `k8s.io/apiserver`. Three unary
+RPCs.
+
+**The division of labor is the decision.** The API server does all of the cryptography: it builds the
+signature base, verifies, enforces the covered component set, and checks the body digest. The resolver
+holds key material and nonce state and never sees a request. A resolver returns data, never a verifier
+and never a verdict, so no resolver has to get the cryptography right and none can get it wrong.
+
+`Metadata`, once at startup and then polled, carries what is not per key: the derivation ladder, and
+any narrowing of accepted signature age. It doubles as the health probe, which is what makes reload
+health-gating possible; without it a new generation would go live blind. A resolver that cannot answer
+it fails the server's start rather than every signed request afterwards.
+
+`ResolveKey` carries the key ID unparsed, the algorithm, the signature's `created`, and the values of
+configured relayed headers. Four decisions in that list:
+
+- **The key ID is not parsed by the API server**, beyond taking the segment before the first slash to
+  choose a resolver. A derived key's key ID carries its claimed scope, and decomposing it needs the
+  ladder. D8 recorded a constraint that a lookup cannot have the ladder before it has chosen a key;
+  that dissolves by giving the whole key ID to the party that holds the ladder.
+- **The resolver's stated algorithm is authoritative and the signature's is advisory.** The verifier is
+  built from the resolver's value, and the signing library rejects a signature whose own `alg`
+  disagrees with the verifier's. Without that, a peer could claim `hmac-sha256` for a key whose material
+  is a public key and have the public key used as a shared secret. A resolver that echoed the request's
+  algorithm rather than stating its key's own would reopen it, which is why the field is documented as
+  the thing it is rather than as a convenience.
+- **Relayed headers are named in the API server's configuration, never requested by the resolver.** A
+  named header present but not covered by the signature rejects the request before any lookup, so an
+  intermediary cannot inject a value that selects a different key. The covered set is readable from
+  `Signature-Input` without verifying anything, which is what makes that check available before there
+  is a key to verify with. Covered is not verified: at lookup time the value is still a claim.
+  Headers with their own configuration path — authorization, the signature fields, `Content-Digest`,
+  the impersonation headers — cannot be relayed, because relaying is not a way around those paths.
+- **Not-found is a gRPC status, not a field.** A response describing the absence of a key is a shape
+  where a caller that mishandles one field authenticates a request it should have rejected.
+
+**What a resolver returns is a claim, not a conclusion.** The identity is validated on arrival: a
+non-empty username, and nothing under the `system:` prefix in the username or any group. This is the
+same rule the static key list enforced, and it matters more here, not less. Whoever holds the
+resolver's socket can vend an identity to the cluster, and a resolver able to claim a name Kubernetes
+issues would be a strictly larger grant than one able to vend a key. CEL user-validation rules, which
+section 6 argues for, are not built: they need the aggregate-cost problem this document records for the
+JWT path solved first.
+
+**Three material shapes, and what each bounds.** A PKIX DER public key; a whole shared secret; or a
+rung of the ladder with its position on it, from which the API server derives per request using the
+signature's `created`. PEM is not accepted for the public key, because a PEM block type is a second
+statement of the key kind and a second thing to disagree with the stated algorithm. The rung is
+`keyscope.Key.Derive`'s output verbatim — the library already calls that "the hand-off operation" — and
+it is the shape worth preferring: a compromise of the API server's memory yields only what the rung's
+scope covers, and for a rung past a date step, only until that date rolls.
+
+**Caching, and why every property of it is forced.** The cache key is chosen by the peer, so the number
+of distinct entries the API server could be asked to hold is not bounded by anything in the cluster.
+Bounded size, a bounded negative-entry lifetime, and collapsing concurrent duplicates all follow from
+that one fact. Two further points:
+
+- The cache key covers the relayed header values, not the key ID alone. Keying on the key ID would
+  serve a cached answer for a rotated session token, which is the case relayed headers exist for, so
+  the rotation would be silently ignored. Values are hashed rather than concatenated, because a relayed
+  value can be a secret held for the entry's lifetime, and because concatenating peer-chosen strings
+  makes two distinct questions collide when one contains the separator.
+- Resolved keys and unserved key IDs are two caches, so a flood of unknown key IDs cannot evict working
+  keys. Eviction from either costs one lookup and never an authentication failure, which is what makes
+  a bound safe to impose at all.
+
+This is the third time the cardinality argument appears: D5 made it for nonce buckets, D8 made it for
+not caching derived keys, and it makes it here. What is deliberately not copied is
+`cached_token_authenticator`, whose cache is unbounded and striped for lock contention rather than for
+size.
+
+**Ordered resolution with an optional prefix selector.** Resolvers are consulted in configuration
+order; one that does not serve a key ID is asked before the next is tried. `keyIDPrefixes` narrows which
+key IDs reach an entry, turning an unknown key ID's cost from one call per resolver into one call or
+none. Validation rejects two entries claiming one prefix, because which resolver serves a key ID would
+then depend on list order and a key moved between resolvers would change identity silently. It also
+rejects more than one entry with no prefixes, because two catch-alls fan out without saying so. Q6
+records what is still unbounded here.
+
+**The trust boundary is the socket's permissions.** No TLS, and the peer is not authenticated, which is
+the KMS and external JWT model. It is worth stating rather than inheriting quietly, because relayed
+headers mean this socket now carries client secrets, which neither of those two does.
+
+**Health is a metric, not a readiness gate.** A resolver being down affects only requests signed by its
+keys. Putting it in `/readyz` would remove the whole API server from service, a blast radius larger
+than the failure. `apiserver_httpsig_resolver_metadata_success_timestamp` and
+`apiserver_httpsig_resolver_request_total{code}` carry the signal, and the aggregated check exists and
+is used to gate reload.
+
+### D12: the seam is a data type, and what it deleted
+
+Section 6 said both remaining paths need the same thing first: key resolution has to become an
+interface, because that is what lets a CA and a resolver be two implementations rather than two branches
+through one function. That is `KeyResolver` in `resolver.go`, and the shape it took is worth recording
+because the obvious shape was worse.
+
+It returns **data**, not a verifier. A `ResolvedKey` carries an algorithm, one of three material forms,
+an identity, and two durations. Compiling it into a verifier happens in one function that also validates
+it, so an answer that reaches the cache is one that has already been checked, and the x509-assertion path
+can supply the same data type without touching any of the cryptography.
+
+Deleted rather than adapted:
+
+- `HTTPSignatureKey`, `HTTPSignatureUser`, `HTTPSignatureKeyDerivation`,
+  `HTTPSignatureKeyDerivationStep`, and `HTTPSignatureKeyStage` from all four API versions. The
+  derivation types remain in the client's kubeconfig and in the exec credential protocol, where a
+  client still states the ladder it derives through.
+- `maxNoncesPerKey`, with the local nonce cache (D5).
+- `maxHTTPSignatureKeys`, the 64-key cap. Its stated reason was that every key got a nonce bucket,
+  which is no longer true.
+- `httpsig.ValidateKey`, which existed so configuration validation could reject unusable key material
+  without a second copy of the rules. With no key material in the file, validation no longer touches
+  the filesystem and no longer imports the verifier package.
+- The PEM public key parser, replaced by PKIX DER.
+
+One thing deliberately **not** reused: `transporthttpsig.DerivationFrom`, which converts a ladder by
+round-tripping JSON and whose contract is "any type whose JSON encoding matches the ladder schema". A
+protobuf-generated type is not one. `protoc-gen-go` writes the proto field name into the Go json tag, so
+`secret_prefix` would not be read as `secretPrefix` and the prefix would be dropped with no error — a
+conversion that silently drops a derivation input produces a key nobody can explain. The proto ladder is
+converted field by field instead, guarded by a test that varies every field and asserts the digest
+changes, plus a field count that fails if the proto grows one. That guard was checked by breaking the
+converter and watching it fail.
+
+### D13: the demo's resolver runs on the host, and starts before the cluster
+
+Two decisions in the kind demo, both settled by testing rather than by argument, and both worth
+recording because the obvious alternatives fail in ways that are hard to read.
+
+**It runs on the host, not on the node.** The socket lives in a directory bind mounted into the node
+and, through a kubeadm patch, into the API server pod. Two facts make that work, and both were checked
+rather than assumed: a unix socket is reachable across a bind mount, and it is reachable across a
+*read-only* one, because connecting is a permission check on the inode rather than a write to the
+filesystem. So the mount is read only, which costs nothing and means nothing in the node can unlink the
+socket and listen in the resolver's place.
+
+The socket is mode 0600 owned by the user who ran the demo. kube-apiserver in a kind node runs as root
+with no `runAsUser`, and root has `CAP_DAC_OVERRIDE`, so it connects; a non-root process that does not
+own the socket gets `permission denied`. Both halves were verified against the real node image before
+the design was committed to, because the alternative was a permissions puzzle discovered during a
+cluster bring-up.
+
+The honest cost: a resolver on the host is not what a deployment looks like. The alternatives were a
+static pod, which needs a container image on the node that can execute the binary and therefore a
+version-dependent image reference, and a process started on the node with `docker exec`, which cannot
+be running before `kubeadm init` needs it. Neither cost buys anything the demo is trying to show.
+
+**It starts before the cluster.** kube-apiserver fetches each resolver's metadata while building its
+authenticator and refuses to start if it cannot. Started afterwards, the API server crash-loops through
+`kubeadm init` and the cluster never comes up. This is the fail-closed behavior working as intended, and
+it makes resolver-before-cluster an ordering the harness has to get right rather than a preference.
+
+It also rules out the arrangement that first looked most elegant: bring the cluster up with no
+`httpSignature` entries, start the resolver, then add the section and let reload apply it. That would
+have demonstrated reload as a side effect, but it makes the demo's happy path depend on two features
+instead of one, and a failure in either presents identically.
+
+**What the demo now shows that the static list could not.** Editing the resolver's key file revokes a
+key with no restart at either end, and the delay is the `cacheTTL` the file states, which makes the
+revocation window a number an operator chose. Stopping the resolver refuses every signed request,
+including for keys the API server has cached, because the nonce can no longer be recorded. Starting it
+again recovers within seconds as gRPC reconnects, with no API server restart, which is worth knowing
+because the opposite would make a resolver restart an outage.
+
+### D14: three reload failure modes, observed rather than reasoned about
+
+The kind demo produced three distinct reload failures by accident, and all three behaved correctly.
+Recorded because reload is the feature most likely to be wrong in a way nobody notices, and because
+these are the cases a unit test would not have thought to construct.
+
+**An empty file.** A fixture regeneration truncated the authentication configuration for a moment. The
+API server logged `failed to load authentication config: empty config data`, kept the configuration it
+had, and carried on. Requests never noticed.
+
+**A resolver that was not there.** A reload fired while the resolver was stopped, and the health gate
+refused the swap: `failed to update authentication config: fetching metadata from resolver ... connect:
+no such file or directory`. The old generation kept serving. This is the gate earning its place, and it
+is why `Metadata` doubles as a health probe: without it the new generation would have gone live and
+every signed request would have failed.
+
+**A field the binary did not have.** A configuration using `nonceHandling` was reloaded by an API server
+built before the field existed, and decoding rejected it: `strict decoding error: unknown field
+"httpSignature[0].nonceHandling"`. The reload failed, the tracker was updated so it stopped retrying,
+and the previous configuration kept serving.
+
+That last one is worth keeping for its own sake, because it settles the rollout question for every field
+added to this section. Decoding is strict, so a configuration written for a newer API server fails
+loudly on an older one rather than being silently ignored. For `nonceHandling` specifically that is the
+difference between an operator learning their setting did not apply and a cluster quietly running with
+replay protection in the opposite state from the one the file describes.
+
+It also cost an hour of chasing a wrong conclusion, which is the reason it is written down. Setting
+`nonceHandling: Ignore` on the live cluster appeared not to work, and the tempting reading was that the
+feature was broken. The API server log said otherwise in one line. The binary was two hours older than
+the field; nothing was wrong except the thing being tested.
+
 ## 5. Open questions
 
 ### Q1: which components survive a conforming intermediary
@@ -735,93 +992,113 @@ a review question independent of the design. Options: donate the libraries to `k
 reimplement in tree, or argue for the external dependency. Not a PoC blocker; it is a KEP blocker.
 I'm open to any outcome.
 
-### Q4: remote key lookup, which the static list stands in for
+### Q4: remote key lookup, which the static list stood in for
 
-The static key list in D4 is the API integration surface, not the key distribution answer. It is
-enough to prove that the authenticator and the coverage rules work. It is also
-wrong for any real deployment: it does not scale past a handful of identities, it has no revocation
-beyond editing a file on every control plane node, and it puts human identities in server
-configuration.
+**Answered. See D11 and D12.** This section previously listed five design questions; four are settled
+and one changed shape.
 
-A real implementation needs to resolve a key ID to key material at request time, from something
-outside the API server's own configuration. The shape that fits the existing surface area is a
-request-response API, one analogous to `TokenReview` but asking a different question. `TokenReview`
-asks "who does this token belong to" and gets back a `UserInfo`. The question here is "what key
-verifies signatures from this key ID, and who is it", so call it `KeyRequest` for now: the key ID
-goes in, and public key material plus a `UserInfo` and a validity period comes back. Note the
-difference from `TokenReview` that makes this worth doing at all: the response is cacheable across
-requests, because a key is stable while a token is not. The verifier does the cryptography locally
-and only the key lookup is remote.
+- *Who serves it.* A process on a local Unix socket, following the KMS provider and the external JWT
+  signer rather than the token authentication webhook. Not a cluster object read through an informer,
+  which would have made authentication depend on the API server's own storage being available.
+- *What the response is keyed on.* The key ID, the algorithm, the signature's `created` timestamp, and
+  the values of headers the configuration names. Not the whole request. Naming the headers in the API
+  server's own configuration is what keeps this from being the session token pattern this document
+  rejects: a resolver cannot ask for more of the request than an administrator wrote down.
+- *How caching and revocation interact.* The resolver states a duration per answer and the
+  configuration caps it, so the revocation window is a number an operator can read. Zero means do not
+  cache, which is the correct answer when the answer depended on a relayed value that rotates.
+- *Failure behavior.* A resolver that fails takes down only the keys it serves. Another resolver may
+  still answer for the same key ID, and a lookup failure is not remembered, because caching it would
+  extend an outage past its end. Absence *is* remembered, briefly, because a peer that sends one
+  unknown key ID usually sends it again.
+- *Whether the API server derives at all.* Both. A resolver may hand back a whole secret, or a rung
+  with its position on the ladder, and the API server folds the remaining steps per request. The
+  ladder left the API server's configuration, as this section predicted it might, and now comes from
+  the resolver's `Metadata`.
 
-Design questions this raises, none of them settled:
-
-- Who serves it. A webhook, following the token authentication webhook, keeps key distribution
-  outside the cluster where an external identity system already holds the keys. A cluster object
-  read through an informer, following the bootstrap token authenticator, keeps it inside and avoids
-  a network dependency on the authentication path, at the cost of a bootstrap ordering problem.
-- What the response is keyed on. A key ID alone is the simple form. The lookup could instead see the
-  whole request, which is what lets key material travel in a request header, and which is exactly
-  the session token pattern this document rejects for in-tree use.
-- How caching and revocation interact. A cached key is a key that stays usable after it is revoked.
-  The `serviceaccount.PublicKeysGetter` interface already models this with a declared maximum cache
-  age and listener based invalidation, and is the right thing to copy rather than reinvent.
-  What not to copy: `cached_token_authenticator`'s cache is an unbounded `utilcache.NewExpiring`, and
-  its striping is for lock contention rather than size. A lookup keyed on a key ID and a claimed scope
-  is keyed entirely on peer-chosen input, so it needs a bounded cache and a tight negative TTL. This
-  is the same cardinality argument D8 makes for not caching derived keys, arriving a second time.
-- Failure behavior. A key lookup that is unreachable must fail closed for that key without taking
-  down authentication for anything else.
-- Whether the API server derives at all. If the lookup answers for the scope it was asked about, it
-  returns the verification key for that scope and the API server does no derivation: it verifies with
-  what it was handed. `keyDerivation` then leaves the server's configuration entirely and the ladder
-  becomes a client and broker concern, which retires the server-wide ladder in D4 rather than
-  extending it. Worth settling before anything is built on the current shape, because it is a
-  deletion and the alternative is a normalization.
-
-Key resolution happens in one function, which indexes a map built at startup. Nothing in the
-coverage or acceptance logic depends on where a key came from, so a lookup can replace that map
-without disturbing either. That containment is the part of the static list decision meant to survive, and it
-is not an interface today.
+One thing this section got wrong: it framed the response as carrying a validity period and treated the
+identity as the simple part. The identity is the part that needed rules. A resolver holds key material;
+letting it claim a name Kubernetes issues would be a strictly larger grant than vending a key. See D11.
 
 ### Q5: recovering the ladder drift check as an operator can use it
 
-D8 gave something up when the ladder became a typed field in each party's own configuration. Two
-parties no longer share bytes, so the digest is computed over the parsed ladder, and comparing
-digests now means reading two processes' logs rather than running `sha256sum` on two files.
+**Partly answered.** The digest is now a metric label,
+`apiserver_httpsig_resolver_key_derivation_info{resolver, sha256}`, alongside the log line it already
+had. An operator compares one metric read against the digest a client logs, rather than grepping two
+processes' logs. It is a label rather than a value because the operation is comparing it to another
+party's, which a label supports and a float does not, and the series for a resolver is reset before the
+new one is published so a ladder that changed leaves one series rather than two.
 
-That is a diagnostic regression, not a security one: a mismatched ladder fails closed, and both
-sides log their digest at load. But the failure it produces at the server is a bare signature
-mismatch, and the operator who has to notice is the one least likely to be reading API server logs.
+The digest is computed by the shared helper both sides use, not a second implementation, and a test
+asserts that. A digest computed a second way would make the comparison meaningless while looking like
+it worked.
 
-Two shapes would fix it, and neither is built:
+The pressure on this got higher, not lower, and that is worth naming. Before, both copies of the ladder
+were written by the same operator into two files. Now the server's copy comes from the identity system
+and the client's stays hand-authored in a kubeconfig, so the two have different owners and drift is
+*more* likely. The count of places the fact is stated did not change; who states them did.
 
-- **Put the client's digest on the wire.** The verifier could then answer "ladder mismatch" rather
-  than "signature does not match", which is the same diagnosability argument that put the claimed
-  scope in the key ID. It costs a component on every request and puts an implementation detail into
-  the protocol, so it needs the argument made properly rather than assumed.
-- **Make the digest computable offline.** The helper is exported, so a small tool could read a
-  kubeconfig and an authentication configuration and report whether they agree. This is the cheap
-  half and probably the right first move, because it serves the operator without changing anything
-  on the wire.
+Still not built, and still the better fix: putting the client's digest on the wire, so the verifier can
+answer "ladder mismatch" rather than "signature does not match". It costs a covered component on every
+request and puts an implementation detail into the protocol, so it needs the argument made properly
+rather than assumed.
 
-### Q6: whether replay gets narrowed below the acceptance window
+### Q6: what bounds resolver calls from an unauthenticated caller
 
-D5 leaves the acceptance window as the whole of the replay bound. Narrowing it means recognising a
-signature the fleet has already accepted, which is shared state on the request path, and the question
-is whether that is worth having at all rather than how to build it.
+Not answered, and the sharpest remaining question.
 
-The two answers are not a spectrum. Either the fleet keeps shared state, which puts a store on the
-authentication path of every request and makes its availability the API server's availability, or
-non-replayability is stated as a non-goal and the window is documented as the bound. The second is
-the honest default and costs nothing; the first needs a threat that the window does not already
-bound, stated concretely, before the operational cost is worth arguing about.
+A key lookup happens before any signature has verified, because verifying needs the key. So an
+unauthenticated caller drives a network call. Three things bound it today and none of them is a limit
+on the rate:
 
-Whatever consumes a nonce later needs no client change: the client already attaches one to every
-signature. Two constraints on the store, if it is ever built. It has to be keyed on the nonce
-together with the identity the signature authenticated as, not on the nonce alone, because a single
-namespace of client-chosen values lets one client evict another's records and turns the store into a
-replay enabling mechanism. And its cardinality is peer-driven, so it needs a bound, which is the same
-argument D8 makes for not caching derived keys.
+- The key ID is length-capped before it becomes a cache key or a resolver argument.
+- Signature age is checked before the lookup, so an ancient or future `created` costs nothing.
+- Concurrent lookups for one cache key collapse to one call, and absence is remembered briefly, so a
+  peer repeating one unknown key ID costs one call rather than one per request.
+
+What is not bounded is a caller cycling through *distinct* key IDs. Each one is a cache miss, a
+singleflight group of one, and a resolver call. `maxKeyIDPrefixes` narrows which resolvers see it and
+`keyIDPrefixes` can reduce the fan-out to one, but nothing caps the rate.
+
+Two places could hold the limit and it is not obvious which. The resolver is the party that knows its
+own capacity, and it is already reachable only over a socket an administrator controls. The API server
+has priority and fairness in front of every request, which bounds concurrency but is scoped to
+resources rather than to authenticators. Adding a third limiter inside the authenticator would be a
+knob whose right value nobody can state, which is the argument for not adding it yet and for measuring
+first: `apiserver_httpsig_resolver_request_total` and `apiserver_httpsig_key_cache_lookup_total` are
+what would say whether it is a real problem or a predicted one.
+
+This is the "verify before work inverts" concern section 6 records against path B, arriving as a
+concrete gap rather than a prediction.
+
+### Q7: whether replay gets narrowed below the acceptance window
+
+**Answered, and the answer was the first option.** See D5 and D11. This asked whether the fleet should
+keep shared state on the request path or state non-replayability as a non-goal, and called the second
+the honest default. The resolver's `ConsumeNonce` is the first: shared state, on the authentication path
+of every accepted request, with its availability folded into the API server's for the keys it serves.
+
+What changed the answer was that the store stopped being something Kubernetes would have to build. A
+resolver already has to exist to answer for a key, it is already on the authentication path, and it is
+already the one thing in the deployment that sees every API server's traffic. Given that, the marginal
+cost of one more RPC to it is small, where the cost of introducing a store for this alone would not have
+been. The second option is still available and now says so out loud: `nonceHandling: Ignore`.
+
+Both constraints this section put on the store, if it were ever built, survived contact with building
+it, and one of them survived in a stronger form:
+
+- *Keyed on the nonce together with an identity, not the nonce alone.* Held: records are per key ID, so
+  one client cannot evict another's. The reasoning was about eviction; the sharper version is that the
+  same nonce value under two keys is two different facts, so pooling them would let one client's traffic
+  reject another's outright rather than merely evict it.
+- *Cardinality is peer-driven, so it needs a bound.* Held, and the demo resolver shows what the bound
+  has to do: a full store **refuses** rather than evicting, because evicting a record permits the replay
+  it was preventing. That is a third appearance of the argument D8 makes about derived keys.
+
+One thing this section assumed that turned out not to hold. It expected the store's availability to
+become the API server's availability, full stop. It is narrower than that: a resolver outage rejects
+requests bearing the keys that resolver serves, and nothing else. Another resolver's keys keep working,
+and so does every other authenticator.
 
 ## 6. Paths not taken yet
 
@@ -1059,14 +1336,32 @@ Built and covered by tests:
 - The floor and the protected header list as package-level values both sides read, so neither can
   disagree with the other about which headers matter. The signer assembles its component list with
   `Components`; the verifier states the floor as its requirement and checks presence in its own loop.
-- An `httpSignature` section in `AuthenticationConfiguration` behind the
-  `HTTPSignatureAuthentication` alpha feature gate, with validation, carrying the deployment's
-  ladder once and each key's own position on it.
+- An `httpSignature` list in `AuthenticationConfiguration` behind the `HTTPSignatureAuthentication`
+  alpha feature gate, with validation. Each entry names a resolver, which key IDs reach it, which
+  headers are relayed to it, its cache bounds, and its acceptance policy. No key material and no
+  identity appears in the file (D11).
+- `k8s.io/externalhttpsig`, a staging module carrying the resolver's proto API: `Metadata`,
+  `ResolveKey`, and `ConsumeNonce`. No `k8s.io` dependencies, so a resolver author does not import
+  `k8s.io/apiserver` to implement it.
+- A gRPC client for it over a Unix socket, with per-call deadlines, a metadata poll that doubles as a
+  health probe, and a bounded key cache with a separate bounded negative cache and singleflight on
+  both (D11).
+- Reload of the `httpSignature` list, behind an `atomic.Pointer` read per request, health-gated before
+  the swap and torn down after a grace period, so a resolver can be added, removed, or repointed by
+  editing the file (D4).
+- A `KeyResolver` seam that returns data rather than a verifier, which is the prerequisite section 6
+  names for both the certificate-assertion and remote-resolution paths (D12).
+- `e2e/cmd/httpsig-resolver`, a resolver backed by a YAML file: keys nested by algorithm then key ID,
+  PEM in the file and PKIX DER on the wire, all three material shapes including a ladder rung, identity
+  chosen by a relayed header, reload on file change, and an atomic in-memory nonce store that refuses
+  rather than evicting when full. Its socket permissions default to 0600 and world-writable is refused,
+  because on Linux write permission on the socket is permission to vend an identity to the cluster.
 - `spec.httpSignature` and `status.httpSignature` in `clientauthentication` v1 and v1beta1, behind
   the `ClientsAllowHTTPSignature` client-go feature gate, so a plugin is told what to produce and
   can answer with key material instead of a token.
 - An `authenticator.Request` verifier wired into the kube-apiserver authenticator chain ahead of the
-  bearer token authenticator.
+  bearer token authenticator, with nonces recorded at the resolver, fail-closed, and only after a
+  signature verifies (D5).
 - A redaction test over every exported type that can hold key material, in every fmt verb, checking
   for the secret as a string and as the bytes an interface field prints, and requiring the key ID to
   survive so the output stays worth logging (D3).
@@ -1083,28 +1378,76 @@ Built and covered by tests:
   - the daily cliff a date-scoped server rung falls off, recorded so a change to it is visible
   - a reflection test comparing the Kubernetes ladder types against the library's field for field, so
     the nine declarations of that schema cannot drift from the one that validates them
+  - a drift guard on the proto-to-library ladder conversion: every field varied and asserted to change
+    the digest, plus a field count that fails if the proto grows one (D12). Verified by breaking the
+    converter and watching the guard fail, rather than by assuming it would
 - Exec plugin tests: material that signs, a brokered rung that verifies against a root the client
   never sees, and the answers a plugin must not give, each rejected by name rather than as a
   signature the server refuses.
-- Integration tests against a real kube-apiserver:
-  - a kubeconfig-configured client authenticating, reading, and writing with a body
-  - an unknown key rejected with 401
+- Resolver tests, against an in-process resolver on a real socket rather than a fake or a direct call,
+  because the parts most likely to be wrong are the ones a direct call skips: endpoint parsing, the
+  dialer, the not-found status, and the difference between a resolver that says not-found and one that
+  is not there.
+  - all three material shapes, including every pairing of root and rung across client and server
+  - ordered fallthrough across resolvers, and a prefix selector proven to skip one entirely
+  - a cached key, a resolver stating zero cache duration and being obeyed, a remembered absence, and a
+    resolver failure deliberately *not* remembered
+  - a relayed value reaching the resolver, an uncovered one rejected before any lookup, a repeated one
+    refused rather than joined, and a rotated one busting the cache
+  - `system:` usernames and groups refused, and each material-versus-algorithm mismatch refused by name
+  - `ConsumeNonce` asserted *not* called for a signature that failed to verify, because that property
+    lives in call order and call order is not self-documenting
+  - a stale signature rejected without the resolver being called at all
+- Integration tests against a real kube-apiserver, with a resolver on a real socket:
+  - a kubeconfig-configured client authenticating, reading, and writing with a body, and one resolver
+    call serving four requests
+  - an unknown key rejected with 401, both as an unserved key ID and as a served one with wrong material
+  - a captured request replayed over the wire and rejected, by the resolver's nonce record
+  - two resolvers routed by key ID prefix, each vending a different identity, each proven not to be
+    asked about the other's keys
+  - a session token relayed to the resolver, which chooses the identity from it
   - signed impersonation accepted, injected impersonation rejected
-  - the HMAC credential document path
-  - a brokered rung: the client holds a rung scoped to one cluster, the server re-derives from the
-    root, and a rung scoped to another cluster is rejected with 401
+  - a brokered rung with the ladder stated by the resolver, and a rung scoped to another cluster
+    rejected with 401
+  - a resolver that goes away rejecting requests whose keys are still cached, because the nonce cannot
+    be recorded
+  - a resolver added by rewriting the configuration file taking effect without a restart
+- Integration tests against the resolver command as a separate process, which is the only place several
+  things are exercised at all: the key file parsed by the code that will parse it, PEM surviving
+  conversion to the DER the wire takes, a socket created by one process and dialed by another, and a
+  resolver that actually died rather than one told to return an error.
+  - a key file a person could have written authenticating a signed request, identity and extras intact
+  - a captured request replayed and refused by the resolver's own nonce store
+  - a key removed from the file stopping authentication, with the delay being the cacheTTL the file set
+  - the resolver killed, and requests refused because the nonce can no longer be recorded
+  - a rung vended with the ladder stated in Metadata, folded per request by the API server
+  - a key file claiming a `system:` identity refusing to start, naming the rule
+  - the resolver README's example key file loaded, so a documented example cannot rot
   - an exec plugin whose material signs four requests, runs once for all four, and is shown to have
     been told the algorithm and the covered headers it had to satisfy
 
 Deliberately not built:
 
-- Any key lookup beyond the static list (Q4), and therefore any key retirement story.
-- Hot reload of the `httpSignature` section. A change to it is accepted, ignored, and reported as a
-  successful reload, which is a defect rather than a decision (D4).
+- A resolver worth deploying. `httpsig-resolver` holds plaintext key material in a file next to the
+  identity it authenticates, which is the objection this API exists to answer moved one process over,
+  and keeps nonce state in memory in one process, which is correct only while there is exactly one of
+  it. Both are recorded in its README rather than hidden.
+- A rate limit on resolver calls driven by an unauthenticated caller (Q6). Bounded key ID length, an
+  age check before the lookup, singleflight, and a negative cache all reduce it; nothing caps the rate
+  for distinct key IDs.
+- CEL user-validation rules over a resolver's claimed identity. The hard rules are enforced; the
+  configurable ones need the aggregate-cost problem recorded for the JWT path solved first (D11).
+- Resolver health in `/readyz`. Deliberate: a resolver being down affects only requests signed by its
+  keys, and gating readiness on it would remove the whole API server from service (D11).
+- The client's ladder digest on the wire, which would let the verifier answer "ladder mismatch" rather
+  than "signature does not match" (Q5).
+- A ladder discovery endpoint for clients. A ladder is not secret and could be published, but a client
+  has to state it to work at all, so a new public API surface buys nothing.
 - Hardware-backed or non-exportable keys (D3), which the signer seam allows and nothing here
   delivers.
 - Asymmetric key derivation (D8), which is a new ladder kind and a key distribution design.
-- More than one ladder per API server (D4), which needs named ladders and a key referring to one.
+- More than one ladder per resolver, which needs named ladders and a key referring to one. A
+  deployment needing two can run two resolvers.
 - An inline credential in a kubeconfig (D3), which the file would then carry around.
 
 Two implementation notes worth keeping, because both are places where the obvious choice would have

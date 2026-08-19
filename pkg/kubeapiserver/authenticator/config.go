@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync/atomic"
 	"time"
 
@@ -134,12 +135,29 @@ func (config Config) New(serverLifecycle context.Context) (authenticator.Request
 	// HTTP message signatures. This runs before the bearer token authenticator
 	// so that a request presenting both is authenticated as the signer, whose
 	// identity is bound to the request rather than merely presented with it.
-	if config.AuthenticationConfig != nil && config.AuthenticationConfig.HTTPSignature != nil {
-		signatureAuth, err := httpsig.New(config.AuthenticationConfig.HTTPSignature)
+	//
+	// Building it dials every configured resolver and fetches its metadata, so a
+	// resolver that is absent or that states a malformed key derivation ladder
+	// fails the server's start rather than every signed request afterwards.
+	//
+	// It goes into the chain whenever there is an authentication config file, even
+	// with no resolvers configured, and reads a pointer per request. That is what
+	// lets a resolver be added by editing the file: an authenticator that was not
+	// in the chain to begin with cannot be swapped into it later. With no resolvers
+	// it has no opinion about any request.
+	httpSignatureAuthenticatorPtr := &atomic.Pointer[httpSignatureAuthenticatorWithCancel]{}
+	if config.AuthenticationConfig != nil {
+		initial, err := newHTTPSignatureAuthenticator(serverLifecycle, config.AuthenticationConfig, config.APIServerID, httpSignatureStartupDialTimeout)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
-		authenticators = append(authenticators, authenticator.WrapAudienceAgnosticRequest(config.APIAudiences, signatureAuth))
+		httpSignatureAuthenticatorPtr.Store(initial)
+
+		authenticators = append(authenticators, authenticator.WrapAudienceAgnosticRequest(config.APIAudiences,
+			authenticator.RequestFunc(func(req *http.Request) (*authenticator.Response, bool, error) {
+				return httpSignatureAuthenticatorPtr.Load().authenticator.AuthenticateRequest(req)
+			}),
+		))
 	}
 
 	// Bearer token methods, local first, then remote
@@ -191,10 +209,11 @@ func (config Config) New(serverLifecycle context.Context) (authenticator.Request
 		}
 
 		updateAuthenticationConfig = (&authenticationConfigUpdater{
-			serverLifecycle:     serverLifecycle,
-			config:              config,
-			jwtAuthenticatorPtr: jwtAuthenticatorPtr,
-			issuers:             initialIssuers,
+			serverLifecycle:               serverLifecycle,
+			config:                        config,
+			jwtAuthenticatorPtr:           jwtAuthenticatorPtr,
+			httpSignatureAuthenticatorPtr: httpSignatureAuthenticatorPtr,
+			issuers:                       initialIssuers,
 		}).updateAuthenticationConfig
 
 		tokenAuthenticators = append(tokenAuthenticators,
@@ -260,6 +279,61 @@ func (config Config) New(serverLifecycle context.Context) (authenticator.Request
 	return authenticator, updateAuthenticationConfig, &securityDefinitionsV2, securitySchemesV3, nil
 }
 
+const (
+	// httpSignatureStartupDialTimeout bounds the first metadata call to each key
+	// resolver at server start. Generous because a resolver and an API server are
+	// often started together, and a resolver that is not listening yet is not a
+	// resolver that is broken. It matches the budget the external JWT signer allows
+	// for its first key fetch.
+	httpSignatureStartupDialTimeout = 60 * time.Second
+
+	// httpSignatureReloadDialTimeout bounds the same call when the configuration
+	// file is reloaded. Much shorter, because by then the resolver is either running
+	// or the change is wrong, and because this budget is shared with everything else
+	// a reload does inside UpdateAuthenticationConfigTimeout.
+	httpSignatureReloadDialTimeout = 10 * time.Second
+)
+
+type httpSignatureAuthenticatorWithCancel struct {
+	authenticator *httpsig.Authenticator
+	healthChecks  []func() error
+	cancel        func()
+}
+
+// newHTTPSignatureAuthenticator builds one generation of the signature
+// authenticator. Its connections and metadata refreshes hang off a context of its
+// own, so an older generation can be torn down without disturbing the current one.
+func newHTTPSignatureAuthenticator(serverLifecycle context.Context, config *apiserver.AuthenticationConfiguration, apiServerID string, dialTimeout time.Duration) (_ *httpSignatureAuthenticatorWithCancel, buildErr error) {
+	ctx, cancel := context.WithCancel(serverLifecycle)
+	defer func() {
+		if buildErr != nil {
+			cancel()
+		}
+	}()
+
+	auth, err := httpsig.New(ctx, config.HTTPSignature, apiServerID, dialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return &httpSignatureAuthenticatorWithCancel{
+		authenticator: auth,
+		healthChecks:  auth.HealthChecks(),
+		cancel:        cancel,
+	}, nil
+}
+
+// healthCheck aggregates every resolver's health, for gating a reload before the
+// new generation goes live.
+func (h *httpSignatureAuthenticatorWithCancel) healthCheck() error {
+	var errs []error
+	for _, check := range h.healthChecks {
+		if err := check(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return utilerrors.NewAggregate(errs)
+}
+
 type jwtAuthenticatorWithCancel struct {
 	jwtAuthenticator authenticator.Token
 	healthCheck      func() error
@@ -319,7 +393,11 @@ type authenticationConfigUpdater struct {
 	serverLifecycle     context.Context
 	config              Config
 	jwtAuthenticatorPtr *atomic.Pointer[jwtAuthenticatorWithCancel]
-	issuers             sets.Set[string]
+	// httpSignatureAuthenticatorPtr is nil-valued rather than nil when no
+	// authentication config file is in use, which cannot happen here: this updater
+	// only exists when one is.
+	httpSignatureAuthenticatorPtr *atomic.Pointer[httpSignatureAuthenticatorWithCancel]
+	issuers                       sets.Set[string]
 }
 
 // the input ctx controls the timeout for updateAuthenticationConfig to return, not the lifetime of the constructed authenticators.
@@ -329,12 +407,29 @@ func (c *authenticationConfigUpdater) updateAuthenticationConfig(ctx context.Con
 		return err
 	}
 
+	// Built before either is swapped in, so a reload is all or nothing. A file that
+	// changed both sections and applied only one would leave the server in a state
+	// no configuration describes.
+	updatedHTTPSignatureAuthenticator, err := newHTTPSignatureAuthenticator(c.serverLifecycle, authConfig, c.config.APIServerID, httpSignatureReloadDialTimeout)
+	if err != nil {
+		updatedJWTAuthenticator.cancel()
+		return err
+	}
+
 	var lastErr error
 	if waitErr := wait.PollUntilContextCancel(ctx, 10*time.Second, true, func(_ context.Context) (done bool, err error) {
-		lastErr = updatedJWTAuthenticator.healthCheck()
+		lastErr = utilerrors.NewAggregate([]error{
+			updatedJWTAuthenticator.healthCheck(),
+			// Every resolver answered its metadata call during construction above,
+			// so this is a second look rather than a first one. It is worth taking:
+			// a resolver that answered once and then failed must not be swapped in
+			// as though it were working.
+			updatedHTTPSignatureAuthenticator.healthCheck(),
+		})
 		return lastErr == nil, nil
 	}); lastErr != nil || waitErr != nil {
 		updatedJWTAuthenticator.cancel()
+		updatedHTTPSignatureAuthenticator.cancel()
 		return utilerrors.NewAggregate([]error{lastErr, waitErr}) // filters out nil errors
 	}
 
@@ -347,6 +442,7 @@ func (c *authenticationConfigUpdater) updateAuthenticationConfig(ctx context.Con
 	removedIssuers := c.issuers.Difference(newIssuers)
 
 	oldJWTAuthenticator := c.jwtAuthenticatorPtr.Swap(updatedJWTAuthenticator)
+	oldHTTPSignatureAuthenticator := c.httpSignatureAuthenticatorPtr.Swap(updatedHTTPSignatureAuthenticator)
 	c.issuers = newIssuers
 
 	go func() {
@@ -358,6 +454,10 @@ func (c *authenticationConfigUpdater) updateAuthenticationConfig(ctx context.Con
 		}
 		// TODO maybe track requests so we know when this is safe to do
 		oldJWTAuthenticator.cancel()
+		// Cancelling closes the old generation's resolver connections and stops its
+		// metadata polls. It waits out the same grace period as the JWT side, because
+		// a request that read the old pointer may still be mid-lookup.
+		oldHTTPSignatureAuthenticator.cancel()
 
 		// Wait a bit to account for the lack of locks in shouldRecordFunc.
 		// This ensures any in-flight HTTP requests that checked shouldRecordFunc

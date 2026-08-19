@@ -19,8 +19,13 @@ limitations under the License.
 // query, body digest, and selected headers. Nothing reusable is sent, so a
 // captured request is a record of one request rather than a credential.
 //
-// Two rules in here are the whole security argument, and both are easy to leave
-// out of an implementation that still appears to work:
+// Keys are not configured here. A resolver answers for a key ID with the key
+// that verifies signatures bearing it and the identity it authenticates, and
+// records the nonces those signatures carry. See resolver.go for that seam and
+// remote.go for the gRPC implementation of it.
+//
+// Three rules in here are the whole security argument, and all three are easy to
+// leave out of an implementation that still appears to work:
 //
 // The covered component set is required by this verifier, not read from the
 // signature. RFC 9421 signatures declare what they cover. A verifier that only
@@ -34,140 +39,242 @@ limitations under the License.
 // intermediary can append Impersonate-User to a signed request that carried no
 // impersonation and the signature still verifies. Checking presence against the
 // covered set is the only defense against that.
+//
+// Work is ordered by what it costs an unauthenticated caller. Signature age is
+// checked before a key is resolved, so a caller with an ancient timestamp cannot
+// drive a lookup. The signature is verified before the body is read and before a
+// nonce is consumed, so a caller who cannot produce a valid signature cannot make
+// this server read a body or call a resolver twice.
+//
+// Replay is closed by the resolver recording nonces, which configuration can turn
+// off. With it off the replay window is the maximum signature age, and nothing here
+// narrows it; see apiserver.NonceHandling for why that is a stated option rather
+// than something to fake with a resolver that always says yes.
 package httpsig
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/base64"
-	"encoding/pem"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/micahhausler/httpsig"
 
-	"github.com/micahhausler/httpsig/keyscope"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apiserver/pkg/apis/apiserver"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
-	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/authentication/request/httpsig/metrics"
 
 	transporthttpsig "k8s.io/client-go/transport/httpsig"
 	"k8s.io/klog/v2"
 )
 
 const (
-	// defaultMaxAge bounds signature age when configuration does not. It is also
-	// the only bound on replay: replay protection is unimplemented, so a
-	// captured request can be resent until it ages out.
-	defaultMaxAge = 5 * time.Minute
+	// DefaultMaxAge bounds signature age when configuration does not. It also
+	// sets how long a resolver is asked to remember a nonce.
+	DefaultMaxAge = 5 * time.Minute
 
 	// maxBodyBytes caps the body read to check a Content-Digest. It matches the
 	// API server's default request body limit, so a request this verifier
 	// rejects for size is one the server would have rejected anyway.
 	maxBodyBytes = int64(3 * 1024 * 1024)
+
+	// maxKeyIDLen bounds the keyid this server will act on. A keyid is
+	// peer-chosen and becomes a cache key, a resolver argument, and part of an
+	// error message, so it is bounded before any of those. The value is the one
+	// the signing library's own keyid parser accepts, so a longer keyid could
+	// not have verified anyway.
+	maxKeyIDLen = 512
 )
 
 // errNoSignature reports a request carrying no signature at all. The union
 // authenticator moves on, so this never reaches a client.
 var errNoSignature = errors.New("request carries no HTTP message signature")
 
-// key is one configured verification key and the identity it authenticates.
-type key struct {
-	// verifier is set for keys that verify the same way on every request. For a
-	// derived key it is nil and a verifier is built per request, because the
-	// derived key depends on the created timestamp the signature carries and
-	// on the scope the keyid claims.
-	verifier httpsig.Verifier
-	// scoped is set for a derived key: material bound to its position on the
-	// ladder, which derives a verifier per signature.
-	scoped *keyscope.Key
-	info   *user.DefaultInfo
+// resolverEntry is one configured resolver and the policy applied to the keys it
+// vends.
+type resolverEntry struct {
+	// prefixes admit a keyid by the segment before its first slash. Empty means
+	// every keyid.
+	prefixes []string
+
+	// relayedHeaders are the lowercase names of headers relayed with a lookup.
+	relayedHeaders []string
+
+	keys *keyCache
+
+	// consumeNonces is false when configuration says to ignore them. It gates one
+	// thing only: whether the resolver is asked to record the nonce. The signature
+	// is still required to carry one either way, so turning this on later needs no
+	// change at any client.
+	consumeNonces bool
+
+	// maxAge and tolerance are this entry's configured bounds. A resolver may
+	// narrow maxAge, per resolver or per key; nothing widens it.
+	maxAge    time.Duration
+	tolerance time.Duration
 }
 
 // Authenticator verifies HTTP message signatures on incoming requests.
 type Authenticator struct {
-	keys      map[string]*key
-	policy    httpsig.Policy
+	entries []*resolverEntry
+
+	// parseOpts states the external scheme and authority clients sign, for a
+	// server behind an intermediary that rewrites Host. It is shared across
+	// entries because it describes this server rather than any resolver: the
+	// authority goes into the signature base, so two entries disagreeing about it
+	// would make the same request verify under one and not the other.
+	// Configuration is rejected if entries disagree.
 	parseOpts *httpsig.ParseOptions
 }
 
 var _ authenticator.Request = &Authenticator{}
 
-// New builds an Authenticator from configuration. Key material is parsed here,
-// so a malformed key fails at server start rather than on a request.
-func New(config *apiserver.HTTPSignatureAuthenticator) (*Authenticator, error) {
-	if config == nil {
-		return nil, fmt.Errorf("httpsig: configuration is required")
-	}
-	maxAge := defaultMaxAge
-	if config.MaxAge != nil {
-		maxAge = config.MaxAge.Duration
-	}
-	var tolerance time.Duration
-	if config.Tolerance != nil {
-		tolerance = config.Tolerance.Duration
-	}
-
-	a := &Authenticator{
-		keys: make(map[string]*key, len(config.Keys)),
-		policy: httpsig.Policy{
-			// The floor is stated here, by this verifier, and not taken from
-			// the signature.
-			RequiredComponents: transporthttpsig.FloorComponents,
-			// A positive maximum age is also what makes the created parameter
-			// mandatory: the verifier rejects a signature it cannot age.
-			// Configuration cannot reach a non-positive value, because maxAge
-			// is either unset and defaulted above or validated as positive.
-			MaxAge:    maxAge,
-			Tolerance: tolerance,
-		},
-	}
-	if config.Scheme != "" || config.Authority != "" {
-		a.parseOpts = &httpsig.ParseOptions{Scheme: config.Scheme, Authority: config.Authority}
+// New builds an Authenticator from configuration. It dials each resolver and
+// fetches its metadata, so a resolver that is absent or unusable fails at server
+// start rather than on a request.
+//
+// An empty list is valid and produces an authenticator with no opinion about any
+// request. That is what lets a resolver be added by reloading the configuration
+// file: the authenticator has to already be in the chain for a later generation to
+// replace it.
+//
+// The connections and each resolver's metadata refresh live for as long as
+// lifecycle. dialTimeout bounds the first metadata call to each resolver, and the
+// resolvers are dialed concurrently, so it bounds this function rather than being
+// multiplied by the number of them.
+func New(lifecycle context.Context, configs []apiserver.HTTPSignatureAuthenticator, apiServerID string, dialTimeout time.Duration) (*Authenticator, error) {
+	a := &Authenticator{}
+	if len(configs) == 0 {
+		return a, nil
 	}
 
-	for i, k := range config.Keys {
-		built, err := buildKey(k, config.KeyDerivation)
-		if err != nil {
-			return nil, fmt.Errorf("httpsig: keys[%d]: %w", i, err)
+	if configs[0].Scheme != "" || configs[0].Authority != "" {
+		a.parseOpts = &httpsig.ParseOptions{Scheme: configs[0].Scheme, Authority: configs[0].Authority}
+	}
+	for i, c := range configs {
+		if c.Scheme != configs[0].Scheme || c.Authority != configs[0].Authority {
+			return nil, fmt.Errorf("httpsig: httpSignature[%d] states a different scheme or authority than httpSignature[0]; both describe this server rather than a resolver, so every entry has to state the same values", i)
 		}
-		if _, dup := a.keys[k.KeyID]; dup {
-			return nil, fmt.Errorf("httpsig: keys[%d]: duplicate keyID %q", i, k.KeyID)
-		}
-		built.info = &user.DefaultInfo{
-			Name:   k.User.Username,
-			UID:    k.User.UID,
-			Groups: k.User.Groups,
-		}
-		a.keys[k.KeyID] = built
+	}
+
+	// Dialed concurrently. Sequentially, a list of resolvers that are all absent
+	// would take the dial budget times the length of the list to report, which for
+	// a server start means an unbounded-looking hang rather than an error.
+	a.entries = make([]*resolverEntry, len(configs))
+	errs := make([]error, len(configs))
+	var wg sync.WaitGroup
+	for i, c := range configs {
+		wg.Add(1)
+		go func(i int, c apiserver.HTTPSignatureAuthenticator) {
+			defer wg.Done()
+			entry, err := newResolverEntry(lifecycle, c, apiServerID, dialTimeout)
+			if err != nil {
+				errs[i] = fmt.Errorf("httpSignature[%d]: %w", i, err)
+				return
+			}
+			a.entries[i] = entry
+		}(i, c)
+	}
+	wg.Wait()
+
+	if err := utilerrors.NewAggregate(errs); err != nil {
+		return nil, fmt.Errorf("httpsig: %w", err)
 	}
 	return a, nil
 }
 
-// verifierFor returns the verifier for one signature. A static key holds one; a
-// derived key builds one per request, checking the scope the keyid claims
-// against its own configuration first, so a request signed under the wrong
-// scope, whatever dimensions the ladder scopes by, is rejected with an error
-// naming the disagreeing step rather than a bare signature mismatch. The verifier never derives with its
-// own clock: it uses the created timestamp the signature carries, which is
-// covered by the signature and bounded by the maximum age policy.
-func (k *key) verifierFor(sig *httpsig.Signature) (httpsig.Verifier, error) {
-	if k.scoped == nil {
-		return k.verifier, nil
+func newResolverEntry(lifecycle context.Context, c apiserver.HTTPSignatureAuthenticator, apiServerID string, dialTimeout time.Duration) (*resolverEntry, error) {
+	maxAge := DefaultMaxAge
+	if c.MaxAge != nil {
+		maxAge = c.MaxAge.Duration
 	}
-	created := sig.Created()
-	if created.IsZero() {
-		return nil, fmt.Errorf("the signature carries no created parameter, and this key's verification key is derived from it")
+	var tolerance time.Duration
+	if c.Tolerance != nil {
+		tolerance = c.Tolerance.Duration
 	}
-	return k.scoped.Verifier(sig.KeyID(), created)
+
+	remote, err := newRemote(lifecycle, c.Endpoint, apiServerID, dialTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	relayed := make([]string, 0, len(c.RelayedHeaders))
+	for _, name := range c.RelayedHeaders {
+		relayed = append(relayed, strings.ToLower(name))
+	}
+
+	// The zero value means Consume, so replay protection is on unless configuration
+	// turns it off in so many words. This does not rely on a defaulting pass having
+	// run, because AuthenticationConfiguration has none and a caller building this
+	// struct directly should still get the safe behavior.
+	consumeNonces := c.NonceHandling != apiserver.NonceHandlingIgnore
+	if !consumeNonces {
+		// Logged at default verbosity, and named, because a cluster running without
+		// replay protection should be discoverable without reading a configuration
+		// file off a control plane node.
+		klog.InfoS("HTTP signature nonces will not be recorded; a captured request can be replayed within the maximum signature age",
+			"resolver", c.Endpoint, "maxAge", maxAge, "tolerance", tolerance)
+	}
+	metrics.RecordNonceHandling(c.Endpoint, consumeNonces)
+
+	return &resolverEntry{
+		prefixes:       c.KeyIDPrefixes,
+		relayedHeaders: relayed,
+		keys:           newKeyCache(remote, c.Cache),
+		consumeNonces:  consumeNonces,
+		maxAge:         maxAge,
+		tolerance:      tolerance,
+	}, nil
+}
+
+// HealthChecks returns one checker per configured resolver.
+func (a *Authenticator) HealthChecks() []func() error {
+	checks := make([]func() error, 0, len(a.entries))
+	for _, entry := range a.entries {
+		checks = append(checks, entry.keys.resolver.Check)
+	}
+	return checks
+}
+
+// admits reports whether this entry is asked about a keyid.
+func (e *resolverEntry) admits(keyName string) bool {
+	if len(e.prefixes) == 0 {
+		return true
+	}
+	for _, p := range e.prefixes {
+		if keyName == p {
+			return true
+		}
+	}
+	return false
+}
+
+// policyFor returns the verification policy for one resolved key. The effective
+// maximum age is the smallest of this entry's configured bound and whatever the
+// resolver narrowed it to, so a resolver can tighten the window and never widen
+// it.
+func (e *resolverEntry) policyFor(k *verifierKey) httpsig.Policy {
+	maxAge := e.maxAge
+	if k.maxAge > 0 && k.maxAge < maxAge {
+		maxAge = k.maxAge
+	}
+	return httpsig.Policy{
+		// The floor is stated here, by this verifier, and not taken from the
+		// signature.
+		RequiredComponents: transporthttpsig.FloorComponents,
+		// A positive maximum age is also what makes the created parameter
+		// mandatory: the verifier rejects a signature it cannot age. Configuration
+		// cannot reach a non-positive value, because maxAge is either unset and
+		// defaulted or validated as positive, and a resolver can only narrow it.
+		MaxAge:    maxAge,
+		Tolerance: e.tolerance,
+	}
 }
 
 // AuthenticateRequest verifies the request's signatures. It returns no opinion
@@ -177,6 +284,13 @@ func (k *key) verifierFor(sig *httpsig.Signature) (httpsig.Verifier, error) {
 // everything here. Requiring every signature to verify would be trivially
 // defeated by appending a garbage one.
 func (a *Authenticator) AuthenticateRequest(req *http.Request) (*authenticator.Response, bool, error) {
+	// With no resolvers configured there is nothing that could resolve a key, so
+	// this draws no opinion even about a request carrying a signature, and the rest
+	// of the chain runs. Returning an error instead would make a stray Signature
+	// header break authentication that has nothing to do with signatures.
+	if len(a.entries) == 0 {
+		return nil, false, nil
+	}
 	if len(req.Header.Values("Signature-Input")) == 0 && len(req.Header.Values("Signature")) == 0 {
 		return nil, false, nil
 	}
@@ -207,54 +321,212 @@ func (a *Authenticator) AuthenticateRequest(req *http.Request) (*authenticator.R
 }
 
 func (a *Authenticator) authenticateSignature(req *http.Request, sig *httpsig.Signature) (*authenticator.Response, error) {
-	// KeyID is an unverified claim until Verify succeeds. It is used only to
-	// select a key, never to grant anything. A derived key's keyid carries its
-	// claimed scope after the name, joined by slashes, so the
-	// lookup falls back to the segment before the first slash; the claimed
-	// scope itself is checked by the key, not here.
+	ctx := req.Context()
+
+	// The keyid is an unverified claim until Verify succeeds. It is used only to
+	// select a resolver and as an argument to it, never to grant anything. It is
+	// bounded first, before it becomes a cache key or a resolver argument.
 	keyID := sig.KeyID()
-	k, ok := a.keys[keyID]
-	if !ok {
-		if name, _, found := strings.Cut(keyID, "/"); found {
-			k, ok = a.keys[name]
-		}
+	if keyID == "" {
+		return nil, fmt.Errorf("signature %q: carries no keyID", sig.Label())
 	}
-	if !ok {
+	if len(keyID) > maxKeyIDLen {
+		return nil, fmt.Errorf("signature %q: keyID is %d bytes, limit %d", sig.Label(), len(keyID), maxKeyIDLen)
+	}
+	// A derived key's keyid carries its claimed scope after the name, joined by
+	// slashes. Selection uses the name; the claimed scope is checked by the key
+	// the resolver returns, not here.
+	keyName, _, _ := strings.Cut(keyID, "/")
+
+	var errs []error
+	for _, entry := range a.entries {
+		if !entry.admits(keyName) {
+			continue
+		}
+
+		// Age is checked against this entry's widest bound before the resolver is
+		// called, so a caller who has authenticated nothing cannot drive a lookup
+		// with an ancient or future timestamp. Verify checks it again against the
+		// effective bound, which a resolver may have narrowed, and that check is
+		// the authoritative one.
+		if err := checkAge(sig, entry.maxAge, entry.tolerance); err != nil {
+			errs = append(errs, fmt.Errorf("signature %q: %w", sig.Label(), err))
+			continue
+		}
+
+		relayed, err := collectRelayedHeaders(req, sig, entry.relayedHeaders)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("signature %q: %w", sig.Label(), err))
+			continue
+		}
+
+		key, err := entry.keys.get(ctx, ResolveRequest{
+			KeyID:          keyID,
+			Algorithm:      string(sig.Alg()),
+			Created:        sig.Created(),
+			RelayedHeaders: relayed,
+		})
+		switch {
+		case errors.Is(err, ErrKeyNotFound):
+			// This resolver does not serve this keyid. Try the next one.
+			continue
+		case err != nil:
+			// A resolver that failed takes down only its own keys. Another
+			// resolver may still serve this keyid.
+			errs = append(errs, fmt.Errorf("signature %q: %w", sig.Label(), err))
+			continue
+		}
+
+		resp, err := a.verify(ctx, req, sig, entry, key)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("signature %q: %w", sig.Label(), err))
+			continue
+		}
+		return resp, nil
+	}
+
+	if len(errs) == 0 {
 		return nil, fmt.Errorf("signature %q: unknown keyID", sig.Label())
 	}
+	return nil, errors.Join(errs...)
+}
 
-	verifier, err := k.verifierFor(sig)
+// verify runs everything that has to hold for a resolved key to authenticate a
+// request. The order is the security argument: the signature base is built from
+// headers alone, so verification comes before anything that reads a body or calls
+// out.
+func (a *Authenticator) verify(ctx context.Context, req *http.Request, sig *httpsig.Signature, entry *resolverEntry, key *verifierKey) (*authenticator.Response, error) {
+	verifier, err := key.verifierFor(sig)
 	if err != nil {
-		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
+		return nil, err
 	}
 
-	// Verify before anything that costs work: the signature base is built from
-	// headers alone, so an unauthenticated caller cannot make this server read
-	// a body.
-	if err := sig.Verify(verifier, a.policy); err != nil {
-		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
+	// The verifier carries the algorithm the resolver stated, and Verify rejects a
+	// signature whose own alg parameter disagrees with it. That is what closes
+	// algorithm confusion, and it is why the resolver's algorithm is authoritative
+	// and the signature's is advisory.
+	if err := sig.Verify(verifier, entry.policyFor(key)); err != nil {
+		return nil, err
 	}
 
 	if err := checkProtectedHeaders(req, sig); err != nil {
-		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
+		return nil, err
 	}
 	if err := checkBodyDigest(req, sig); err != nil {
-		return nil, fmt.Errorf("signature %q: %w", sig.Label(), err)
+		return nil, err
+	}
+
+	// Consumed last, so a request rejected for any other reason does not use up
+	// the nonce of a legitimate request it copied, and so that a caller who cannot
+	// produce a valid signature cannot reach the resolver's nonce store at all.
+	if err := a.consumeNonce(ctx, entry, sig, key); err != nil {
+		return nil, err
 	}
 
 	klog.V(4).InfoS("Authenticated request by HTTP message signature",
-		"keyID", sig.KeyID(), "username", k.info.Name, "components", len(sig.Components()))
-	return &authenticator.Response{User: k.info}, nil
+		"keyID", sig.KeyID(), "username", key.info.Name, "components", len(sig.Components()))
+	return &authenticator.Response{User: key.info}, nil
+}
+
+// checkAge rejects a signature outside the accepted time window. It duplicates
+// what the signing library's policy enforces, deliberately: this runs before a
+// key is resolved and the library's runs after, and the point of the first is to
+// keep an unauthenticated caller from driving a network call.
+func checkAge(sig *httpsig.Signature, maxAge, tolerance time.Duration) error {
+	created := sig.Created()
+	if created.IsZero() {
+		return errors.New("signature carries no created parameter, so its age cannot be bounded")
+	}
+	now := time.Now()
+	if created.After(now.Add(tolerance)) {
+		return fmt.Errorf("signature was created at %v, which is in the future", created)
+	}
+	if now.After(created.Add(maxAge + tolerance)) {
+		return fmt.Errorf("signature was created at %v, older than the %v maximum age", created, maxAge)
+	}
+	return nil
+}
+
+// collectRelayedHeaders gathers the values a resolver is configured to see.
+//
+// A named header present on the request but not covered by the signature rejects
+// the request without a lookup. Coverage is what stops an intermediary injecting
+// a value that selects a different key, and the covered set is readable from
+// Signature-Input without verifying anything, so this check is available before
+// there is a key to verify with.
+//
+// A named header with more than one value is rejected rather than joined.
+// Joining would invent a value nobody signed.
+func collectRelayedHeaders(req *http.Request, sig *httpsig.Signature, names []string) (map[string]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	covered := coveredComponents(sig)
+	out := make(map[string]string, len(names))
+	for _, name := range names {
+		values := req.Header.Values(name)
+		switch {
+		case len(values) == 0:
+			// Absent is allowed. A resolver that needs the value says so by
+			// failing to resolve without it.
+			continue
+		case len(values) > 1:
+			return nil, fmt.Errorf("request carries %d values for the relayed header %s; a single value is required because there is no correct way to combine them", len(values), name)
+		case !covered[name]:
+			return nil, fmt.Errorf("request carries the relayed header %s, which the signature does not cover, so an intermediary could have set it", name)
+		}
+		out[name] = values[0]
+	}
+	return out, nil
+}
+
+// consumeNonce records the signature's nonce with the resolver.
+//
+// A resolver that fails rejects the request. Configuration can say not to record
+// nonces at all, but it cannot say to accept a request whose nonce this server tried
+// and failed to record: anti-replay that switches off when a call fails is not
+// anti-replay, and an outage is not a policy decision.
+//
+// The nonce is required whether or not it is recorded. Requiring it costs a client
+// nothing, it is covered by the signature either way, and it means turning recording
+// on is a change to this server alone rather than to every client.
+func (a *Authenticator) consumeNonce(ctx context.Context, entry *resolverEntry, sig *httpsig.Signature, key *verifierKey) error {
+	nonce := sig.Nonce()
+	if nonce == "" {
+		return errors.New("signature carries no nonce")
+	}
+	if !entry.consumeNonces {
+		return nil
+	}
+	created := sig.Created()
+	maxAge := entry.maxAge
+	if key.maxAge > 0 && key.maxAge < maxAge {
+		maxAge = key.maxAge
+	}
+	return entry.keys.resolver.ConsumeNonce(ctx, NonceRequest{
+		KeyID:   sig.KeyID(),
+		Nonce:   nonce,
+		Created: created,
+		// The resolver may forget the nonce once no signature bearing it could be
+		// accepted, which is the same bound Verify applied.
+		ExpiresAt: created.Add(maxAge + entry.tolerance),
+	})
+}
+
+func coveredComponents(sig *httpsig.Signature) map[string]bool {
+	components := sig.Components()
+	covered := make(map[string]bool, len(components))
+	for _, c := range components {
+		covered[c.Name] = true
+	}
+	return covered
 }
 
 // checkProtectedHeaders rejects a request carrying a protected header the
 // signature does not cover. Without this, appending a header to a signed request
 // is unnoticed.
 func checkProtectedHeaders(req *http.Request, sig *httpsig.Signature) error {
-	covered := make(map[string]bool, len(sig.Components()))
-	for _, c := range sig.Components() {
-		covered[c.Name] = true
-	}
+	covered := coveredComponents(sig)
 	var uncovered []string
 	for name := range req.Header {
 		if !transporthttpsig.IsProtectedHeader(name) {
@@ -277,19 +549,13 @@ func checkProtectedHeaders(req *http.Request, sig *httpsig.Signature) error {
 // The body is read here and replaced, so the handler chain still sees it.
 func checkBodyDigest(req *http.Request, sig *httpsig.Signature) error {
 	digests := req.Header.Values("Content-Digest")
-	covered := false
-	for _, c := range sig.Components() {
-		if c.Name == "content-digest" {
-			covered = true
-			break
-		}
-	}
+	covered := coveredComponents(sig)["content-digest"]
 
 	if req.Body == nil || req.Body == http.NoBody {
 		// No body to bind. A Content-Digest on a bodiless request is checked
 		// below only if one was sent, so an empty request cannot smuggle one.
 		if len(digests) > 0 {
-			return checkDigestValues(req, digests, covered, nil)
+			return checkDigestValues(digests, covered, nil)
 		}
 		return nil
 	}
@@ -303,20 +569,17 @@ func checkBodyDigest(req *http.Request, sig *httpsig.Signature) error {
 	if len(body) == 0 && len(digests) == 0 {
 		return nil
 	}
-	return checkDigestValues(req, digests, covered, body)
+	return checkDigestValues(digests, covered, body)
 }
 
-func checkDigestValues(req *http.Request, digests []string, covered bool, body []byte) error {
+func checkDigestValues(digests []string, covered bool, body []byte) error {
 	if len(digests) == 0 {
 		return fmt.Errorf("request has a body but no Content-Digest, so the body is not bound to the signature")
 	}
 	if !covered {
 		return fmt.Errorf("request has a Content-Digest the signature does not cover, so the body is not bound to the signature")
 	}
-	if err := transporthttpsig.VerifyContentDigest(digests, body); err != nil {
-		return err
-	}
-	return nil
+	return transporthttpsig.VerifyContentDigest(digests, body)
 }
 
 func readBody(req *http.Request) ([]byte, error) {
@@ -329,132 +592,4 @@ func readBody(req *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("request body exceeds the %d byte limit for digest verification", maxBodyBytes)
 	}
 	return body, nil
-}
-
-// ValidateKey reports whether one configured key is usable. It is exported so
-// configuration validation can reject unusable key material, ladder documents,
-// and stages without repeating the rules, which live here and in the signing
-// library.
-func ValidateKey(k apiserver.HTTPSignatureKey, ladder *apiserver.HTTPSignatureKeyDerivation) error {
-	_, err := buildKey(k, ladder)
-	return err
-}
-
-// buildKey loads one configured key: parses its material, loads its ladder, and
-// validates its stage. Everything that can fail does so here, at server start,
-// rather than on a request.
-func buildKey(k apiserver.HTTPSignatureKey, ladder *apiserver.HTTPSignatureKeyDerivation) (*key, error) {
-	alg := httpsig.Algorithm(k.Algorithm)
-	if k.Algorithm == "" {
-		return nil, fmt.Errorf("algorithm is required")
-	}
-	if k.KeyID == "" {
-		return nil, fmt.Errorf("keyID is required")
-	}
-
-	if alg != httpsig.HMACSHA256 {
-		if k.SecretFile != "" {
-			return nil, fmt.Errorf("algorithm %s uses a public key, not secretFile", alg)
-		}
-		if ladder != nil && k.Stage != nil {
-			return nil, fmt.Errorf("stage names a position on a derivation ladder, which applies to hmac-sha256 only; an asymmetric key is not derived")
-		}
-		if k.Stage != nil {
-			return nil, fmt.Errorf("stage applies to hmac-sha256 only")
-		}
-		if k.PublicKey == "" {
-			return nil, fmt.Errorf("algorithm %s requires publicKey", alg)
-		}
-		pub, err := parsePublicKey(k.PublicKey)
-		if err != nil {
-			return nil, err
-		}
-		verifier, err := httpsig.NewVerifier(alg, pub)
-		if err != nil {
-			return nil, err
-		}
-		return &key{verifier: verifier}, nil
-	}
-
-	if k.PublicKey != "" {
-		return nil, fmt.Errorf("algorithm %s uses a shared secret, not publicKey", alg)
-	}
-	if k.SecretFile == "" {
-		return nil, fmt.Errorf("algorithm %s requires secretFile", alg)
-	}
-	if k.Stage != nil && ladder == nil {
-		return nil, fmt.Errorf("stage names a position on a ladder, so it requires httpSignature.keyDerivation")
-	}
-	raw, err := os.ReadFile(k.SecretFile)
-	if err != nil {
-		return nil, fmt.Errorf("reading secretFile: %w", err)
-	}
-	var material []byte
-	if k.Stage != nil && k.Stage.From != "" {
-		// An intermediate rung is raw hash output. The newline trim applied to
-		// a plain secret would corrupt a rung that ends in a newline byte, so a
-		// rung-holding secretFile holds base64. A root secret is a printable
-		// string even when a stage carries scope values, so it stays plain.
-		material, err = base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
-		if err != nil {
-			return nil, fmt.Errorf("secretFile must hold base64 when stage.from is set, because a derived rung is raw bytes: %w", err)
-		}
-	} else {
-		// A trailing newline is what an editor or `echo` leaves behind, and a
-		// secret that differs by one byte fails with no clue why.
-		material = bytes.TrimRight(raw, "\r\n")
-	}
-
-	if ladder == nil {
-		verifier, err := httpsig.NewVerifier(alg, material)
-		if err != nil {
-			return nil, err
-		}
-		return &key{verifier: verifier}, nil
-	}
-
-	derivation, digest, err := transporthttpsig.DerivationFrom(ladder)
-	if err != nil {
-		return nil, err
-	}
-	// The digest is the drift check: the client logs the same value for its
-	// copy, and a mismatch otherwise surfaces as a bare signature failure.
-	klog.V(2).InfoS("Loaded key derivation ladder", "keyID", k.KeyID, "sha256", digest)
-	var stage *transporthttpsig.Stage
-	if k.Stage != nil {
-		stage = &transporthttpsig.Stage{From: k.Stage.From, Scope: k.Stage.Scope}
-	}
-	// Binding the material to its position validates the stage, so a scope typo
-	// fails at server start rather than on a request.
-	scoped, err := keyscope.New(derivation, transporthttpsig.KeyscopeStage(k.KeyID, stage), material)
-	if err != nil {
-		return nil, err
-	}
-	return &key{scoped: scoped}, nil
-}
-
-// parsePublicKey reads a PEM-encoded public key. Both the SubjectPublicKeyInfo
-// and PKCS#1 encodings are accepted, which covers what openssl emits.
-func parsePublicKey(data string) (any, error) {
-	block, _ := pem.Decode([]byte(data))
-	if block == nil {
-		return nil, fmt.Errorf("publicKey holds no PEM block")
-	}
-	switch block.Type {
-	case "PUBLIC KEY":
-		pub, err := x509.ParsePKIXPublicKey(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("parsing publicKey: %w", err)
-		}
-		switch pub.(type) {
-		case *rsa.PublicKey, *ecdsa.PublicKey, ed25519.PublicKey:
-			return pub, nil
-		default:
-			return nil, fmt.Errorf("publicKey holds an unsupported key type %T", pub)
-		}
-	case "RSA PUBLIC KEY":
-		return x509.ParsePKCS1PublicKey(block.Bytes)
-	default:
-		return nil, fmt.Errorf("publicKey holds an unsupported PEM block %q", block.Type)
-	}
 }

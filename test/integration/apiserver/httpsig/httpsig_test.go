@@ -19,9 +19,11 @@ limitations under the License.
 //
 // These tests exercise the whole path that unit tests on either side cannot: a
 // client-go client configured from a kubeconfig, signing over a real connection,
-// against a kube-apiserver that verifies with its configured keys. The floor
-// components include the authority and the path, so a real connection is the
-// only way to know the two sides agree on what those are.
+// against a kube-apiserver that resolves keys from a resolver on a socket. The
+// floor components include the authority and the path, so a real connection is the
+// only way to know the two sides agree on what those are, and a real resolver on a
+// real socket is the only way to know the endpoint, the dialer, and the not-found
+// status all line up.
 package httpsig
 
 import (
@@ -48,17 +50,19 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	nettesting "k8s.io/apimachinery/pkg/util/net/testing"
+	"k8s.io/apimachinery/pkg/util/wait"
+	resolvertesting "k8s.io/apiserver/pkg/authentication/request/httpsig/testing"
 	clientfeatures "k8s.io/client-go/features"
 	clientfeaturestesting "k8s.io/client-go/features/testing"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-
 	transporthttpsig "k8s.io/client-go/transport/httpsig"
+	externalhttpsig "k8s.io/externalhttpsig/apis/v1alpha1"
 	kubeapiserverapptesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/framework"
-	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -73,8 +77,9 @@ func TestMain(m *testing.M) {
 	framework.EtcdMain(m.Run)
 }
 
-// keyPair writes a private key to disk and returns its path and public key PEM.
-func keyPair(t *testing.T, name string, algorithm string) (keyFile string, publicKeyPEM string) {
+// keyPair writes a private key to disk and returns its path and the public key in
+// the PKIX DER encoding a resolver answers with.
+func keyPair(t *testing.T, name string, algorithm string) (keyFile string, publicKeyDER []byte) {
 	t.Helper()
 	var priv, pub any
 	switch algorithm {
@@ -106,7 +111,7 @@ func keyPair(t *testing.T, name string, algorithm string) (keyFile string, publi
 	if err != nil {
 		t.Fatal(err)
 	}
-	return keyFile, string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}))
+	return keyFile, pubDER
 }
 
 func writeTempFile(t *testing.T, name, content string) string {
@@ -118,12 +123,42 @@ func writeTempFile(t *testing.T, name, content string) string {
 	return path
 }
 
-// indent puts a PEM block into a YAML block scalar. The keys are list items at
-// indent 2, so their fields sit at indent 4 and block scalar content has to be
-// deeper than that.
-func indent(s string) string {
-	const pad = "      "
-	return pad + strings.ReplaceAll(strings.TrimRight(s, "\n"), "\n", "\n"+pad)
+// newResolver starts a resolver on a socket unique to this test.
+func newResolver(t *testing.T, name string) *resolvertesting.Resolver {
+	t.Helper()
+	socket := nettesting.MakeSocketNameForTest(t, fmt.Sprintf("httpsig-int-%s-%d.sock", name, time.Now().UnixNano()))
+	return resolvertesting.New(t, socket)
+}
+
+// authConfigFor renders an authentication configuration whose httpSignature
+// section points at the given resolvers, in order.
+func authConfigFor(resolvers ...*resolvertesting.Resolver) string {
+	var b strings.Builder
+	b.WriteString("apiVersion: apiserver.config.k8s.io/v1alpha1\nkind: AuthenticationConfiguration\nhttpSignature:\n")
+	for _, r := range resolvers {
+		fmt.Fprintf(&b, "- endpoint: %s\n", r.Endpoint())
+	}
+	return b.String()
+}
+
+// asymmetricAnswer is the response a resolver gives for a public key.
+func asymmetricAnswer(algorithm string, publicKeyDER []byte, username string, groups ...string) *externalhttpsig.ResolveKeyResponse {
+	return &externalhttpsig.ResolveKeyResponse{
+		Algorithm:       algorithm,
+		Material:        &externalhttpsig.ResolveKeyResponse_PublicKey{PublicKey: publicKeyDER},
+		User:            &externalhttpsig.UserInfo{Username: username, Groups: groups},
+		CacheTtlSeconds: 300,
+	}
+}
+
+// secretAnswer is the response a resolver gives for a shared secret.
+func secretAnswer(secret string, username string, groups ...string) *externalhttpsig.ResolveKeyResponse {
+	return &externalhttpsig.ResolveKeyResponse{
+		Algorithm:       "hmac-sha256",
+		Material:        &externalhttpsig.ResolveKeyResponse_Secret{Secret: []byte(secret)},
+		User:            &externalhttpsig.UserInfo{Username: username, Groups: groups},
+		CacheTtlSeconds: 300,
+	}
 }
 
 // signingClientConfig derives a rest.Config that signs, from the server's own
@@ -157,13 +192,15 @@ func signingClientConfig(t *testing.T, server kubeapiserverapptesting.TestServer
 }
 
 // startServer brings up a kube-apiserver whose authentication configuration holds
-// the given httpSignature section.
-func startServer(t *testing.T, authConfig string, extraFlags ...string) kubeapiserverapptesting.TestServer {
+// the given httpSignature section. The path is returned so a test can rewrite it
+// and exercise reload.
+func startServer(t *testing.T, authConfig string, extraFlags ...string) (kubeapiserverapptesting.TestServer, string) {
 	t.Helper()
+	configPath := writeTempFile(t, "authn.yaml", authConfig)
 	flags := []string{
 		"--authorization-mode=RBAC",
 		"--feature-gates=HTTPSignatureAuthentication=true",
-		fmt.Sprintf("--authentication-config=%s", writeTempFile(t, "authn.yaml", authConfig)),
+		fmt.Sprintf("--authentication-config=%s", configPath),
 	}
 	flags = append(flags, extraFlags...)
 	server, err := kubeapiserverapptesting.StartTestServer(
@@ -176,7 +213,7 @@ func startServer(t *testing.T, authConfig string, extraFlags ...string) kubeapis
 		t.Fatalf("starting kube-apiserver: %v", err)
 	}
 	t.Cleanup(server.TearDownFn)
-	return server
+	return server, configPath
 }
 
 // grantPodReader gives the signing group permission to read pods, so a signed
@@ -204,25 +241,25 @@ func grantPodReader(t *testing.T, server kubeapiserverapptesting.TestServer) {
 	}
 }
 
+func selfReview(t *testing.T, client kubernetes.Interface) *authenticationv1.SelfSubjectReview {
+	t.Helper()
+	review, err := client.AuthenticationV1().SelfSubjectReviews().Create(
+		context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("a signed request was not authenticated: %v", err)
+	}
+	return review
+}
+
 // TestSignedRequestAuthenticates is the end-to-end claim: a kubeconfig with an
-// httpSignature stanza produces a client whose requests the API server accepts,
-// and the identity it reports is the one the key is configured for.
+// httpSignature stanza produces a client whose requests the API server accepts, and
+// the identity it reports is the one the resolver vended.
 func TestSignedRequestAuthenticates(t *testing.T) {
-	keyFile, publicKey := keyPair(t, "alice", "ed25519")
-	server := startServer(t, fmt.Sprintf(`
-apiVersion: apiserver.config.k8s.io/v1alpha1
-kind: AuthenticationConfiguration
-httpSignature:
-  keys:
-  - keyID: %s
-    algorithm: ed25519
-    publicKey: |
-%s
-    user:
-      username: %s
-      uid: alice-uid
-      groups: [%s]
-`, aliceKeyID, indent(publicKey), aliceUser, signerGrp))
+	keyFile, publicKeyDER := keyPair(t, "alice", "ed25519")
+	r := newResolver(t, "alice")
+	r.SetKey(aliceKeyID, asymmetricAnswer("ed25519", publicKeyDER, aliceUser, signerGrp))
+
+	server, _ := startServer(t, authConfigFor(r))
 	grantPodReader(t, server)
 
 	clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
@@ -230,71 +267,51 @@ httpSignature:
 		Algorithm:  "ed25519",
 		KeyID:      aliceKeyID,
 		KeyFile:    keyFile,
-		TTL:        "30s",
 	})
 	client := kubernetes.NewForConfigOrDie(clientConfig)
 	ctx := context.Background()
 
-	review, err := client.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("a signed request was not authenticated: %v", err)
-	}
+	review := selfReview(t, client)
 	if got := review.Status.UserInfo.Username; got != aliceUser {
 		t.Errorf("username: got %q, want %q", got, aliceUser)
 	}
-	if got := review.Status.UserInfo.UID; got != "alice-uid" {
-		t.Errorf("uid: got %q, want alice-uid", got)
-	}
-	var hasGroup bool
-	for _, g := range review.Status.UserInfo.Groups {
-		if g == signerGrp {
-			hasGroup = true
-		}
-	}
-	if !hasGroup {
-		t.Errorf("groups %v do not include %q", review.Status.UserInfo.Groups, signerGrp)
+	if got := review.Status.UserInfo.Groups; !containsString(got, signerGrp) {
+		t.Errorf("groups: got %v, want to contain %q", got, signerGrp)
 	}
 
-	// A read, which carries no body.
 	if _, err := client.CoreV1().Pods("default").List(ctx, metav1.ListOptions{}); err != nil {
-		t.Errorf("listing pods as a signing client: %v", err)
+		t.Errorf("listing pods with a signed request: %v", err)
+	}
+	// A write exercises the body digest over a real connection.
+	if _, err := client.CoreV1().ConfigMaps("default").Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "signed-write"},
+		Data:       map[string]string{"signed": "yes"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating a config map with a signed request: %v", err)
 	}
 
-	// A write, which does. This is the path where the digest is computed by the
-	// client, covered by the signature, and checked against the body by the
-	// server before the handler decodes it.
-	created, err := client.CoreV1().ConfigMaps("default").Create(ctx, &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: "signed-write"},
-		Data:       map[string]string{"written": "by a signed request"},
-	}, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("creating a config map with a signed request body: %v", err)
+	// One resolver call for many requests: the key is cached for the duration the
+	// resolver stated.
+	if calls, _, _ := r.Counts(); calls != 1 {
+		t.Errorf("ResolveKey calls for four requests: got %d, want 1", calls)
 	}
-	if created.Data["written"] != "by a signed request" {
-		t.Errorf("the server stored %q, so the body the digest covered is not the body it decoded", created.Data)
+	// A nonce call per request, because a nonce is per request by definition.
+	if _, nonceCalls, _ := r.Counts(); nonceCalls < 3 {
+		t.Errorf("ConsumeNonce calls: got %d, want one per authenticated request", nonceCalls)
 	}
 }
 
-// TestUnknownKeyIsRejected checks that a well-formed signature from a key the
-// server does not know gets 401 rather than anonymous access or a 500.
+// TestUnknownKeyIsRejected covers both ways a key can fail to resolve to something
+// that verifies: a key ID the resolver does not serve, and one it serves with
+// different material than the client signed with.
 func TestUnknownKeyIsRejected(t *testing.T) {
-	_, publicKey := keyPair(t, "alice", "ed25519")
-	// The client signs with a second key that the server never sees.
+	_, publicKeyDER := keyPair(t, "alice", "ed25519")
+	// The client signs with a second key that the resolver never vends.
 	otherKeyFile, _ := keyPair(t, "attacker", "ed25519")
 
-	server := startServer(t, fmt.Sprintf(`
-apiVersion: apiserver.config.k8s.io/v1alpha1
-kind: AuthenticationConfiguration
-httpSignature:
-  keys:
-  - keyID: %s
-    algorithm: ed25519
-    publicKey: |
-%s
-    user:
-      username: %s
-      groups: [%s]
-`, aliceKeyID, indent(publicKey), aliceUser, signerGrp))
+	r := newResolver(t, "unknown")
+	r.SetKey(aliceKeyID, asymmetricAnswer("ed25519", publicKeyDER, aliceUser, signerGrp))
+	server, _ := startServer(t, authConfigFor(r))
 
 	for _, tc := range []struct {
 		name  string
@@ -322,39 +339,155 @@ httpSignature:
 	}
 }
 
-// The feature gate is deliberately not tested here. A server given an
-// httpSignature section with the gate disabled fails to start, which is the
-// right behavior and is covered by a unit test in
-// k8s.io/apiserver/pkg/apis/apiserver/validation. It cannot be asserted at this
-// level: a kube-apiserver that fails to start leaks three workqueue goroutines
-// from its partially built server chain, and the integration framework's leak
-// detector waits ten minutes for them before reporting. That is a defect in the
-// failed-start cleanup path rather than in this feature, so it is recorded in
-// httpsig/DECISIONS.md instead of worked around here.
-
-// TestHMACWithSessionTokenHeader covers the AWS shaped deployment: the key
-// identifier and the shared secret come from the environment, and a session token
-// travels as a signed header rather than sitting in the kubeconfig.
-func TestHMACWithSessionTokenHeader(t *testing.T) {
-	secret := "an-hmac-secret-that-would-be-derived"
-	secretFile := writeTempFile(t, "hmac.secret", secret)
-
-	server := startServer(t, fmt.Sprintf(`
-apiVersion: apiserver.config.k8s.io/v1alpha1
-kind: AuthenticationConfiguration
-httpSignature:
-  keys:
-  - keyID: %s
-    algorithm: hmac-sha256
-    secretFile: %s
-    user:
-      username: %s
-      groups: [%s]
-`, bobKeyID, secretFile, bobUser, signerGrp))
+// TestReplayedRequestIsRejected replays a captured request over the wire. This is
+// the property the whole design is for, and moving nonce records to the resolver is
+// what makes it hold across more than one API server, which this asserts for one.
+func TestReplayedRequestIsRejected(t *testing.T) {
+	keyFile, publicKeyDER := keyPair(t, "alice", "ecdsa-p256-sha256")
+	r := newResolver(t, "replay")
+	r.SetKey(aliceKeyID, asymmetricAnswer("ecdsa-p256-sha256", publicKeyDER, aliceUser, signerGrp))
+	server, _ := startServer(t, authConfigFor(r))
 	grantPodReader(t, server)
 
-	// The credential document is what a helper wrapping a cloud provider SDK
-	// writes and rewrites on rotation. Nothing rotating sits in the kubeconfig.
+	clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
+		APIVersion: "client.authentication.k8s.io/v1alpha1",
+		Algorithm:  "ecdsa-p256-sha256",
+		KeyID:      aliceKeyID,
+		KeyFile:    keyFile,
+	})
+	if err := assertReplayRejected(t, clientConfig); err != nil {
+		t.Error(err)
+	}
+}
+
+// assertReplayRejected sends one signed request, captures the bytes that went out, and
+// sends them again through a transport that does not sign.
+//
+// Capturing rather than re-signing is the whole point: a re-signed request would carry
+// a fresh nonce and prove nothing. This is the same bytes, signature included, which is
+// the only thing that tests the nonce record.
+func assertReplayRejected(t *testing.T, clientConfig *rest.Config) error {
+	t.Helper()
+	var captured *http.Request
+	capturing := *clientConfig
+	capturing.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+		return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			captured = req.Clone(req.Context())
+			return rt.RoundTrip(req)
+		})
+	})
+	client, err := kubernetes.NewForConfig(&capturing)
+	if err != nil {
+		return err
+	}
+	if _, err := client.AuthenticationV1().SelfSubjectReviews().Create(
+		context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("the first request should be authenticated: %w", err)
+	}
+	if captured == nil {
+		return fmt.Errorf("no request was captured")
+	}
+
+	plain := rest.CopyConfig(clientConfig)
+	plain.HTTPSignature = nil
+	transport, err := rest.TransportFor(plain)
+	if err != nil {
+		return err
+	}
+	captured.Body = http.NoBody
+	resp, err := transport.RoundTrip(captured)
+	if err != nil {
+		return fmt.Errorf("replaying the captured request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnauthorized {
+		return fmt.Errorf("replaying a captured request: got %d, want 401; the resolver had already recorded its nonce", resp.StatusCode)
+	}
+	return nil
+}
+
+// pemPublicKey renders a PKIX DER public key as PEM, the form a person writes into a
+// resolver key file.
+func pemPublicKey(der []byte) string {
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+}
+
+// TestResolverRoutingByKeyIDPrefix covers a deployment with two identity systems:
+// each resolver is asked only about the key IDs its prefixes admit, so the other is
+// never called, and the identity each vends is the one that arrives.
+func TestResolverRoutingByKeyIDPrefix(t *testing.T) {
+	aliceKeyFile, alicePub := keyPair(t, "alice", "ed25519")
+	bobKeyFile, bobPub := keyPair(t, "bob", "ed25519")
+
+	aliceResolver := newResolver(t, "alice-only")
+	aliceResolver.SetKey(aliceKeyID, asymmetricAnswer("ed25519", alicePub, aliceUser, signerGrp))
+	bobResolver := newResolver(t, "bob-only")
+	bobResolver.SetKey(bobKeyID, asymmetricAnswer("ed25519", bobPub, bobUser, signerGrp))
+
+	authConfig := fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1alpha1
+kind: AuthenticationConfiguration
+httpSignature:
+- endpoint: %s
+  keyIDPrefixes: [%s]
+- endpoint: %s
+  keyIDPrefixes: [%s]
+`, aliceResolver.Endpoint(), aliceKeyID, bobResolver.Endpoint(), bobKeyID)
+
+	server, _ := startServer(t, authConfig)
+
+	for _, tc := range []struct {
+		name     string
+		keyID    string
+		keyFile  string
+		wantUser string
+		asked    *resolvertesting.Resolver
+		notAsked *resolvertesting.Resolver
+	}{
+		{name: "alice", keyID: aliceKeyID, keyFile: aliceKeyFile, wantUser: aliceUser, asked: aliceResolver, notAsked: bobResolver},
+		{name: "bob", keyID: bobKeyID, keyFile: bobKeyFile, wantUser: bobUser, asked: bobResolver, notAsked: aliceResolver},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, _, _ := tc.notAsked.Counts()
+			clientConfig := signingClientConfig(t, server, tc.wantUser, &clientcmdapi.HTTPSignatureConfig{
+				APIVersion: "client.authentication.k8s.io/v1alpha1",
+				Algorithm:  "ed25519",
+				KeyID:      tc.keyID,
+				KeyFile:    tc.keyFile,
+			})
+			review := selfReview(t, kubernetes.NewForConfigOrDie(clientConfig))
+			if got := review.Status.UserInfo.Username; got != tc.wantUser {
+				t.Errorf("username: got %q, want %q", got, tc.wantUser)
+			}
+			if after, _, _ := tc.notAsked.Counts(); after != before {
+				t.Errorf("a resolver whose prefixes exclude this keyID was asked (%d calls became %d)", before, after)
+			}
+		})
+	}
+}
+
+// TestRelayedSessionTokenHeader covers the deployment where the identity is not in
+// the key ID: the client covers a session token header, kube-apiserver relays its
+// value to the resolver, and the resolver decides who the request is from.
+//
+// The value is a secret and never appears in the kubeconfig. It reaches the
+// resolver over the socket and nothing else about the request goes with it.
+func TestRelayedSessionTokenHeader(t *testing.T) {
+	secret := "an-hmac-secret-that-would-be-derived"
+	r := newResolver(t, "relay")
+	server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1alpha1
+kind: AuthenticationConfiguration
+httpSignature:
+- endpoint: %s
+  relayedHeaders: [X-Session-Token]
+`, r.Endpoint()))
+	grantPodReader(t, server)
+
+	// A resolver that vends an identity chosen by the relayed token rather than by
+	// the key ID. The key ID names the key; the token names the session.
+	r.SetKey(bobKeyID, secretAnswer(secret, bobUser, signerGrp))
+
+	// The credential document is what a helper wrapping a cloud provider SDK writes
+	// and rewrites on rotation. Nothing rotating sits in the kubeconfig.
 	credFile := writeTempFile(t, "credential.yaml", fmt.Sprintf(
 		`{"apiVersion":%q,"kind":%q,"keyID":%q,"secret":%q,"signedHeaders":{"X-Session-Token":"a-session-token-value"}}`,
 		transporthttpsig.SigningCredentialAPIVersion, transporthttpsig.SigningCredentialKind, bobKeyID, secret))
@@ -365,38 +498,34 @@ httpSignature:
 		CredentialFile: credFile,
 		SignedHeaders:  []clientcmdapi.HTTPSignatureHeader{{Name: "X-Session-Token"}},
 	})
-	client := kubernetes.NewForConfigOrDie(clientConfig)
-
-	review, err := client.AuthenticationV1().SelfSubjectReviews().Create(context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("an hmac signed request was not authenticated: %v", err)
-	}
+	review := selfReview(t, kubernetes.NewForConfigOrDie(clientConfig))
 	if got := review.Status.UserInfo.Username; got != bobUser {
 		t.Errorf("username: got %q, want %q", got, bobUser)
+	}
+
+	resolve, _ := r.LastRequests()
+	if resolve == nil {
+		t.Fatal("the resolver was never asked")
+	}
+	if got := resolve.GetRelayedHeaders()["x-session-token"]; got != "a-session-token-value" {
+		t.Errorf("relayed session token: got %q, want %q", got, "a-session-token-value")
+	}
+	if len(resolve.GetRelayedHeaders()) != 1 {
+		t.Errorf("only the configured header should be relayed, got %v", resolve.GetRelayedHeaders())
 	}
 }
 
 // TestSignedImpersonation checks impersonation still works, and that the
 // impersonation headers travel inside the signature rather than beside it.
 func TestSignedImpersonation(t *testing.T) {
-	keyFile, publicKey := keyPair(t, "alice", "ed25519")
-	server := startServer(t, fmt.Sprintf(`
-apiVersion: apiserver.config.k8s.io/v1alpha1
-kind: AuthenticationConfiguration
-httpSignature:
-  keys:
-  - keyID: %s
-    algorithm: ed25519
-    publicKey: |
-%s
-    user:
-      username: %s
-      groups: [%s]
-`, aliceKeyID, indent(publicKey), aliceUser, signerGrp))
+	keyFile, publicKeyDER := keyPair(t, "alice", "ed25519")
+	r := newResolver(t, "impersonate")
+	r.SetKey(aliceKeyID, asymmetricAnswer("ed25519", publicKeyDER, aliceUser, signerGrp))
+	server, _ := startServer(t, authConfigFor(r))
+	grantPodReader(t, server)
 
 	admin := kubernetes.NewForConfigOrDie(server.ClientConfig)
-	ctx := context.Background()
-	if _, err := admin.RbacV1().ClusterRoles().Create(ctx, &rbacv1.ClusterRole{
+	if _, err := admin.RbacV1().ClusterRoles().Create(context.Background(), &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{Name: "httpsig-impersonator"},
 		Rules: []rbacv1.PolicyRule{{
 			Verbs:     []string{"impersonate"},
@@ -406,9 +535,9 @@ httpSignature:
 	}, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		t.Fatal(err)
 	}
-	if _, err := admin.RbacV1().ClusterRoleBindings().Create(ctx, &rbacv1.ClusterRoleBinding{
+	if _, err := admin.RbacV1().ClusterRoleBindings().Create(context.Background(), &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: "httpsig-impersonator"},
-		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.GroupKind, Name: signerGrp}},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: aliceUser}},
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "httpsig-impersonator"},
 	}, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
 		t.Fatal(err)
@@ -420,36 +549,21 @@ httpSignature:
 		KeyID:      aliceKeyID,
 		KeyFile:    keyFile,
 	})
-	clientConfig.Impersonate = rest.ImpersonationConfig{UserName: "carol"}
-	client := kubernetes.NewForConfigOrDie(clientConfig)
-
-	review, err := client.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("a signed impersonating request was rejected: %v", err)
-	}
-	if got := review.Status.UserInfo.Username; got != "carol" {
-		t.Errorf("impersonated username: got %q, want carol", got)
+	clientConfig.Impersonate = rest.ImpersonationConfig{UserName: "someone-else"}
+	review := selfReview(t, kubernetes.NewForConfigOrDie(clientConfig))
+	if got := review.Status.UserInfo.Username; got != "someone-else" {
+		t.Errorf("impersonated username: got %q, want %q", got, "someone-else")
 	}
 }
 
-// TestInjectedImpersonationIsRejected is the attack the covered header rule
-// exists for, observed at the API server. The signature is alice's own and
-// verifies. A party on the path adds an impersonation header she never signed.
+// TestInjectedImpersonationIsRejected is the coverage rule against addition: a
+// signature cannot stop a header being appended, so presence is checked against the
+// covered set.
 func TestInjectedImpersonationIsRejected(t *testing.T) {
-	keyFile, publicKey := keyPair(t, "alice", "ed25519")
-	server := startServer(t, fmt.Sprintf(`
-apiVersion: apiserver.config.k8s.io/v1alpha1
-kind: AuthenticationConfiguration
-httpSignature:
-  keys:
-  - keyID: %s
-    algorithm: ed25519
-    publicKey: |
-%s
-    user:
-      username: %s
-      groups: [%s]
-`, aliceKeyID, indent(publicKey), aliceUser, signerGrp))
+	keyFile, publicKeyDER := keyPair(t, "alice", "ed25519")
+	r := newResolver(t, "injected")
+	r.SetKey(aliceKeyID, asymmetricAnswer("ed25519", publicKeyDER, aliceUser, signerGrp))
+	server, _ := startServer(t, authConfigFor(r))
 	grantPodReader(t, server)
 
 	clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
@@ -485,39 +599,51 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
-// TestDerivedHMACWithBrokeredRung covers the key derivation deployment end to
-// end: a broker holding the root secret hands the client a rung scoped to
-// today and one cluster; the server holds the root and re-derives from the
-// created timestamp and claimed scope each signature carries. Nothing rotating
-// or secret sits in the kubeconfig, and the client never sees the root.
+// TestDerivedHMACWithBrokeredRung covers key derivation end to end, with the ladder
+// now coming from the resolver rather than from the server's configuration file.
+//
+// The broker holding the root secret hands the client a rung scoped to today and one
+// cluster, and hands the resolver a rung too. The resolver states the ladder in its
+// metadata, and kube-apiserver folds the remaining steps per request from the created
+// timestamp and claimed scope each signature carries. Nothing rotating or secret sits
+// in the kubeconfig, and neither the client nor the API server ever sees the root.
 func TestDerivedHMACWithBrokeredRung(t *testing.T) {
-	// One statement of the ladder, from which the server's configuration is
-	// rendered. Both sides deriving from one source is the property under test:
-	// they have to agree, and a test that wrote the ladder twice could not tell
-	// agreement from luck.
-	apiLadder := &clientcmdapi.HTTPSignatureKeyDerivation{
+	// One statement of the ladder, converted for each party that states it. Both
+	// sides deriving from one source is the property under test: they have to agree,
+	// and a test that wrote the ladder twice could not tell agreement from luck.
+	protoLadder := &externalhttpsig.KeyDerivation{
 		Kind:         "hmac-ladder",
 		Hash:         "sha-256",
 		SecretPrefix: "K8S1",
-		Steps: []clientcmdapi.HTTPSignatureKeyDerivationStep{
+		Steps: []*externalhttpsig.KeyDerivationStep{
 			{Name: "date", Date: "YYYYMMDD"},
 			{Name: "cluster", Scope: true},
 			{Name: "terminator", Literal: "k8s1_request"},
 		},
 	}
-	rootSecret := "a-root-secret-held-by-the-broker-and-the-server"
-	rootFile := writeTempFile(t, "root.secret", rootSecret)
+	clientLadder := &clientcmdapi.HTTPSignatureKeyDerivation{
+		Kind:         protoLadder.GetKind(),
+		Hash:         protoLadder.GetHash(),
+		SecretPrefix: protoLadder.GetSecretPrefix(),
+	}
+	for _, step := range protoLadder.GetSteps() {
+		clientLadder.Steps = append(clientLadder.Steps, clientcmdapi.HTTPSignatureKeyDerivationStep{
+			Name: step.GetName(), Literal: step.GetLiteral(), Scope: step.GetScope(), Date: step.GetDate(),
+		})
+	}
 
-	// The broker's half: fold the ladder down to the cluster step and hand the
-	// rung out, using the hand-off operation against the same ladder every other
-	// party derives through.
-	ladder, ladderDigest, err := transporthttpsig.DerivationFrom(apiLadder)
+	ladder, ladderDigest, err := transporthttpsig.DerivationFrom(clientLadder)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("ladder digest: %s", ladderDigest)
+
+	// The broker's half: fold the ladder down to the cluster step and hand the rung
+	// out, using the hand-off operation against the same ladder every other party
+	// derives through.
+	rootSecret := "a-root-secret-held-only-by-the-broker"
 	now := time.Now()
-	brokerFor := func(cluster string) ([]byte, *transporthttpsig.Stage) {
+	brokerFor := func(cluster string) ([]byte, keyscope.Stage) {
 		root, err := keyscope.New(ladder, keyscope.Stage{
 			Name:  bobKeyID,
 			Scope: map[string]string{"cluster": cluster},
@@ -529,31 +655,30 @@ func TestDerivedHMACWithBrokeredRung(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return material, &transporthttpsig.Stage{From: stage.From, Scope: stage.Scope}
+		return material, stage
 	}
 
-	server := startServer(t, fmt.Sprintf(`
-apiVersion: apiserver.config.k8s.io/v1alpha1
-kind: AuthenticationConfiguration
-httpSignature:
-  # The ladder describes the deployment, so it is stated once rather than on
-  # every key. Each key says where its own material sits, in its stage.
-  keyDerivation:
-%s
-  keys:
-  - keyID: %s
-    algorithm: hmac-sha256
-    secretFile: %s
-    stage:
-      scope: {cluster: cluster-a}
-    user:
-      username: %s
-      groups: [%s]
-`, indentYAML(t, apiLadder, "    "), bobKeyID, rootFile, bobUser, signerGrp))
+	serverRung, serverStage := brokerFor("cluster-a")
+	r := newResolver(t, "derived")
+	r.SetMetadata(&externalhttpsig.MetadataResponse{KeyDerivation: protoLadder})
+	r.SetKey(bobKeyID, &externalhttpsig.ResolveKeyResponse{
+		Algorithm: "hmac-sha256",
+		Material: &externalhttpsig.ResolveKeyResponse_DerivedKey{
+			DerivedKey: &externalhttpsig.DerivedKey{
+				Key:   serverRung,
+				From:  serverStage.From,
+				Scope: serverStage.Scope,
+			},
+		},
+		User:            &externalhttpsig.UserInfo{Username: bobUser, Groups: []string{signerGrp}},
+		CacheTtlSeconds: 300,
+	})
+
+	server, _ := startServer(t, authConfigFor(r))
 	grantPodReader(t, server)
 
-	credentialFor := func(name string, material []byte, stage *transporthttpsig.Stage) string {
-		stageJSON, err := json.Marshal(stage)
+	credentialFor := func(name string, material []byte, stage keyscope.Stage) string {
+		stageJSON, err := json.Marshal(&transporthttpsig.Stage{From: stage.From, Scope: stage.Scope})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -563,19 +688,16 @@ httpSignature:
 			bobKeyID, base64.StdEncoding.EncodeToString(material), stageJSON))
 	}
 
-	rung, rungStage := brokerFor("cluster-a")
+	clientRung, clientStage := brokerFor("cluster-a")
 	clientConfig := signingClientConfig(t, server, bobUser, &clientcmdapi.HTTPSignatureConfig{
 		APIVersion:     "client.authentication.k8s.io/v1alpha1",
 		Algorithm:      "hmac-sha256",
-		CredentialFile: credentialFor("credential.yaml", rung, rungStage),
-		KeyDerivation:  apiLadder,
+		CredentialFile: credentialFor("credential.yaml", clientRung, clientStage),
+		KeyDerivation:  clientLadder,
 	})
 	client := kubernetes.NewForConfigOrDie(clientConfig)
 
-	review, err := client.AuthenticationV1().SelfSubjectReviews().Create(context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("a rung-signed request was not authenticated: %v", err)
-	}
+	review := selfReview(t, client)
 	if got := review.Status.UserInfo.Username; got != bobUser {
 		t.Errorf("username: got %q, want %q", got, bobUser)
 	}
@@ -588,18 +710,17 @@ httpSignature:
 		t.Fatalf("creating a config map with a rung-signed request: %v", err)
 	}
 
-	// The domain separation half: the same broker's rung for a different
-	// cluster must not authenticate here, even though every party derives from
-	// the same root.
+	// The domain separation half: the same broker's rung for a different cluster must
+	// not authenticate here, even though every party derives from the same root.
 	otherRung, otherStage := brokerFor("cluster-b")
 	otherConfig := signingClientConfig(t, server, bobUser, &clientcmdapi.HTTPSignatureConfig{
 		APIVersion:     "client.authentication.k8s.io/v1alpha1",
 		Algorithm:      "hmac-sha256",
 		CredentialFile: credentialFor("other-credential.yaml", otherRung, otherStage),
-		KeyDerivation:  apiLadder,
+		KeyDerivation:  clientLadder,
 	})
-	otherClient := kubernetes.NewForConfigOrDie(otherConfig)
-	_, err = otherClient.AuthenticationV1().SelfSubjectReviews().Create(context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	_, err = kubernetes.NewForConfigOrDie(otherConfig).AuthenticationV1().SelfSubjectReviews().Create(
+		context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
 	if err == nil {
 		t.Fatal("a rung scoped to another cluster authenticated against this one")
 	}
@@ -608,29 +729,108 @@ httpSignature:
 	}
 }
 
-// TestExecCredentialEndToEnd covers the delivery mode D3 leads with, against a
-// real API server: a command produces the credential, so nothing rotating and
-// nothing secret appears in the kubeconfig, and a long-lived client refreshes by
-// running the command again rather than by restarting.
+// TestResolverUnavailableRejects covers fail-closed at the level where it matters. A
+// resolver that is not there cannot vend a key and cannot record a nonce, so requests
+// bearing its keys are refused rather than admitted.
 //
-// The command is a shell script written by the test. A real one would wrap a
-// credential broker or a provider SDK.
+// It also covers the other half: a key already cached keeps working, because a brief
+// resolver outage should not log out a client whose key is still valid.
+func TestResolverUnavailableRejects(t *testing.T) {
+	keyFile, publicKeyDER := keyPair(t, "alice", "ed25519")
+	r := newResolver(t, "outage")
+	r.SetKey(aliceKeyID, asymmetricAnswer("ed25519", publicKeyDER, aliceUser, signerGrp))
+	server, _ := startServer(t, authConfigFor(r))
+
+	clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
+		APIVersion: "client.authentication.k8s.io/v1alpha1",
+		Algorithm:  "ed25519",
+		KeyID:      aliceKeyID,
+		KeyFile:    keyFile,
+	})
+	client := kubernetes.NewForConfigOrDie(clientConfig)
+	selfReview(t, client)
+
+	// The resolver goes away. The key is cached, but the nonce cannot be recorded,
+	// so a request cannot be shown not to be a replay and is refused.
+	r.Stop()
+	_, err := client.AuthenticationV1().SelfSubjectReviews().Create(
+		context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	if err == nil {
+		t.Fatal("a request whose nonce could not be recorded was accepted")
+	}
+	if !apierrors.IsUnauthorized(err) {
+		t.Errorf("want 401 Unauthorized, got %v", err)
+	}
+}
+
+// TestConfigReloadAddsResolver covers the reload path: a resolver added by editing
+// the authentication configuration file takes effect without restarting.
+//
+// This is the case a static key list could never serve, and it is why the signature
+// authenticator is in the chain even when no resolver is configured: an authenticator
+// absent from the chain cannot be swapped into it.
+func TestConfigReloadAddsResolver(t *testing.T) {
+	keyFile, publicKeyDER := keyPair(t, "alice", "ed25519")
+	added := newResolver(t, "added")
+	added.SetKey(aliceKeyID, asymmetricAnswer("ed25519", publicKeyDER, aliceUser, signerGrp))
+
+	// Start with no resolvers at all.
+	server, configPath := startServer(t, `apiVersion: apiserver.config.k8s.io/v1alpha1
+kind: AuthenticationConfiguration
+jwt: []
+`)
+
+	clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
+		APIVersion: "client.authentication.k8s.io/v1alpha1",
+		Algorithm:  "ed25519",
+		KeyID:      aliceKeyID,
+		KeyFile:    keyFile,
+	})
+	client := kubernetes.NewForConfigOrDie(clientConfig)
+	ctx := context.Background()
+
+	if _, err := client.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{}); err == nil {
+		t.Fatal("a signed request was accepted before any resolver was configured")
+	}
+
+	// Rewritten by rename, which is how a ConfigMap update arrives.
+	updated := authConfigFor(added)
+	staged := configPath + ".new"
+	if err := os.WriteFile(staged, []byte(updated), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(staged, configPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// The watcher polls at a one-minute interval as a backstop, and fires on the
+	// filesystem event well before that. Reload also health-gates the new generation
+	// before swapping it in, so this waits rather than asserting immediately.
+	if err := wait.PollUntilContextTimeout(ctx, 2*time.Second, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
+		_, err := client.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+		return err == nil, nil
+	}); err != nil {
+		t.Fatalf("a resolver added to the configuration file never took effect: %v", err)
+	}
+}
+
 // TestExecPluginSignsRequests covers the delivery mode the design leads with: a
 // credential plugin, named where every other credential plugin is named, that
 // returns signing key material instead of a token.
 //
-// Two things are asserted that no unit test can. The plugin really is told what
-// the signature has to satisfy, through the same environment variable every exec
-// plugin reads. And the credential is cached for its stated lifetime, because a
-// plugin invoked per request is the failure this mode exists to avoid.
+// Two things are asserted that no unit test can. The plugin really is told what the
+// signature has to satisfy, through the same environment variable every exec plugin
+// reads. And the credential is cached for its stated lifetime, because a plugin
+// invoked per request is the failure this mode exists to avoid.
 func TestExecPluginSignsRequests(t *testing.T) {
 	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.ClientsAllowHTTPSignature, true)
 
-	secret := "a-secret-only-the-plugin-and-the-server-know"
-	secretFile := writeTempFile(t, "hmac.secret", secret)
+	secret := "a-secret-only-the-plugin-and-the-resolver-know"
+	r := newResolver(t, "exec")
+	r.SetKey(bobKeyID, secretAnswer(secret, bobUser, signerGrp))
 
-	// The plugin records what it was told and how often it ran, then answers with
-	// key material rather than a token.
+	// The plugin records what it was told and how often it ran, then answers with key
+	// material rather than a token.
 	runLog := filepath.Join(t.TempDir(), "runs")
 	specLog := filepath.Join(t.TempDir(), "spec")
 	script := writeTempFile(t, "signing-plugin.sh", fmt.Sprintf(`#!/bin/sh
@@ -651,18 +851,12 @@ JSON
 		t.Fatal(err)
 	}
 
-	server := startServer(t, fmt.Sprintf(`
-apiVersion: apiserver.config.k8s.io/v1alpha1
+	server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1alpha1
 kind: AuthenticationConfiguration
 httpSignature:
-  keys:
-  - keyID: %s
-    algorithm: hmac-sha256
-    secretFile: %s
-    user:
-      username: %s
-      groups: [%s]
-`, bobKeyID, secretFile, bobUser, signerGrp))
+- endpoint: %s
+  relayedHeaders: [X-Session-Token]
+`, r.Endpoint()))
 	grantPodReader(t, server)
 
 	clientConfig := signingClientConfig(t, server, bobUser, &clientcmdapi.HTTPSignatureConfig{
@@ -677,10 +871,7 @@ httpSignature:
 	client := kubernetes.NewForConfigOrDie(clientConfig)
 	ctx := context.Background()
 
-	review, err := client.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("a request signed with material from an exec plugin was not authenticated: %v", err)
-	}
+	review := selfReview(t, client)
 	if got := review.Status.UserInfo.Username; got != bobUser {
 		t.Errorf("username: got %q, want %q", got, bobUser)
 	}
@@ -695,9 +886,16 @@ httpSignature:
 		t.Fatalf("creating a config map: %v", err)
 	}
 
-	// What the plugin was told. Without the header name it would have to guess,
-	// and a credential missing a value for a covered header is refused before a
-	// request is sent.
+	// The plugin's session token reached the resolver, which is the whole point of
+	// relaying it: the plugin mints it and nothing in the kubeconfig knows it.
+	resolve, _ := r.LastRequests()
+	if got := resolve.GetRelayedHeaders()["x-session-token"]; got != "minted-by-the-plugin" {
+		t.Errorf("relayed token: got %q, want %q", got, "minted-by-the-plugin")
+	}
+
+	// What the plugin was told. Without the header name it would have to guess, and a
+	// credential missing a value for a covered header is refused before a request is
+	// sent.
 	spec, err := os.ReadFile(specLog)
 	if err != nil {
 		t.Fatal(err)
@@ -737,18 +935,119 @@ httpSignature:
 	}
 }
 
-// indentYAML renders a value as YAML indented for embedding in a larger
-// document, so a configuration file and the client can be built from one
-// statement of the same thing.
-func indentYAML(t *testing.T, v any, indent string) string {
-	t.Helper()
-	data, err := yaml.Marshal(v)
+func containsString(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestNonceHandlingIgnoreAcceptsReplay is the configured escape hatch, over the wire.
+//
+// It asserts an uncomfortable thing on purpose. With nonceHandling: Ignore a captured
+// request really is accepted again, which is what "replay protection off" means, and a
+// test that only checked the resolver was not called would not have shown it.
+func TestNonceHandlingIgnoreAcceptsReplay(t *testing.T) {
+	keyFile, publicKeyDER := keyPair(t, "alice", "ed25519")
+	r := newResolver(t, "ignore-nonces")
+	r.SetKey(aliceKeyID, asymmetricAnswer("ed25519", publicKeyDER, aliceUser, signerGrp))
+	// The resolver would refuse a replay if it were asked. It is not asked.
+	r.SetErrors(nil, nil, nil)
+
+	// v1 rather than v1alpha1, deliberately. This is the version an operator writes,
+	// the conversion to the internal type is generated, and a field declared in one
+	// version and missing from another would show up nowhere else. Decoding is strict,
+	// so a field the server does not know is a hard error rather than a silent default.
+	server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+httpSignature:
+- endpoint: %s
+  nonceHandling: Ignore
+`, r.Endpoint()))
+	grantPodReader(t, server)
+
+	clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
+		APIVersion: "client.authentication.k8s.io/v1alpha1",
+		Algorithm:  "ed25519",
+		KeyID:      aliceKeyID,
+		KeyFile:    keyFile,
+	})
+
+	// Capture a signed request, then send the same bytes twice.
+	var captured *http.Request
+	capturing := *clientConfig
+	capturing.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+		return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			captured = req.Clone(req.Context())
+			return rt.RoundTrip(req)
+		})
+	})
+	client, err := kubernetes.NewForConfig(&capturing)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	for i, line := range lines {
-		lines[i] = indent + line
+	if _, err := client.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{}); err != nil {
+		t.Fatalf("the first request should be authenticated: %v", err)
 	}
-	return strings.Join(lines, "\n")
+
+	plain := rest.CopyConfig(clientConfig)
+	plain.HTTPSignature = nil
+	transport, err := rest.TransportFor(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	captured.Body = http.NoBody
+	resp, err := transport.RoundTrip(captured)
+	if err != nil {
+		t.Fatalf("replaying the captured request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Error("the replay was rejected, so nonceHandling: Ignore did not take effect")
+	}
+
+	// The resolver was never asked about a nonce. That is the difference between this
+	// and a resolver that always answers yes: no round trip, and the configuration
+	// says what is happening.
+	if _, nonceCalls, _ := r.Counts(); nonceCalls != 0 {
+		t.Errorf("ConsumeNonce was called %d times; with Ignore the call is skipped entirely", nonceCalls)
+	}
+}
+
+// TestNonceHandlingIsValidatedAcrossVersions asserts the field is declared in every
+// served version and spelled the same way in each.
+//
+// Decoding is strict, so a version missing the field rejects a configuration that uses
+// it, and a version that misspells it rejects one that does not. Either is a failure an
+// operator meets as a server that will not start, which is the right failure but a poor
+// place to discover a typo in a generated conversion.
+func TestNonceHandlingIsValidatedAcrossVersions(t *testing.T) {
+	for _, version := range []string{"v1", "v1beta1", "v1alpha1"} {
+		t.Run(version, func(t *testing.T) {
+			keyFile, publicKeyDER := keyPair(t, "alice", "ed25519")
+			r := newResolver(t, "versions-"+version)
+			r.SetKey(aliceKeyID, asymmetricAnswer("ed25519", publicKeyDER, aliceUser, signerGrp))
+
+			server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/%s
+kind: AuthenticationConfiguration
+httpSignature:
+- endpoint: %s
+  nonceHandling: Consume
+`, version, r.Endpoint()))
+
+			clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
+				APIVersion: "client.authentication.k8s.io/v1alpha1",
+				Algorithm:  "ed25519",
+				KeyID:      aliceKeyID,
+				KeyFile:    keyFile,
+			})
+			selfReview(t, kubernetes.NewForConfigOrDie(clientConfig))
+			// Consume was asked for, so the resolver is asked.
+			if _, nonceCalls, _ := r.Counts(); nonceCalls != 1 {
+				t.Errorf("ConsumeNonce calls: got %d, want 1", nonceCalls)
+			}
+		})
+	}
 }

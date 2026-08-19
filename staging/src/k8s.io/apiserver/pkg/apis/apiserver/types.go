@@ -173,8 +173,10 @@ type AuthenticationConfiguration struct {
 	// If present --anonymous-auth must not be set
 	Anonymous *AnonymousAuthConfig
 
-	// HTTPSignature authenticates requests by HTTP message signature.
-	HTTPSignature *HTTPSignatureAuthenticator
+	// HTTPSignature authenticates requests by HTTP message signature (RFC 9421)
+	// rather than by a credential the client sends. Each entry names a resolver,
+	// and entries are consulted in the order given.
+	HTTPSignature []HTTPSignatureAuthenticator
 }
 
 // AnonymousAuthConfig provides the configuration for the anonymous authenticator.
@@ -440,23 +442,55 @@ type WebhookMatchCondition struct {
 
 // HTTPSignatureAuthenticator provides the configuration for authenticating
 // requests by HTTP message signature (RFC 9421).
+//
+// Keys are not configured here. Endpoint names a resolver, which answers for a
+// key ID with the key that verifies signatures bearing it and the identity it
+// authenticates as, and which records the nonces those signatures carry. A
+// resolver's answer is a claim rather than a conclusion: this server validates
+// the identity on arrival and rejects a name or group under the "system:"
+// prefix.
 type HTTPSignatureAuthenticator struct {
-	// Keys the verifier accepts, and the identity each one authenticates as.
-	Keys []HTTPSignatureKey
-
-	// KeyDerivation is a key derivation ladder, stated identically here and in
-	// the configuration of every party that derives through it. When set,
-	// signatures from an hmac-sha256 key are verified against a key derived from
-	// its secret through the ladder, using the created timestamp the signature
-	// carries.
+	// Endpoint is the resolver's Unix domain socket, as unix:///path/to/socket,
+	// or unix://@name for a Linux abstract socket.
 	//
-	// It sits here rather than on each key because a ladder describes a
-	// derivation for a whole deployment. Each key states where its own material
-	// sits on the ladder, in its stage.
-	KeyDerivation *HTTPSignatureKeyDerivation
+	// The connection carries no TLS and this server does not authenticate the
+	// resolver. Access to the socket is the whole trust boundary.
+	Endpoint string
+
+	// KeyIDPrefixes narrows which key IDs this resolver is asked about, matched
+	// against the segment before a key ID's first "/". Unset means every key ID.
+	//
+	// Resolvers are consulted in order, so a key ID no resolver serves costs one
+	// call per resolver whose prefixes admit it, driven by a caller who has
+	// authenticated nothing.
+	KeyIDPrefixes []string
+
+	// RelayedHeaders names request headers whose values are sent to this resolver
+	// with a key lookup. Nothing else about the request is sent.
+	//
+	// A named header present but not covered by the signature rejects the request
+	// before any lookup. Covered is not verified: at lookup time the value is
+	// still a claim. Headers with their own configuration path elsewhere may not
+	// be named.
+	RelayedHeaders []string
+
+	// NonceHandling says whether this server asks the resolver to record the nonce
+	// each accepted signature carries. The zero value means Consume, so replay
+	// protection is on unless it is turned off in so many words.
+	//
+	// Ignore makes the replay window MaxAge plus Tolerance, during which a captured
+	// request can be replayed against every API server without limit.
+	NonceHandling NonceHandling
+
+	// Cache bounds what this server remembers of this resolver's answers.
+	Cache *HTTPSignatureCache
 
 	// MaxAge bounds how old a signature may be, measured from its created
 	// parameter. Unset means five minutes.
+	//
+	// Replay is closed by the resolver recording nonces, not by this. What this
+	// bounds is how stale a request may be, and so how long a resolver has to
+	// remember a nonce.
 	MaxAge *metav1.Duration
 
 	// Tolerance is added to time comparisons to allow for clock skew between
@@ -472,112 +506,48 @@ type HTTPSignatureAuthenticator struct {
 	Scheme    string
 }
 
-// HTTPSignatureKey is one verification key and the identity it authenticates.
-type HTTPSignatureKey struct {
-	// KeyID matches the keyid parameter a signature carries.
-	KeyID string
+// HTTPSignatureCache bounds what this server remembers of a resolver's answers.
+// A key ID is chosen by the peer, so neither cache may grow with the number of
+// distinct ones.
+type HTTPSignatureCache struct {
+	// MaxKeys caps the entries in each of the two caches kept per resolver: keys
+	// it resolved, and key IDs it said it does not serve. Unset means 1024. The
+	// two are separate so a flood of unknown key IDs cannot evict working keys.
+	MaxKeys *int32
 
-	// Algorithm is the signature algorithm this key verifies, named as in the
-	// IANA "HTTP Signature Algorithms" registry. A signature whose alg
-	// parameter disagrees is rejected, which closes algorithm confusion.
-	Algorithm string
+	// MaxAge caps how long a resolved key is reused, capping the duration the
+	// resolver states with each answer. Unset means five minutes. A cached key
+	// outlives its revocation, so this is the revocation window.
+	MaxAge *metav1.Duration
 
-	// PublicKey is a PEM-encoded public key, for asymmetric algorithms. A
-	// public key is not a secret, so it is stated inline.
-	PublicKey string
+	// NegativeMaxAge is how long this server remembers that a resolver does not
+	// serve a key ID. Unset means ten seconds. A resolver cannot state this
+	// itself, because not-found is a status rather than an answer with fields.
+	NegativeMaxAge *metav1.Duration
+}
 
-	// SecretFile is a file holding a shared secret, for hmac-sha256. A secret
-	// is never inline: this file is the only place one appears. When Stage is
-	// set the file must hold base64, because the material is raw bytes.
+// NonceHandling says what this server does with the nonce a signature carries.
+//
+// There is no per-API-server option, and its absence is a decision rather than an
+// omission. A nonce remembered in one process is not replay protection: with several
+// API servers and no shared state, a captured request can be replayed once against
+// each one that has not seen it. Offering that would be offering a guarantee that
+// does not hold, so the choice is between one shared record and none.
+type NonceHandling string
+
+const (
+	// NonceHandlingConsume asks the resolver to record every accepted signature's
+	// nonce, and rejects the request if it cannot. This is the default, and it is
+	// what closes replay across more than one API server.
+	NonceHandlingConsume NonceHandling = "Consume"
+
+	// NonceHandlingIgnore skips the call. The nonce is still required on the
+	// signature and still covered by it; nothing tracks whether it has been seen.
 	//
-	// A shared secret lets this server produce signatures indistinguishable
-	// from the client's, which asymmetric keys do not.
-	SecretFile string
-
-	// Stage is this key's position on the ladder, when SecretFile holds an
-	// intermediate rung rather than the root secret. A rung bounds what this
-	// server can mint: only within the rung's scope, only until its date rolls.
-	Stage *HTTPSignatureKeyStage
-
-	// User is the identity a request signed by this key authenticates as.
-	User HTTPSignatureUser
-}
-
-// HTTPSignatureKeyDerivation is a key derivation ladder: a chain of HMAC steps
-// that turns a root secret into a signing key scoped to a purpose and, with a
-// Date step, to a day. A ladder is not a secret and not specific to one party.
-//
-// Every party that derives states the same ladder, so this and the client's
-// copy have to agree. Both log a digest of theirs when they load it, because a
-// disagreement otherwise fails as a bare signature mismatch with nothing in the
-// error to say why.
-type HTTPSignatureKeyDerivation struct {
-	// Kind discriminates the derivation form. Only "hmac-ladder" is defined.
-	Kind string
-
-	// Hash is the HMAC hash used to derive: "sha-256" or "sha-512". The
-	// signature algorithm is always hmac-sha256; this governs derivation only.
-	// +optional
-	Hash string
-
-	// SecretPrefix is prepended to the root secret before the first step. It
-	// applies only when the material is the root secret, never to an
-	// intermediate rung.
-	// +optional
-	SecretPrefix string
-
-	// Steps are the rungs, applied in order. Each step's input is fed to HMAC
-	// keyed by the previous step's output, and the last output is the signing
-	// key.
-	Steps []HTTPSignatureKeyDerivationStep
-}
-
-// HTTPSignatureKeyDerivationStep is one rung of a ladder. Exactly one of
-// Literal, Scope, or Date supplies the step's input.
-//
-// Step names are arbitrary labels chosen by whoever writes the ladder. Nothing
-// in the implementation treats a name, a prefix, or a literal as meaningful.
-type HTTPSignatureKeyDerivationStep struct {
-	// Name identifies the step. Names are unique within a ladder and key the
-	// Scope map each party supplies. A name may not contain "/", because step
-	// values are joined by slashes into the key ID a signature carries.
-	Name string
-
-	// Literal is a fixed input value, the same for every party.
-	// +optional
-	Literal string
-
-	// Scope marks the input as a deployment-scoped value, such as a cell or a
-	// purpose name, supplied by each party's stage.
-	// +optional
-	Scope bool
-
-	// Date names a date format from a closed set: "YYYYMMDD" or "YYYY-MM-DD".
-	// The input is the signature's created timestamp rendered in UTC, so the
-	// signer and the verifier render the same value without consulting their
-	// own clocks. The set is deliberately not a Go layout or a strftime
-	// string: a ladder is read by implementations in any language, and a
-	// format token has to mean the same thing to all of them.
-	// +optional
-	Date string
-}
-
-// HTTPSignatureKeyStage is a position on a key derivation ladder.
-type HTTPSignatureKeyStage struct {
-	// From names the ladder step whose output the secret is. Empty means the
-	// secret is the root and the whole ladder is folded per request.
-	From string
-
-	// Scope holds values for the ladder's scope steps, and assertions for date
-	// steps at or before From.
-	Scope map[string]string
-}
-
-// HTTPSignatureUser is the identity a verification key authenticates as. The
-// values are used as given: this server does not prefix them, so an
-// administrator owns avoiding collision with names other authenticators issue.
-type HTTPSignatureUser struct {
-	Username string
-	UID      string
-	Groups   []string
-}
+	// This exists because the alternative was worse. Without it, a deployment whose
+	// resolver has no nonce store has to implement ConsumeNonce as a stub that
+	// always accepts, which is a resolver that lies about the RPC's contract, costs
+	// a round trip per request, and leaves nothing in this file to say that replay
+	// protection is off. Stating it here is legible; hiding it in a resolver is not.
+	NonceHandlingIgnore NonceHandling = "Ignore"
+)
