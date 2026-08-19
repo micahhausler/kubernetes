@@ -136,15 +136,18 @@ func (config Config) New(serverLifecycle context.Context) (authenticator.Request
 	// so that a request presenting both is authenticated as the signer, whose
 	// identity is bound to the request rather than merely presented with it.
 	//
-	// Building it dials every configured resolver and fetches its metadata, so a
-	// resolver that is absent or that states a malformed key derivation ladder
-	// fails the server's start rather than every signed request afterwards.
+	// Building it parses trust anchors, compiles expressions, and dials every
+	// configured resolver to fetch its metadata, so a malformed certificate
+	// authority or an absent resolver fails the server's start rather than every
+	// signed request afterwards.
 	//
-	// It goes into the chain whenever there is an authentication config file, even
-	// with no resolvers configured, and reads a pointer per request. That is what
-	// lets a resolver be added by editing the file: an authenticator that was not
-	// in the chain to begin with cannot be swapped into it later. With no resolvers
-	// it has no opinion about any request.
+	// The authenticator is reached through an atomic pointer rather than being
+	// installed directly, for the same reason the JWT authenticator is: the union
+	// below is built once, so a reloaded configuration has to be able to replace the
+	// implementation without replacing the union. It goes into the chain whenever
+	// there is an authentication config file, even with no httpSignature section, so
+	// that adding the section by editing the file works: an authenticator that was
+	// not in the chain to begin with cannot be swapped into it later.
 	httpSignatureAuthenticatorPtr := &atomic.Pointer[httpSignatureAuthenticatorWithCancel]{}
 	if config.AuthenticationConfig != nil {
 		initial, err := newHTTPSignatureAuthenticator(serverLifecycle, config.AuthenticationConfig, config.APIServerID, httpSignatureStartupDialTimeout)
@@ -155,7 +158,13 @@ func (config Config) New(serverLifecycle context.Context) (authenticator.Request
 
 		authenticators = append(authenticators, authenticator.WrapAudienceAgnosticRequest(config.APIAudiences,
 			authenticator.RequestFunc(func(req *http.Request) (*authenticator.Response, bool, error) {
-				return httpSignatureAuthenticatorPtr.Load().authenticator.AuthenticateRequest(req)
+				current := httpSignatureAuthenticatorPtr.Load().authenticator
+				if current == nil {
+					// No httpSignature section. No opinion, so the rest of the
+					// chain runs.
+					return nil, false, nil
+				}
+				return current.AuthenticateRequest(req)
 			}),
 		))
 	}
@@ -311,7 +320,17 @@ func newHTTPSignatureAuthenticator(serverLifecycle context.Context, config *apis
 		}
 	}()
 
-	auth, err := httpsig.New(ctx, config.HTTPSignature, apiServerID, dialTimeout)
+	// A nil section is a legitimate state, and produces a generation holding no
+	// authenticator. That is what makes removing the section by a reload work, and
+	// what lets this be built unconditionally at startup.
+	if config.HTTPSignature == nil {
+		return &httpSignatureAuthenticatorWithCancel{cancel: cancel}, nil
+	}
+
+	// The compiler is left to the authenticator to default, so that the CEL
+	// environment a certificate expression is compiled against is stated in one
+	// place rather than two.
+	auth, err := httpsig.New(ctx, config.HTTPSignature, nil, apiServerID, dialTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -402,6 +421,16 @@ type authenticationConfigUpdater struct {
 
 // the input ctx controls the timeout for updateAuthenticationConfig to return, not the lifetime of the constructed authenticators.
 func (c *authenticationConfigUpdater) updateAuthenticationConfig(ctx context.Context, authConfig *apiserver.AuthenticationConfiguration) error {
+	// Built before the JWT half so that a configuration this authenticator
+	// rejects fails the whole reload, rather than leaving the JWT authenticators
+	// swapped and this one stale.
+	//
+	// A nil section is a legitimate state and stores nil, so removing the section
+	// takes effect too. Swapping discards the certificate validation cache, which
+	// costs each client one revalidation, and the nonce buckets, which reopens the
+	// replay window for the length of maxAge. Both are the price of the section
+	// being reloadable at all, and neither grants anything a fresh server would
+	// not have granted.
 	updatedJWTAuthenticator, err := newJWTAuthenticator(c.serverLifecycle, authConfig, c.config.OIDCSigningAlgs, c.config.APIAudiences, c.config.ServiceAccountIssuers, c.config.EgressLookup, c.config.APIServerID)
 	if err != nil {
 		return err

@@ -384,10 +384,12 @@ func httpSignatureConfig(in *clientcmdapi.HTTPSignatureConfig) (*transporthttpsi
 		return nil, fmt.Errorf("httpSignature apiVersion %q is not understood, want %q", in.APIVersion, httpSignatureAPIVersion)
 	}
 	out := &transporthttpsig.Config{
-		Algorithm:      in.Algorithm,
-		KeyID:          in.KeyID,
-		KeyFile:        in.KeyFile,
-		CredentialFile: in.CredentialFile,
+		Algorithm:            in.Algorithm,
+		KeyID:                in.KeyID,
+		KeyFile:              in.KeyFile,
+		CertFile:             in.CertFile,
+		CredentialFile:       in.CredentialFile,
+		CredentialBundleFile: in.CredentialBundleFile,
 	}
 	if in.KeyDerivation != nil {
 		// The library validates the ladder as it converts, so a bad one is

@@ -163,6 +163,7 @@ type HTTPSignatureRequest struct {
 	// SignedHeaders are the names of headers the client covers with the
 	// signature. The plugin has to return a value for every one of them.
 	// +optional
+	// +listType=atomic
 	SignedHeaders []HTTPSignatureHeader
 }
 
@@ -252,6 +253,7 @@ type HTTPSignatureKeyDerivation struct {
 	// Steps are the rungs, applied in order. Each step's input is fed to HMAC
 	// keyed by the previous step's output, and the last output is the signing
 	// key.
+	// +listType=atomic
 	Steps []HTTPSignatureKeyDerivationStep
 }
 

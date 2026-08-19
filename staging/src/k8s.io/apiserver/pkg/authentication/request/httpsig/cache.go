@@ -43,7 +43,7 @@ const (
 	// configuration does not. It matches the default maximum signature age, so by
 	// default a key is re-resolved on roughly the same cadence as the window a
 	// signature is accepted in.
-	defaultCacheMaxAge = DefaultMaxAge
+	defaultCacheMaxAge = defaultMaxAge
 
 	// defaultNegativeMaxAge is how long an unserved keyid is remembered when
 	// configuration does not.

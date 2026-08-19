@@ -29,13 +29,15 @@ import (
 const (
 	claimsVarName = "claims"
 	userVarName   = "user"
+	certVarName   = "cert"
 )
 
 // compiler implements the Compiler interface.
 type compiler struct {
 	// varEnvs is a map of CEL environments, keyed by the name of the CEL variable.
 	// The CEL variable is available to the expression.
-	// We have 2 environments, one for claims and one for user.
+	// One environment per variable, so an expression written against one of them
+	// cannot reference another: the identifier is simply not declared.
 	varEnvs map[string]*environment.EnvSet
 }
 
@@ -62,6 +64,15 @@ func (c compiler) CompileClaimsExpression(expressionAccessor ExpressionAccessor)
 // The user CEL variable is available to the expression.
 func (c compiler) CompileUserExpression(expressionAccessor ExpressionAccessor) (CompilationResult, error) {
 	return c.compile(expressionAccessor, userVarName)
+}
+
+// CompileCertificateExpression compiles the given expressionAccessor into a CEL
+// program that can be evaluated. The cert CEL variable is available to the
+// expression, and nothing else: this environment declares no clock and no
+// request, which is what makes an expression's result a pure function of the
+// certificate and therefore safe to cache per certificate.
+func (c compiler) CompileCertificateExpression(expressionAccessor ExpressionAccessor) (CompilationResult, error) {
+	return c.compile(expressionAccessor, certVarName)
 }
 
 func (c compiler) compile(expressionAccessor ExpressionAccessor, envVarName string) (CompilationResult, error) {
@@ -138,9 +149,9 @@ func buildUserType() *apiservercel.DeclType {
 }
 
 func mustBuildEnvs(baseEnv *environment.EnvSet) map[string]*environment.EnvSet {
-	buildEnvSet := func(envOpts []cel.EnvOption, declTypes []*apiservercel.DeclType) *environment.EnvSet {
+	buildEnvSet := func(introduced *version.Version, envOpts []cel.EnvOption, declTypes []*apiservercel.DeclType) *environment.EnvSet {
 		env, err := baseEnv.Extend(environment.VersionedOptions{
-			IntroducedVersion: version.MajorMinor(1, 0),
+			IntroducedVersion: introduced,
 			EnvOptions:        envOpts,
 			DeclTypes:         declTypes,
 		})
@@ -153,9 +164,15 @@ func mustBuildEnvs(baseEnv *environment.EnvSet) map[string]*environment.EnvSet {
 	userType := buildUserType()
 	claimsType := apiservercel.NewMapType(apiservercel.StringType, apiservercel.AnyType, -1)
 
-	envs := make(map[string]*environment.EnvSet, 2) // build two environments, one for claims and one for user
-	envs[claimsVarName] = buildEnvSet([]cel.EnvOption{cel.Variable(claimsVarName, claimsType.CelType())}, []*apiservercel.DeclType{claimsType})
-	envs[userVarName] = buildEnvSet([]cel.EnvOption{cel.Variable(userVarName, userType.CelType())}, []*apiservercel.DeclType{userType})
+	// One environment per variable.
+	envs := make(map[string]*environment.EnvSet, 3)
+	envs[claimsVarName] = buildEnvSet(version.MajorMinor(1, 0), []cel.EnvOption{cel.Variable(claimsVarName, claimsType.CelType())}, []*apiservercel.DeclType{claimsType})
+	envs[userVarName] = buildEnvSet(version.MajorMinor(1, 0), []cel.EnvOption{cel.Variable(userVarName, userType.CelType())}, []*apiservercel.DeclType{userType})
+	// The certificate variable arrived with the HTTP signature authenticator, so
+	// it states its real introducing version rather than 1.0. Registering
+	// CertificateType alone is enough: the nested name type is reachable through
+	// its fields.
+	envs[certVarName] = buildEnvSet(version.MajorMinor(1, 37), []cel.EnvOption{cel.Variable(certVarName, CertificateType.CelType())}, []*apiservercel.DeclType{CertificateType})
 
 	return envs
 }

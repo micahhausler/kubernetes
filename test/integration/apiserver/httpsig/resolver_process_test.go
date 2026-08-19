@@ -138,7 +138,9 @@ func TestResolverProcessAuthenticates(t *testing.T) {
 	server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1alpha1
 kind: AuthenticationConfiguration
 httpSignature:
-- endpoint: %s
+  authenticators:
+  - name: resolver
+    endpoint: %s
 `, endpoint))
 	grantPodReader(t, server)
 
@@ -198,7 +200,9 @@ func TestResolverProcessRevokesOnFileEdit(t *testing.T) {
 	server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1alpha1
 kind: AuthenticationConfiguration
 httpSignature:
-- endpoint: %s
+  authenticators:
+  - name: resolver
+    endpoint: %s
 `, endpoint))
 
 	clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
@@ -274,7 +278,9 @@ func TestResolverProcessDeathRejects(t *testing.T) {
 	server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1alpha1
 kind: AuthenticationConfiguration
 httpSignature:
-- endpoint: unix://%s
+  authenticators:
+  - name: resolver
+    endpoint: unix://%s
 `, socket))
 
 	clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
@@ -356,7 +362,9 @@ func TestResolverProcessVendsARung(t *testing.T) {
 	server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1alpha1
 kind: AuthenticationConfiguration
 httpSignature:
-- endpoint: %s
+  authenticators:
+  - name: resolver
+    endpoint: %s
 `, endpoint))
 
 	stageJSON := fmt.Sprintf(`{"from":%q,"scope":{"date":%q,"cluster":%q}}`, stage.From, stage.Scope["date"], stage.Scope["cluster"])

@@ -614,11 +614,11 @@ func TestConfigErrors(t *testing.T) {
 	}, {
 		name: "no key source",
 		cfg:  Config{Algorithm: string(httpsig.Ed25519), KeyID: "k1"},
-		want: "exactly one of credential, keyFile, or credentialFile",
+		want: "exactly one of credential, keyFile, credentialFile, certFile with keyFile, or credentialBundleFile",
 	}, {
 		name: "both key sources",
 		cfg:  Config{Algorithm: string(httpsig.Ed25519), KeyID: "k1", KeyFile: keyFile, CredentialFile: asymCred},
-		want: "exactly one of credential, keyFile, or credentialFile",
+		want: "exactly one of credential, keyFile, credentialFile, certFile with keyFile, or credentialBundleFile",
 	}, {
 		name: "hmac with a key file",
 		cfg:  Config{Algorithm: string(httpsig.HMACSHA256), KeyID: "k1", KeyFile: keyFile},

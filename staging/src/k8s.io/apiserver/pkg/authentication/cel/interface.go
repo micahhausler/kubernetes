@@ -48,6 +48,7 @@ type EvaluationResult struct {
 type Compiler interface {
 	CompileClaimsExpression(expressionAccessor ExpressionAccessor) (CompilationResult, error)
 	CompileUserExpression(expressionAccessor ExpressionAccessor) (CompilationResult, error)
+	CompileCertificateExpression(expressionAccessor ExpressionAccessor) (CompilationResult, error)
 }
 
 // ClaimsMapper provides a CEL expression mapper configured with the claims CEL variable.
@@ -65,6 +66,17 @@ type UserMapper interface {
 	// EvalUser evaluates the given user expressions and returns a list of EvaluationResult.
 	// This is used for user validation that contains a list of expressions.
 	EvalUser(ctx context.Context, userInfo traits.Mapper) ([]EvaluationResult, error)
+}
+
+// CertificateMapper provides a CEL expression mapper configured with the cert CEL variable.
+type CertificateMapper interface {
+	// EvalCertificateMapping evaluates one expression over a certificate and
+	// returns a single EvaluationResult. This is used for the username, groups,
+	// and uid mappings, which are one expression each.
+	EvalCertificateMapping(ctx context.Context, cert traits.Mapper) (EvaluationResult, error)
+	// EvalCertificateMappings evaluates a list of expressions over a certificate.
+	// This is used for extra mappings and for certificate validation rules.
+	EvalCertificateMappings(ctx context.Context, cert traits.Mapper) ([]EvaluationResult, error)
 }
 
 var _ ExpressionAccessor = &ClaimMappingExpression{}
@@ -143,5 +155,51 @@ func (v *UserValidationCondition) GetExpression() string {
 
 // ReturnTypes returns the CEL expression return types.
 func (v *UserValidationCondition) ReturnTypes() []*celgo.Type {
+	return []*celgo.Type{celgo.BoolType}
+}
+
+var _ ExpressionAccessor = &CertificateMappingExpression{}
+
+// CertificateMappingExpression is a CEL expression that maps an attribute of a
+// certificate onto a user attribute. When it maps an extra attribute, Key is the
+// extra key it produces.
+type CertificateMappingExpression struct {
+	Key        string
+	Expression string
+}
+
+// GetExpression returns the CEL expression.
+func (v *CertificateMappingExpression) GetExpression() string {
+	return v.Expression
+}
+
+// ReturnTypes returns the CEL expression return types.
+//
+// Unlike the claim mapping expressions, these could be typed at compilation:
+// the certificate type is fully declared, so the compiler knows whether an
+// expression produces a string or a list. They are deliberately not, because a
+// mapping legitimately produces either one, and enforcing which per field would
+// put that rule in the compiler where the error names no field. Validation
+// checks it instead, where it can.
+func (v *CertificateMappingExpression) ReturnTypes() []*celgo.Type {
+	return []*celgo.Type{celgo.AnyType}
+}
+
+var _ ExpressionAccessor = &CertificateValidationCondition{}
+
+// CertificateValidationCondition is a CEL expression that validates a
+// certificate.
+type CertificateValidationCondition struct {
+	Expression string
+	Message    string
+}
+
+// GetExpression returns the CEL expression.
+func (v *CertificateValidationCondition) GetExpression() string {
+	return v.Expression
+}
+
+// ReturnTypes returns the CEL expression return types.
+func (v *CertificateValidationCondition) ReturnTypes() []*celgo.Type {
 	return []*celgo.Type{celgo.BoolType}
 }

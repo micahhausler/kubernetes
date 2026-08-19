@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	api "k8s.io/apiserver/pkg/apis/apiserver"
 	authenticationcel "k8s.io/apiserver/pkg/authentication/cel"
+	"k8s.io/apiserver/pkg/authentication/request/httpsig"
 	authorizationcel "k8s.io/apiserver/pkg/authorization/cel"
 	"k8s.io/apiserver/pkg/cel"
 	"k8s.io/apiserver/pkg/features"
@@ -86,74 +87,81 @@ func ValidateAuthenticationConfiguration(compiler authenticationcel.Compiler, c 
 		}
 	}
 
-	allErrs = append(allErrs, validateHTTPSignatureAuthenticators(c.HTTPSignature, field.NewPath("httpSignature"),
+	allErrs = append(allErrs, validateHTTPSignature(compiler, c.HTTPSignature, field.NewPath("httpSignature"),
 		utilfeature.DefaultFeatureGate.Enabled(features.HTTPSignatureAuthentication))...)
 
 	return allErrs
 }
 
-// maxHTTPSignatureResolvers bounds the resolver list. Resolvers are consulted in
-// order for a keyid whose prefixes admit it, so the list length is a multiplier on
-// what one unauthenticated request can cost. A deployment needing more than this
-// needs one resolver that fronts them, not a longer list.
-const maxHTTPSignatureResolvers = 8
+// maxHTTPSignatureAuthenticators bounds the authenticator list, matching the
+// bound on JWT authenticators. Every certificate authenticator holds a validation
+// cache and every resolver authenticator holds two key caches, so the list length
+// sets a memory floor. Resolvers are also consulted in order for a keyid whose
+// prefixes admit it, so it is a multiplier on what one unauthenticated request can
+// cost.
+const maxHTTPSignatureAuthenticators = 64
 
-func validateHTTPSignatureAuthenticators(cs []api.HTTPSignatureAuthenticator, fldPath *field.Path, featureEnabled bool) field.ErrorList {
+func validateHTTPSignature(compiler authenticationcel.Compiler, c *api.HTTPSignatureConfig, fldPath *field.Path, featureEnabled bool) field.ErrorList {
 	var allErrs field.ErrorList
-	if len(cs) == 0 {
+	if c == nil {
 		return allErrs
 	}
 	if !featureEnabled {
 		return append(allErrs, field.Forbidden(fldPath, "httpSignature is not supported when the HTTPSignatureAuthentication feature gate is disabled"))
 	}
-	if len(cs) > maxHTTPSignatureResolvers {
-		return append(allErrs, field.TooMany(fldPath, len(cs), maxHTTPSignatureResolvers))
+	authPath := fldPath.Child("authenticators")
+	if len(c.Authenticators) == 0 {
+		allErrs = append(allErrs, field.Required(authPath, "at least one authenticator is required for httpSignature to authenticate anything"))
+		return allErrs
+	}
+	if len(c.Authenticators) > maxHTTPSignatureAuthenticators {
+		return append(allErrs, field.TooMany(authPath, len(c.Authenticators), maxHTTPSignatureAuthenticators))
 	}
 
+	if c.Scheme != "" && c.Scheme != "http" && c.Scheme != "https" {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("scheme"), c.Scheme, "must be http or https"))
+	}
+
+	seenNames := sets.New[string]()
+	// Trust anchors are collected across authenticators because two that share
+	// one would both claim the same certificate, and which identity it got would
+	// depend on the order they appear in this file.
+	anchorOwners := map[string]string{}
+	// Endpoints and keyID prefixes are likewise collected across authenticators:
+	// which resolver serves a keyID must not depend on list order.
 	seenEndpoints := sets.New[string]()
 	seenPrefixes := sets.New[string]()
 	unprefixed := 0
-	for i, c := range cs {
-		path := fldPath.Index(i)
-		allErrs = append(allErrs, validateHTTPSignatureAuthenticator(c, path)...)
 
-		if len(c.Endpoint) > 0 {
-			if seenEndpoints.Has(c.Endpoint) {
-				allErrs = append(allErrs, field.Duplicate(path.Child("endpoint"), c.Endpoint))
-			}
-			seenEndpoints.Insert(c.Endpoint)
+	for i, a := range c.Authenticators {
+		path := authPath.Index(i)
+
+		if len(a.Name) == 0 {
+			allErrs = append(allErrs, field.Required(path.Child("name"), "a name is required to identify this authenticator in errors and metrics"))
+		} else if seenNames.Has(a.Name) {
+			allErrs = append(allErrs, field.Duplicate(path.Child("name"), a.Name))
+		}
+		seenNames.Insert(a.Name)
+
+		// Rejecting a non-positive maxAge also keeps the created parameter
+		// mandatory, because the verifier requires created only while it has an
+		// age bound to apply.
+		if a.MaxAge != nil && a.MaxAge.Duration <= 0 {
+			allErrs = append(allErrs, field.Invalid(path.Child("maxAge"), a.MaxAge.Duration.String(), "must be positive: it is the bound on how long a captured request can be replayed"))
+		}
+		if a.Tolerance != nil && a.Tolerance.Duration < 0 {
+			allErrs = append(allErrs, field.Invalid(path.Child("tolerance"), a.Tolerance.Duration.String(), "must not be negative"))
 		}
 
-		// Scheme and authority describe this server, not a resolver: the authority
-		// goes into the signature base, so two entries disagreeing would make the
-		// same request verify under one and fail under the other. Rather than
-		// choose between them, reject the state where they can disagree.
-		if c.Scheme != cs[0].Scheme {
-			allErrs = append(allErrs, field.Invalid(path.Child("scheme"), c.Scheme, fmt.Sprintf("must match httpSignature[0].scheme (%q): scheme describes this server rather than a resolver, so every entry has to state the same value", cs[0].Scheme)))
-		}
-		if c.Authority != cs[0].Authority {
-			allErrs = append(allErrs, field.Invalid(path.Child("authority"), c.Authority, fmt.Sprintf("must match httpSignature[0].authority (%q): authority describes this server rather than a resolver, and it is covered by every signature, so every entry has to state the same value", cs[0].Authority)))
-		}
-
-		if len(c.KeyIDPrefixes) == 0 {
-			unprefixed++
-			continue
-		}
-		for j, prefix := range c.KeyIDPrefixes {
-			prefixPath := path.Child("keyIDPrefixes").Index(j)
-			switch {
-			case len(prefix) == 0:
-				allErrs = append(allErrs, field.Required(prefixPath, "an empty prefix admits nothing; omit keyIDPrefixes to admit every keyID"))
-			case strings.Contains(prefix, "/"):
-				allErrs = append(allErrs, field.Invalid(prefixPath, prefix, "must not contain \"/\": a prefix is matched against the segment of a keyID before its first slash, so one containing a slash can never match"))
-			case seenPrefixes.Has(prefix):
-				// Two resolvers claiming one prefix means which serves a keyID
-				// depends on list order, and a key moved between resolvers would
-				// change identity silently.
-				allErrs = append(allErrs, field.Duplicate(prefixPath, prefix))
-			default:
-				seenPrefixes.Insert(prefix)
-			}
+		switch {
+		case a.X509 != nil && len(a.Endpoint) > 0:
+			allErrs = append(allErrs, field.Invalid(path, "", "endpoint and x509 are mutually exclusive: a resolver states the identity with each answer, and x509 takes it from a certificate"))
+		case a.X509 != nil:
+			allErrs = append(allErrs, validateHTTPSignatureX509(compiler, a, path, anchorOwners)...)
+		case len(a.Endpoint) > 0:
+			allErrs = append(allErrs, validateHTTPSignatureEndpoint(a, path, seenEndpoints, seenPrefixes, &unprefixed)...)
+		default:
+			allErrs = append(allErrs, field.Required(path, "one of endpoint or x509 is required"))
 		}
 	}
 
@@ -161,29 +169,40 @@ func validateHTTPSignatureAuthenticators(cs []api.HTTPSignatureAuthenticator, fl
 	// costs a call to each. One catch-all is a deliberate choice; two is a
 	// configuration that fans out without saying so.
 	if unprefixed > 1 {
-		allErrs = append(allErrs, field.Invalid(fldPath, unprefixed, "at most one entry may omit keyIDPrefixes: entries without prefixes are asked about every keyID, so more than one turns each unknown keyID into a call to each of them"))
+		allErrs = append(allErrs, field.Invalid(authPath, unprefixed, "at most one authenticator may omit keyIDPrefixes: those without prefixes are asked about every keyID, so more than one turns each unknown keyID into a call to each of them"))
 	}
 
 	return allErrs
 }
 
-func validateHTTPSignatureAuthenticator(c api.HTTPSignatureAuthenticator, fldPath *field.Path) field.ErrorList {
+// validateHTTPSignatureEndpoint validates an authenticator that resolves keys and
+// identities through a resolver process.
+//
+// seenEndpoints, seenPrefixes, and unprefixed accumulate across authenticators, so
+// that two resolvers cannot claim one socket or one keyID prefix.
+func validateHTTPSignatureEndpoint(a api.HTTPSignatureAuthenticator, fldPath *field.Path, seenEndpoints, seenPrefixes sets.Set[string], unprefixed *int) field.ErrorList {
 	var allErrs field.ErrorList
 
-	if len(c.Endpoint) == 0 {
-		allErrs = append(allErrs, field.Required(fldPath.Child("endpoint"), "a resolver endpoint is required: keys are not configured in this file"))
-	} else if _, err := kmsutil.ParseEndpoint(c.Endpoint); err != nil {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("endpoint"), c.Endpoint, err.Error()))
+	// Fields that only mean something for an identity asserted by a certificate. A
+	// field that is accepted and ignored is worse than one that is rejected,
+	// because nothing tells the administrator their rule is not running.
+	if a.ClaimMappings != nil {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("claimMappings"), "", "claimMappings derives an identity from a certificate and requires x509; a resolver states the identity with each answer"))
+	}
+	if len(a.CertificateValidationRules) > 0 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("certificateValidationRules"), "", "certificateValidationRules requires x509"))
+	}
+	if len(a.UserValidationRules) > 0 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("userValidationRules"), "", "userValidationRules constrains an identity a certificate claimed and requires x509; an identity a resolver states is checked against the system: prefix as it arrives"))
 	}
 
-	if c.MaxAge != nil && c.MaxAge.Duration <= 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("maxAge"), c.MaxAge.Duration.String(), "must be positive: it bounds how stale a request may be, and how long a resolver is asked to remember a nonce"))
-	}
-	if c.Tolerance != nil && c.Tolerance.Duration < 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("tolerance"), c.Tolerance.Duration.String(), "must not be negative"))
-	}
-	if c.Scheme != "" && c.Scheme != "http" && c.Scheme != "https" {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("scheme"), c.Scheme, "must be http or https"))
+	endpointPath := fldPath.Child("endpoint")
+	if _, err := kmsutil.ParseEndpoint(a.Endpoint); err != nil {
+		allErrs = append(allErrs, field.Invalid(endpointPath, a.Endpoint, err.Error()))
+	} else if seenEndpoints.Has(a.Endpoint) {
+		allErrs = append(allErrs, field.Duplicate(endpointPath, a.Endpoint))
+	} else {
+		seenEndpoints.Insert(a.Endpoint)
 	}
 
 	// Checked against a closed set rather than compared against Ignore alone. A typo
@@ -191,15 +210,35 @@ func validateHTTPSignatureAuthenticator(c api.HTTPSignatureAuthenticator, fldPat
 	// would silently leave replay protection on for an operator who meant to turn it
 	// off. Silently doing the safe thing is still silently doing the wrong thing, and
 	// the operator would go looking in the resolver for the cause.
-	switch c.NonceHandling {
+	switch a.NonceHandling {
 	case "", api.NonceHandlingConsume, api.NonceHandlingIgnore:
 	default:
-		allErrs = append(allErrs, field.NotSupported(fldPath.Child("nonceHandling"), c.NonceHandling,
+		allErrs = append(allErrs, field.NotSupported(fldPath.Child("nonceHandling"), a.NonceHandling,
 			[]api.NonceHandling{api.NonceHandlingConsume, api.NonceHandlingIgnore}))
 	}
 
+	if len(a.KeyIDPrefixes) == 0 {
+		*unprefixed++
+	}
+	for j, prefix := range a.KeyIDPrefixes {
+		prefixPath := fldPath.Child("keyIDPrefixes").Index(j)
+		switch {
+		case len(prefix) == 0:
+			allErrs = append(allErrs, field.Required(prefixPath, "an empty prefix admits nothing; omit keyIDPrefixes to admit every keyID"))
+		case strings.Contains(prefix, "/"):
+			allErrs = append(allErrs, field.Invalid(prefixPath, prefix, "must not contain \"/\": a prefix is matched against the segment of a keyID before its first slash, so one containing a slash can never match"))
+		case seenPrefixes.Has(prefix):
+			// Two resolvers claiming one prefix means which serves a keyID
+			// depends on list order, and a key moved between resolvers would
+			// change identity silently.
+			allErrs = append(allErrs, field.Duplicate(prefixPath, prefix))
+		default:
+			seenPrefixes.Insert(prefix)
+		}
+	}
+
 	seenHeaders := sets.New[string]()
-	for i, name := range c.RelayedHeaders {
+	for i, name := range a.RelayedHeaders {
 		headerPath := fldPath.Child("relayedHeaders").Index(i)
 		lower := strings.ToLower(name)
 		switch {
@@ -218,20 +257,136 @@ func validateHTTPSignatureAuthenticator(c api.HTTPSignatureAuthenticator, fldPat
 		}
 	}
 
-	if c.Cache != nil {
+	if a.Cache != nil {
 		cachePath := fldPath.Child("cache")
-		if c.Cache.MaxKeys != nil && *c.Cache.MaxKeys <= 0 {
-			allErrs = append(allErrs, field.Invalid(cachePath.Child("maxKeys"), *c.Cache.MaxKeys, "must be positive: a cache that holds no keys makes a resolver call per request"))
+		if a.Cache.MaxKeys != nil && *a.Cache.MaxKeys <= 0 {
+			allErrs = append(allErrs, field.Invalid(cachePath.Child("maxKeys"), *a.Cache.MaxKeys, "must be positive: a cache that holds no keys makes a resolver call per request"))
 		}
-		if c.Cache.MaxAge != nil && c.Cache.MaxAge.Duration < 0 {
-			allErrs = append(allErrs, field.Invalid(cachePath.Child("maxAge"), c.Cache.MaxAge.Duration.String(), "must not be negative; zero disables caching of resolved keys"))
+		if a.Cache.MaxAge != nil && a.Cache.MaxAge.Duration < 0 {
+			allErrs = append(allErrs, field.Invalid(cachePath.Child("maxAge"), a.Cache.MaxAge.Duration.String(), "must not be negative; zero disables caching of resolved keys"))
 		}
-		if c.Cache.NegativeMaxAge != nil && c.Cache.NegativeMaxAge.Duration < 0 {
-			allErrs = append(allErrs, field.Invalid(cachePath.Child("negativeMaxAge"), c.Cache.NegativeMaxAge.Duration.String(), "must not be negative; zero disables caching of unserved keyIDs"))
+		if a.Cache.NegativeMaxAge != nil && a.Cache.NegativeMaxAge.Duration < 0 {
+			allErrs = append(allErrs, field.Invalid(cachePath.Child("negativeMaxAge"), a.Cache.NegativeMaxAge.Duration.String(), "must not be negative; zero disables caching of unserved keyIDs"))
 		}
 	}
 
 	return allErrs
+}
+
+// validateHTTPSignatureX509 validates an authenticator that takes its keys and
+// identities from certificates.
+//
+// anchorOwners accumulates across authenticators, mapping each trust anchor to the
+// name of the authenticator that already claimed it.
+func validateHTTPSignatureX509(compiler authenticationcel.Compiler, a api.HTTPSignatureAuthenticator, fldPath *field.Path, anchorOwners map[string]string) field.ErrorList {
+	var allErrs field.ErrorList
+	x509Path := fldPath.Child("x509")
+
+	// Fields that only mean something for a resolver. Rejected rather than
+	// ignored, so that an administrator who set one is told it is not running.
+	if len(a.KeyIDPrefixes) > 0 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("keyIDPrefixes"), "", "keyIDPrefixes narrows which keyIDs a resolver is asked about and requires endpoint; an x509 authenticator is selected by the certificate keyid form"))
+	}
+	if len(a.RelayedHeaders) > 0 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("relayedHeaders"), "", "relayedHeaders sends header values to a resolver and requires endpoint"))
+	}
+	if a.NonceHandling != "" {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("nonceHandling"), a.NonceHandling, "nonceHandling requires endpoint: a nonce record has to live somewhere every API server shares, and x509 has no resolver to hold one, so maxAge plus tolerance is the replay window"))
+	}
+	if a.Cache != nil {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("cache"), "", "cache bounds what is remembered of a resolver's answers and requires endpoint; the certificate equivalent is x509.certificateCache"))
+	}
+
+	caPath := x509Path.Child("certificateAuthority")
+	if len(a.X509.CertificateAuthority) == 0 {
+		allErrs = append(allErrs, field.Required(caPath, "trust anchors are required: they are what makes a certificate mean anything to this server"))
+	} else {
+		anchors, err := cert.ParseCertsPEM([]byte(a.X509.CertificateAuthority))
+		if err != nil {
+			// The value is reported as omitted rather than echoed, matching how
+			// the JWT issuer's authority is reported.
+			allErrs = append(allErrs, field.Invalid(caPath, "<omitted>", err.Error()))
+		}
+		for _, anchor := range anchors {
+			fingerprint := string(anchor.Raw)
+			if owner, taken := anchorOwners[fingerprint]; taken {
+				allErrs = append(allErrs, field.Invalid(caPath, "<omitted>",
+					fmt.Sprintf("trust anchor %q is already used by authenticator %q; two authenticators sharing an anchor would both accept the same certificate, "+
+						"and which identity it received would depend on the order they appear in this list", anchor.Subject.String(), owner)))
+				continue
+			}
+			anchorOwners[fingerprint] = a.Name
+		}
+	}
+
+	if cc := a.X509.CertificateCache; cc != nil {
+		cachePath := x509Path.Child("certificateCache")
+		if cc.MaxEntries != nil && *cc.MaxEntries <= 0 {
+			allErrs = append(allErrs, field.Invalid(cachePath.Child("maxEntries"), *cc.MaxEntries,
+				"must be positive: a cache holding no entries revalidates every request"))
+		}
+		if cc.TTL != nil && cc.TTL.Duration < 0 {
+			allErrs = append(allErrs, field.Invalid(cachePath.Child("ttl"), cc.TTL.Duration.String(), "must not be negative"))
+		}
+	}
+
+	if a.ClaimMappings == nil {
+		allErrs = append(allErrs, field.Required(fldPath.Child("claimMappings"),
+			"claimMappings is required with x509, because the identity comes from the certificate rather than from this file"))
+	} else if len(a.ClaimMappings.Username.Expression) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("claimMappings", "username", "expression"),
+			"a username expression is required: a certificate has no field this server would pick by default"))
+	}
+
+	if a.ClaimMappings != nil {
+		seenExtraKeys := sets.New[string]()
+		for i, extra := range a.ClaimMappings.Extra {
+			extraPath := fldPath.Child("claimMappings", "extra").Index(i)
+			keyErrs, duplicate := validateExtraMappingKey(extra.Key, extraPath.Child("key"), seenExtraKeys)
+			allErrs = append(allErrs, keyErrs...)
+			if duplicate {
+				continue
+			}
+			if len(extra.ValueExpression) == 0 {
+				allErrs = append(allErrs, field.Required(extraPath.Child("valueExpression"), ""))
+			}
+		}
+	}
+
+	// Compilation is the validation. It runs the same function the authenticator
+	// runs, so an expression that validates here cannot fail to compile there.
+	if _, err := httpsig.CompileCertificateAuthenticator(compiler, a); err != nil {
+		allErrs = append(allErrs, field.Invalid(fldPath, "", err.Error()))
+	}
+	return allErrs
+}
+
+// validateExtraMappingKey checks an extra attribute key, and reports whether the
+// key was already seen so the caller can skip the rest of the mapping.
+//
+// Both the JWT and the HTTP signature authenticators call this. An extra
+// attribute key means the same thing whichever authenticator produced it, and two
+// copies of these rules would eventually disagree about one of them, most likely
+// the reservation of the Kubernetes domains.
+//
+// Keys should be namespaced to the authenticator or authenticator/authorizer pair
+// making use of them, for instance "example.org/foo" rather than "foo".
+// xref: https://github.com/kubernetes/kubernetes/blob/3825e206cb162a7ad7431a5bdf6a065ae8422cf7/staging/src/k8s.io/apiserver/pkg/authentication/user/user.go#L31-L41
+func validateExtraMappingKey(key string, fldPath *field.Path, seen sets.Set[string]) (field.ErrorList, bool) {
+	var allErrs field.ErrorList
+	// IsDomainPrefixedPath checks for a non-empty key prefixed with a domain name.
+	allErrs = append(allErrs, utilvalidation.IsDomainPrefixedPath(fldPath, key)...)
+	if key != strings.ToLower(key) {
+		allErrs = append(allErrs, field.Invalid(fldPath, key, "must be lowercase"))
+	}
+	if isKubernetesDomainPrefix(key) {
+		allErrs = append(allErrs, field.Invalid(fldPath, key, "k8s.io, kubernetes.io and their subdomains are reserved for Kubernetes use"))
+	}
+	if seen.Has(key) {
+		return append(allErrs, field.Duplicate(fldPath, key)), true
+	}
+	seen.Insert(key)
+	return allErrs, false
 }
 
 // CompileAndValidateJWTAuthenticator validates a given JWTAuthenticator and returns a CELMapper with the compiled
@@ -480,28 +635,15 @@ func validateClaimMappings(compiler authenticationcel.Compiler, state *validatio
 	}
 
 	var extraCompilationResults []authenticationcel.CompilationResult
-	seenExtraKeys := sets.NewString()
+	seenExtraKeys := sets.New[string]()
 
 	for i, mapping := range m.Extra {
 		fldPath := fldPath.Child("extra").Index(i)
-		// Key should be namespaced to the authenticator or authenticator/authorizer pair making use of them.
-		// For instance: "example.org/foo" instead of "foo".
-		// xref: https://github.com/kubernetes/kubernetes/blob/3825e206cb162a7ad7431a5bdf6a065ae8422cf7/staging/src/k8s.io/apiserver/pkg/authentication/user/user.go#L31-L41
-		// IsDomainPrefixedPath checks for non-empty key and that the key is prefixed with a domain name.
-		allErrs = append(allErrs, utilvalidation.IsDomainPrefixedPath(fldPath.Child("key"), mapping.Key)...)
-		if mapping.Key != strings.ToLower(mapping.Key) {
-			allErrs = append(allErrs, field.Invalid(fldPath.Child("key"), mapping.Key, "must be lowercase"))
-		}
-
-		if isKubernetesDomainPrefix(mapping.Key) {
-			allErrs = append(allErrs, field.Invalid(fldPath.Child("key"), mapping.Key, "k8s.io, kubernetes.io and their subdomains are reserved for Kubernetes use"))
-		}
-
-		if seenExtraKeys.Has(mapping.Key) {
-			allErrs = append(allErrs, field.Duplicate(fldPath.Child("key"), mapping.Key))
+		keyErrs, duplicate := validateExtraMappingKey(mapping.Key, fldPath.Child("key"), seenExtraKeys)
+		allErrs = append(allErrs, keyErrs...)
+		if duplicate {
 			continue
 		}
-		seenExtraKeys.Insert(mapping.Key)
 
 		if len(mapping.ValueExpression) == 0 {
 			allErrs = append(allErrs, field.Required(fldPath.Child("valueExpression"), ""))

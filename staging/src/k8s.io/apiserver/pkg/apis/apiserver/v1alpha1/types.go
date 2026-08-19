@@ -203,8 +203,7 @@ type AuthenticationConfiguration struct {
 	// Requires the HTTPSignatureAuthentication feature gate.
 	// +featureGate=HTTPSignatureAuthentication
 	// +optional
-	// +listType=atomic
-	HTTPSignature []HTTPSignatureAuthenticator `json:"httpSignature,omitempty"`
+	HTTPSignature *HTTPSignatureConfig `json:"httpSignature,omitempty"`
 }
 
 // AnonymousAuthConfig provides the configuration for the anonymous authenticator.
@@ -680,24 +679,69 @@ type WebhookMatchCondition struct {
 	Expression string `json:"expression"`
 }
 
-// HTTPSignatureAuthenticator provides the configuration for authenticating
-// requests by HTTP message signature (RFC 9421). A client signs each request
-// over its method, authority, path, query, body digest, and selected headers,
-// so no credential is sent and a captured request cannot be replayed as a
-// different one.
+// HTTPSignatureConfig provides the configuration for authenticating requests by
+// HTTP message signature (RFC 9421). A client signs each request over its
+// method, authority, path, query, body digest, and selected headers, so no
+// credential is sent and a captured request cannot be replayed as a different
+// one.
 //
 // What a signature must cover is not configurable. This server requires a fixed
 // component set, because a signature declares its own covered components: a
 // verifier that accepted whatever a signature claimed to cover would accept one
 // covering nothing.
+type HTTPSignatureConfig struct {
+	// authority is the external authority clients sign, for a server behind a
+	// TLS-terminating proxy or load balancer that rewrites the Host header.
+	// Unset means the authority is taken from the connection, which is correct
+	// only when clients reach this server directly.
+	//
+	// The Forwarded and X-Forwarded-* fields are unsigned input and are never
+	// consulted. State the deployment fact here instead.
+	// +optional
+	Authority string `json:"authority,omitempty"`
+
+	// scheme is the external scheme clients sign, for the same case as
+	// authority. Unset means the scheme is taken from the connection.
+	// +optional
+	Scheme string `json:"scheme,omitempty"`
+
+	// authenticators resolve a signature's keyid to a verification key and an
+	// identity. They are attempted in the order given.
+	//
+	// authority and scheme are not repeated per authenticator: they describe how
+	// clients reach this one server, and they are consumed when a request's
+	// signatures are parsed, which happens once, before any authenticator has
+	// been selected.
+	// +required
+	// +listType=atomic
+	Authenticators []HTTPSignatureAuthenticator `json:"authenticators"`
+}
+
+// HTTPSignatureAuthenticator is one way of resolving a signature's keyid to a
+// verification key and an identity. Exactly one of endpoint or x509 is required.
 //
-// Keys are not configured here. This section names a resolver, which answers for
-// a key ID with the key that verifies signatures bearing it and the identity it
-// authenticates as, and which records the nonces those signatures carry. A
-// resolver's answer is a claim rather than a conclusion: this server validates
-// the identity on arrival and rejects a name or group under the "system:"
+// Neither states an identity in this file. endpoint names a resolver process,
+// which answers for a key ID with the key that verifies signatures bearing it
+// and the identity it authenticates as, and which records the nonces those
+// signatures carry. x509 takes both key and identity from a certificate the
+// request carries, which this authenticator's trust anchors have to validate.
+//
+// The difference is what the server depends on at request time. With endpoint it
+// depends on a resolver being reachable, and gets revocation and cross-server
+// replay protection from it. With x509 it depends on nothing beyond a
+// certificate authority bundle, and gets neither: a certificate's lifetime is
+// the withdrawal window, and nothing records nonces.
+//
+// Either way the identity is a claim rather than a conclusion. This server
+// validates it on arrival and rejects a name or group under the "system:"
 // prefix, which is reserved for identities Kubernetes issues.
 type HTTPSignatureAuthenticator struct {
+	// name identifies this authenticator in errors and in metrics. It never
+	// appears on the wire, and it is not what a signature's keyid names.
+	// Required to be unique across authenticators.
+	// +required
+	Name string `json:"name"`
+
 	// endpoint is the resolver's Unix domain socket, as unix:///path/to/socket,
 	// or unix://@name for a Linux abstract socket.
 	//
@@ -706,8 +750,17 @@ type HTTPSignatureAuthenticator struct {
 	// permissions decide who can vend an identity to this cluster. An abstract
 	// socket has no permissions at all and is bounded only by the network
 	// namespace.
-	// +required
-	Endpoint string `json:"endpoint"`
+	//
+	// Mutually exclusive with x509.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// x509 resolves the key and the identity from a certificate the request
+	// carries, rather than from a resolver.
+	//
+	// Mutually exclusive with endpoint.
+	// +optional
+	X509 *HTTPSignatureX509 `json:"x509,omitempty"`
 
 	// keyIDPrefixes narrows which key IDs this resolver is asked about. A key ID
 	// matches when the segment before its first "/" equals one of these entries.
@@ -718,6 +771,8 @@ type HTTPSignatureAuthenticator struct {
 	// resolver serves costs one call per resolver whose prefixes admit it, driven
 	// by a caller who has authenticated nothing. Stating prefixes reduces that to
 	// one call, or to none.
+	//
+	// Valid only with endpoint.
 	// +optional
 	// +listType=atomic
 	KeyIDPrefixes []string `json:"keyIDPrefixes,omitempty"`
@@ -746,22 +801,34 @@ type HTTPSignatureAuthenticator struct {
 	// Set it to Ignore only with the replay window below understood: it becomes
 	// maxAge plus tolerance, during which a captured request can be replayed against
 	// every API server, without limit. Nothing else detects that.
+	//
+	// Valid only with endpoint. A nonce record has to live somewhere every API
+	// server shares, and x509 has no resolver to hold one.
 	// +optional
 	NonceHandling NonceHandling `json:"nonceHandling,omitempty"`
 
 	// cache bounds what this server remembers of this resolver's answers. Unset
 	// means the default each field states.
+	//
+	// Valid only with endpoint. The certificate equivalent is x509's
+	// certificateCache, which is separate because it is keyed on a certificate
+	// rather than a key ID and is additionally bounded by the validated chain's
+	// remaining life.
 	// +optional
 	Cache *HTTPSignatureCache `json:"cache,omitempty"`
 
 	// maxAge bounds how old a signature may be, measured from its created
 	// parameter. Signatures without created are rejected. Unset means 5m.
 	//
-	// Replay is closed by the resolver recording nonces, not by this value. What
-	// this bounds is how stale a request may be, and therefore how long the
-	// resolver has to remember a nonce: it is told an expiry of created plus this
-	// value plus tolerance, and may forget the nonce after that. A resolver may
-	// narrow it, for itself or for one key; nothing widens it.
+	// With endpoint and the default nonce handling, replay is closed by the
+	// resolver recording nonces rather than by this value. What this bounds is how
+	// stale a request may be, and therefore how long the resolver has to remember
+	// a nonce: it is told an expiry of created plus this value plus tolerance, and
+	// may forget the nonce after that. A resolver may narrow it, for itself or for
+	// one key; nothing widens it.
+	//
+	// With x509, or with nonceHandling Ignore, nothing records nonces and this
+	// plus tolerance is the entire replay window.
 	// +optional
 	MaxAge *metav1.Duration `json:"maxAge,omitempty"`
 
@@ -771,20 +838,252 @@ type HTTPSignatureAuthenticator struct {
 	// +optional
 	Tolerance *metav1.Duration `json:"tolerance,omitempty"`
 
-	// authority is the external authority clients sign, for a server behind a
-	// TLS-terminating proxy or load balancer that rewrites the Host header.
-	// Unset means the authority is taken from the connection, which is correct
-	// only when clients reach this server directly.
+	// certificateValidationRules constrain which certificates this
+	// authenticator accepts, beyond chaining to its trust anchors. The rules are
+	// logically ANDed and must all return true.
 	//
-	// The Forwarded and X-Forwarded-* fields are unsigned input and are never
-	// consulted. State the deployment fact here instead.
+	// They run before claimMappings, so a mapping expression never sees a
+	// certificate no rule has vetted. This is deliberately the opposite order
+	// from the JWT authenticator, which maps first and compensates for it.
+	//
+	// Valid only with x509.
 	// +optional
-	Authority string `json:"authority,omitempty"`
+	// +listType=atomic
+	CertificateValidationRules []CertificateValidationRule `json:"certificateValidationRules,omitempty"`
 
-	// scheme is the external scheme clients sign, for the same case as
-	// authority. Unset means the scheme is taken from the connection.
+	// claimMappings derives the user attributes from the certificate.
+	//
+	// Required with x509 and invalid with endpoint, whose resolver states the
+	// identity with each answer. This is where the cluster decides what a
+	// certificate is allowed to mean, which matters because the identity now comes
+	// from an assertion rather than from this file.
 	// +optional
-	Scheme string `json:"scheme,omitempty"`
+	ClaimMappings *HTTPSignatureClaimMappings `json:"claimMappings,omitempty"`
+
+	// userValidationRules are rules applied to the mapped identity before
+	// authentication completes. The rules are logically ANDed and must all
+	// return true.
+	//
+	// These allow invariants to be applied to incoming identities, such as
+	// preventing use of the system: prefix that Kubernetes components use. What
+	// an assertion claims is a claim, not a conclusion, and this is the
+	// cluster's say over it.
+	//
+	// Valid only with x509.
+	// +optional
+	// +listType=atomic
+	UserValidationRules []UserValidationRule `json:"userValidationRules,omitempty"`
+}
+
+// HTTPSignatureX509 resolves a signature's verification key and identity from an
+// X.509 certificate the request carries in the Signature-Certificate header.
+//
+// This is mutual TLS with the handshake replaced by a message signature. The
+// same certificate authority, the same issuance, the same certificate tooling,
+// and the same subject conventions apply. Only the point of authentication moves
+// into the message, which is what lets it survive a TLS-terminating hop, and
+// what makes distribution and rotation the certificate machinery's problem
+// rather than this file's.
+//
+// The certificate is bound to the signature by the keyid, which must be
+// "x509-sha256:" followed by the lowercase hex SHA-256 digest of the leaf
+// certificate's DER encoding. A signature's parameters are always part of its
+// signature base, so a keyid naming the certificate binds the certificate
+// without relying on any header coverage rule. The header is covered as well,
+// which is belt and braces rather than the mechanism.
+//
+// Only the leaf is read from the request. Intermediates come from
+// certificateAuthority, so the work an unauthenticated caller can cause is one
+// parse and one chain build against a fixed pool.
+//
+// The signature algorithm is not configurable and is determined by the leaf's
+// key type: ed25519 for an Ed25519 key, ecdsa-p256-sha256 for P-256,
+// ecdsa-p384-sha384 for P-384, and rsa-pss-sha512 for RSA. One algorithm per key
+// type leaves nothing for an algorithm confusion attack to confuse, and it keeps
+// rsa-v1_5-sha256 unreachable.
+type HTTPSignatureX509 struct {
+	// certificateAuthority contains PEM-encoded certificate authority
+	// certificates that a presented certificate must chain to. A certificate
+	// authority is public trust material, so it is stated inline rather than
+	// referenced by path.
+	//
+	// Point this at a certificate authority issued for this purpose. Pointing
+	// it at the cluster's client certificate authority would give every
+	// certificate already issued for connection authentication the ability to
+	// sign detached messages that survive a proxy, which its issuer never
+	// agreed to and which nobody opted in to.
+	//
+	// Extended key usage is not checked, so this bundle being dedicated is a
+	// requirement rather than a recommendation. No registered usage means "may
+	// sign detached HTTP messages": requiring client authentication would make
+	// every certificate issued for connection authentication a signing credential,
+	// and requiring a distinct usage would mean new issuance for everyone. Both
+	// choices enlist the wrong population, so the bundle is what says who is
+	// enlisted.
+	//
+	// A worked example of getting this wrong: an operator puts their organization's
+	// general-purpose internal certificate authority here, because that is the
+	// authority they have. Every internal TLS server certificate that authority ever
+	// issued is now an API server identity, and if claimMappings derives from the
+	// subject then whoever can request a certificate chooses what that identity is.
+	//
+	// The key usage extension is checked, where present: a certificate without
+	// digitalSignature is refused, because that is the extension that answers
+	// whether the key may sign at all. A certificate authority certificate is
+	// refused as a leaf.
+	// +required
+	CertificateAuthority string `json:"certificateAuthority"`
+
+	// certificateCache holds the results of successful certificate validation,
+	// so a client's second request does not repeat the chain build and the
+	// expression evaluation its first one paid for.
+	// +optional
+	CertificateCache *HTTPSignatureCertificateCache `json:"certificateCache,omitempty"`
+}
+
+// HTTPSignatureCertificateCache bounds the memoization of certificate
+// validation.
+//
+// Only successful validations are cached. A negative cache would be keyed on
+// bytes a peer chooses, which is unbounded cardinality for anyone who can send a
+// request, and it would buy nothing: an untrusted certificate is rejected by one
+// chain build. Because entries are created only on success, occupying one
+// requires a certificate the configured authority actually issued.
+//
+// Caching the mapped identity, rather than only the verification key, is sound
+// because the mapping is a pure function of the certificate. The expression
+// environment declares no clock and no request, so no expression can produce a
+// different answer for the same certificate at a different time.
+type HTTPSignatureCertificateCache struct {
+	// maxEntries caps how many validated certificates are remembered. Unset
+	// means 1024. Eviction costs the evicted client one revalidation and
+	// nothing else.
+	// +optional
+	MaxEntries *int32 `json:"maxEntries,omitempty"`
+
+	// ttl bounds how long a validation is trusted, and is therefore the window
+	// in which withdrawing a certificate has no effect. Unset means 5m.
+	//
+	// The effective lifetime of an entry is the smallest of this, the time
+	// remaining on the leaf, and the time remaining on every certificate in the
+	// validated chain. Without the chain bound, a ttl longer than a trust
+	// anchor's remaining life would keep admitting requests past the anchor's
+	// expiry.
+	// +optional
+	TTL *metav1.Duration `json:"ttl,omitempty"`
+}
+
+// CertificateValidationRule provides the configuration for a single certificate
+// validation rule.
+type CertificateValidationRule struct {
+	// expression represents the expression which will be evaluated by CEL.
+	// Must produce a boolean, and must return true for the validation to pass.
+	//
+	// CEL expressions have access to the presented certificate, organized into
+	// CEL variable:
+	// - 'cert' - a kubernetes.Certificate object describing the leaf, with
+	//   fields: subject and issuer (each with commonName, organization, and
+	//   organizationalUnit), serialNumber, notBefore, notAfter, dnsSANs,
+	//   uriSANs, emailSANs, ipSANs, sha256Thumbprint, and extendedKeyUsages.
+	//
+	// Nothing else is in scope. There is no clock and no request, which is what
+	// makes a certificate's validation result cacheable.
+	//
+	// Test a multi-valued attribute with exists() and never by position. A
+	// multi-valued name attribute is encoded as an ASN.1 SET, whose members are
+	// canonically ordered by their encoding, so the order the issuer supplied is
+	// not the order read back:
+	//   cert.subject.organization.exists(o, o == 'system:nodes')
+	//
+	// A certificate's lifetime is expressed by subtracting its validity bounds.
+	// There is no dedicated field for it, because this is the general form:
+	//   cert.notAfter - cert.notBefore <= duration('24h')
+	//
+	// Documentation on CEL: https://kubernetes.io/docs/reference/using-api/cel/
+	// +required
+	Expression string `json:"expression"`
+
+	// message customizes the returned error message when expression returns
+	// false. message is a literal string.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// HTTPSignatureClaimMappings maps a certificate's attributes onto the user
+// attributes a request authenticates as.
+//
+// Mappings are expressions and never field references. A certificate is not a
+// map of names to values the way a token's claim set is, so there is no
+// equivalent of the JWT authenticator's claim form. The field name is kept for
+// the analogy with that authenticator, which is what a reader will look for.
+//
+// No prefix is applied to any mapped value. An administrator owns avoiding
+// collision with the names other authenticators issue, and an expression can
+// prepend a literal where a prefix is wanted. userValidationRules is where an
+// invariant such as refusing the system: prefix belongs.
+//
+// Three names are refused outright, because the server asserts them itself
+// according to what it decided and an authenticator claiming one would be stating a
+// falsehood: the groups system:authenticated and system:unauthenticated, which the
+// server adds according to whether authentication succeeded, and the username
+// system:anonymous, which the anonymous authenticator asserts about a request that
+// carried no credential.
+//
+// Everything else, including system:masters, is left to userValidationRules. State
+// a rule there unless the deployment means otherwise:
+//
+//	userValidationRules:
+//	- expression: '!user.username.startsWith("system:") && !user.groups.exists(g, g.startsWith("system:"))'
+//	  message: 'this authenticator may not assert an identity under the system: prefix'
+//
+// Read what a derivation gives away before omitting that rule. A mapping such as
+// 'cert.subject.organization' hands the choice of group to whoever can request a
+// certificate from the configured authority, so with a general-purpose authority in
+// the bundle a requester naming system:masters in their organization would receive
+// cluster administrator.
+//
+// Relaxing the rule is a deliberate decision rather than an oversight. Mapping a
+// node's certificate to system:node:<name> means the node authorizer and the
+// NodeRestriction admission plugin now trust this authenticator's trust anchors.
+type HTTPSignatureClaimMappings struct {
+	// username is the mapped user name. The expression must produce a non-empty
+	// string.
+	// +required
+	Username HTTPSignatureClaimExpression `json:"username"`
+
+	// groups are the mapped groups. The expression must produce a string or a
+	// list of strings. "", [], and null are treated as the mapping not being
+	// present. The authenticated group is added by the server and does not need
+	// to be produced here.
+	// +optional
+	Groups HTTPSignatureClaimExpression `json:"groups,omitempty"`
+
+	// uid is the mapped user UID. The expression must produce a string.
+	// +optional
+	UID HTTPSignatureClaimExpression `json:"uid,omitempty"`
+
+	// extra are mapped extra attributes. Each expression must produce a string
+	// or a list of strings; "", [], and null are treated as the mapping not
+	// being present.
+	// +optional
+	// +listType=atomic
+	Extra []ExtraMapping `json:"extra,omitempty"`
+}
+
+// HTTPSignatureClaimExpression is one CEL expression over the presented
+// certificate.
+//
+// It is a struct holding one field rather than a bare string so that this reads
+// the same as the JWT authenticator's equivalent, where the field is one of
+// several alternatives.
+type HTTPSignatureClaimExpression struct {
+	// expression represents the expression which will be evaluated by CEL
+	// against the 'cert' variable. See CertificateValidationRule.expression for
+	// what is in scope.
+	//
+	// Documentation on CEL: https://kubernetes.io/docs/reference/using-api/cel/
+	// +optional
+	Expression string `json:"expression,omitempty"`
 }
 
 // HTTPSignatureCache bounds what this server remembers of a resolver's answers.

@@ -1466,10 +1466,22 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		clientauthenticationv1.ExecCredential{}.OpenAPIModelName():                                                      schema_pkg_apis_clientauthentication_v1_ExecCredential(ref),
 		clientauthenticationv1.ExecCredentialSpec{}.OpenAPIModelName():                                                  schema_pkg_apis_clientauthentication_v1_ExecCredentialSpec(ref),
 		clientauthenticationv1.ExecCredentialStatus{}.OpenAPIModelName():                                                schema_pkg_apis_clientauthentication_v1_ExecCredentialStatus(ref),
+		clientauthenticationv1.HTTPSignatureCredential{}.OpenAPIModelName():                                             schema_pkg_apis_clientauthentication_v1_HTTPSignatureCredential(ref),
+		clientauthenticationv1.HTTPSignatureHeader{}.OpenAPIModelName():                                                 schema_pkg_apis_clientauthentication_v1_HTTPSignatureHeader(ref),
+		clientauthenticationv1.HTTPSignatureKeyDerivation{}.OpenAPIModelName():                                          schema_pkg_apis_clientauthentication_v1_HTTPSignatureKeyDerivation(ref),
+		clientauthenticationv1.HTTPSignatureKeyDerivationStep{}.OpenAPIModelName():                                      schema_pkg_apis_clientauthentication_v1_HTTPSignatureKeyDerivationStep(ref),
+		clientauthenticationv1.HTTPSignatureRequest{}.OpenAPIModelName():                                                schema_pkg_apis_clientauthentication_v1_HTTPSignatureRequest(ref),
+		clientauthenticationv1.HTTPSignatureStage{}.OpenAPIModelName():                                                  schema_pkg_apis_clientauthentication_v1_HTTPSignatureStage(ref),
 		clientauthenticationv1beta1.Cluster{}.OpenAPIModelName():                                                        schema_pkg_apis_clientauthentication_v1beta1_Cluster(ref),
 		clientauthenticationv1beta1.ExecCredential{}.OpenAPIModelName():                                                 schema_pkg_apis_clientauthentication_v1beta1_ExecCredential(ref),
 		clientauthenticationv1beta1.ExecCredentialSpec{}.OpenAPIModelName():                                             schema_pkg_apis_clientauthentication_v1beta1_ExecCredentialSpec(ref),
 		clientauthenticationv1beta1.ExecCredentialStatus{}.OpenAPIModelName():                                           schema_pkg_apis_clientauthentication_v1beta1_ExecCredentialStatus(ref),
+		clientauthenticationv1beta1.HTTPSignatureCredential{}.OpenAPIModelName():                                        schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureCredential(ref),
+		clientauthenticationv1beta1.HTTPSignatureHeader{}.OpenAPIModelName():                                            schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureHeader(ref),
+		clientauthenticationv1beta1.HTTPSignatureKeyDerivation{}.OpenAPIModelName():                                     schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureKeyDerivation(ref),
+		clientauthenticationv1beta1.HTTPSignatureKeyDerivationStep{}.OpenAPIModelName():                                 schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureKeyDerivationStep(ref),
+		clientauthenticationv1beta1.HTTPSignatureRequest{}.OpenAPIModelName():                                           schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureRequest(ref),
+		clientauthenticationv1beta1.HTTPSignatureStage{}.OpenAPIModelName():                                             schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureStage(ref),
 		configv1alpha1.CloudControllerManagerConfiguration{}.OpenAPIModelName():                                         schema_k8sio_cloud_provider_config_v1alpha1_CloudControllerManagerConfiguration(ref),
 		configv1alpha1.CloudProviderConfiguration{}.OpenAPIModelName():                                                  schema_k8sio_cloud_provider_config_v1alpha1_CloudProviderConfiguration(ref),
 		configv1alpha1.KubeCloudSharedConfiguration{}.OpenAPIModelName():                                                schema_k8sio_cloud_provider_config_v1alpha1_KubeCloudSharedConfiguration(ref),
@@ -70028,12 +70040,18 @@ func schema_pkg_apis_clientauthentication_v1_ExecCredentialSpec(ref common.Refer
 							Format:      "",
 						},
 					},
+					"httpSignature": {
+						SchemaProps: spec.SchemaProps{
+							Description: "HTTPSignature is the client's signing configuration, set when the client is configured to authenticate by signing requests rather than by sending a credential. A plugin that does not understand it must not return an HTTPSignature credential.",
+							Ref:         ref(clientauthenticationv1.HTTPSignatureRequest{}.OpenAPIModelName()),
+						},
+					},
 				},
 				Required: []string{"interactive"},
 			},
 		},
 		Dependencies: []string{
-			clientauthenticationv1.Cluster{}.OpenAPIModelName()},
+			clientauthenticationv1.Cluster{}.OpenAPIModelName(), clientauthenticationv1.HTTPSignatureRequest{}.OpenAPIModelName()},
 	}
 }
 
@@ -70071,11 +70089,287 @@ func schema_pkg_apis_clientauthentication_v1_ExecCredentialStatus(ref common.Ref
 							Format:      "",
 						},
 					},
+					"httpSignature": {
+						SchemaProps: spec.SchemaProps{
+							Description: "HTTPSignature is key material for signing each request, returned instead of a token or a client certificate. A status may carry a signature or a credential that transits, never both.",
+							Ref:         ref(clientauthenticationv1.HTTPSignatureCredential{}.OpenAPIModelName()),
+						},
+					},
 				},
 			},
 		},
 		Dependencies: []string{
-			metav1.Time{}.OpenAPIModelName()},
+			metav1.Time{}.OpenAPIModelName(), clientauthenticationv1.HTTPSignatureCredential{}.OpenAPIModelName()},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1_HTTPSignatureCredential(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureCredential is key material for signing requests, returned by a plugin instead of a token or a client certificate. The signature covers each request, so this material is used locally and never sent to the server.\n\nSecret, SecretBase64, and PrivateKey are sensitive. A shared secret means the server holds a copy that can produce signatures indistinguishable from this client's; asymmetric keys have no such property.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"keyID": {
+						SchemaProps: spec.SchemaProps{
+							Description: "KeyID is the name the server knows this key by. For a derived key it is the name alone, without the scope segments the signature adds.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"secret": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Secret is a shared secret for hmac-sha256, as a UTF-8 string. Exactly one of Secret, SecretBase64, or PrivateKey is set.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"secretBase64": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SecretBase64 is a shared secret as base64. An intermediate rung of a derivation ladder is raw hash output rather than text, so it travels this way.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"privateKey": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PrivateKey is a PEM-encoded private key, for the asymmetric algorithms.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"stage": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Stage is this material's position on the derivation ladder. Absent means the material is the root secret and the whole ladder is folded at signing time. Set means it is an intermediate rung, which bounds what the holder can sign for.",
+							Ref:         ref(clientauthenticationv1.HTTPSignatureStage{}.OpenAPIModelName()),
+						},
+					},
+					"signedHeaders": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SignedHeaders are values for the headers the client covers, keyed by header name. This is what lets a rotating session token stay out of the kubeconfig and rotate without one.",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Type:   []string{"string"},
+										Format: "",
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"keyID"},
+			},
+		},
+		Dependencies: []string{
+			clientauthenticationv1.HTTPSignatureStage{}.OpenAPIModelName()},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1_HTTPSignatureHeader(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureHeader names a header covered by the signature.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name is the header name.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"name"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1_HTTPSignatureKeyDerivation(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureKeyDerivation is a key derivation ladder: a chain of HMAC steps that turns a root secret into a signing key scoped to a purpose and, with a date step, to a day. A ladder is not a secret and not specific to one party.\n\nThe transport passes the ladder from its configuration to the plugin, because a plugin that hands back an intermediate rung has to derive that rung, and it cannot do so without knowing the chain.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind discriminates the derivation form. Only \"hmac-ladder\" is defined.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"hash": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Hash is the HMAC hash used to derive: \"sha-256\" or \"sha-512\". The signature algorithm is always hmac-sha256; this governs derivation only.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"secretPrefix": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SecretPrefix is prepended to the root secret before the first step. It applies only when the material is the root secret, never to an intermediate rung.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"steps": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Steps are the rungs, applied in order. Each step's input is fed to HMAC keyed by the previous step's output, and the last output is the signing key.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Ref: ref(clientauthenticationv1.HTTPSignatureKeyDerivationStep{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"kind", "steps"},
+			},
+		},
+		Dependencies: []string{
+			clientauthenticationv1.HTTPSignatureKeyDerivationStep{}.OpenAPIModelName()},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1_HTTPSignatureKeyDerivationStep(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureKeyDerivationStep is one rung of a ladder. Exactly one of Literal, Scope, or Date supplies the step's input.\n\nStep names are arbitrary labels chosen by whoever writes the ladder. Nothing in the implementation treats a name, a prefix, or a literal as meaningful.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name identifies the step. Names are unique within a ladder and key the scope map each party supplies. A name may not contain \"/\", because step values are joined by slashes into the key ID a signature carries.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"literal": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Literal is a fixed input value, the same for every party.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"scope": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Scope marks the input as a deployment-scoped value, such as a cell or a purpose name, supplied by each party's stage.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"date": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Date names a date format from a closed set: \"YYYYMMDD\" or \"YYYY-MM-DD\". The input is the signature's created timestamp rendered in UTC, so the signer and the verifier render the same value without consulting their own clocks.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"name"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1_HTTPSignatureRequest(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureRequest tells a plugin what a signing credential has to satisfy. It is the part of the client's signing configuration a plugin needs in order to produce a usable credential, and nothing in it is secret.\n\nWithout it a plugin has to guess the covered header set, and a credential that omits a value for a header the client covers is rejected before any request is sent.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"algorithm": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Algorithm is the signing algorithm the client is configured for, named as in the IANA \"HTTP Signature Algorithms\" registry. It tells the plugin which kind of key material to return.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"keyDerivation": {
+						SchemaProps: spec.SchemaProps{
+							Description: "KeyDerivation is the ladder the client derives through, when it derives. A plugin returning an intermediate rung derives through this same ladder; a plugin returning the root secret can ignore it.",
+							Ref:         ref(clientauthenticationv1.HTTPSignatureKeyDerivation{}.OpenAPIModelName()),
+						},
+					},
+					"signedHeaders": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "SignedHeaders are the names of headers the client covers with the signature. The plugin has to return a value for every one of them.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Ref: ref(clientauthenticationv1.HTTPSignatureHeader{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"algorithm"},
+			},
+		},
+		Dependencies: []string{
+			clientauthenticationv1.HTTPSignatureHeader{}.OpenAPIModelName(), clientauthenticationv1.HTTPSignatureKeyDerivation{}.OpenAPIModelName()},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1_HTTPSignatureStage(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureStage is a position on a derivation ladder.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"from": {
+						SchemaProps: spec.SchemaProps{
+							Description: "From names the ladder step whose output the material is. Empty means the material is the root secret.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"scope": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Scope holds values for the ladder's scope steps, and assertions for the date steps at or before From. It has to cover exactly those; a missing key and an unexpected key are both errors.",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Type:   []string{"string"},
+										Format: "",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 }
 
@@ -70212,12 +70506,18 @@ func schema_pkg_apis_clientauthentication_v1beta1_ExecCredentialSpec(ref common.
 							Format:      "",
 						},
 					},
+					"httpSignature": {
+						SchemaProps: spec.SchemaProps{
+							Description: "HTTPSignature is the client's signing configuration, set when the client is configured to authenticate by signing requests rather than by sending a credential. A plugin that does not understand it must not return an HTTPSignature credential.",
+							Ref:         ref(clientauthenticationv1beta1.HTTPSignatureRequest{}.OpenAPIModelName()),
+						},
+					},
 				},
 				Required: []string{"interactive"},
 			},
 		},
 		Dependencies: []string{
-			clientauthenticationv1beta1.Cluster{}.OpenAPIModelName()},
+			clientauthenticationv1beta1.Cluster{}.OpenAPIModelName(), clientauthenticationv1beta1.HTTPSignatureRequest{}.OpenAPIModelName()},
 	}
 }
 
@@ -70255,11 +70555,287 @@ func schema_pkg_apis_clientauthentication_v1beta1_ExecCredentialStatus(ref commo
 							Format:      "",
 						},
 					},
+					"httpSignature": {
+						SchemaProps: spec.SchemaProps{
+							Description: "HTTPSignature is key material for signing each request, returned instead of a token or a client certificate. A status may carry a signature or a credential that transits, never both.",
+							Ref:         ref(clientauthenticationv1beta1.HTTPSignatureCredential{}.OpenAPIModelName()),
+						},
+					},
 				},
 			},
 		},
 		Dependencies: []string{
-			metav1.Time{}.OpenAPIModelName()},
+			metav1.Time{}.OpenAPIModelName(), clientauthenticationv1beta1.HTTPSignatureCredential{}.OpenAPIModelName()},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureCredential(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureCredential is key material for signing requests, returned by a plugin instead of a token or a client certificate. The signature covers each request, so this material is used locally and never sent to the server.\n\nSecret, SecretBase64, and PrivateKey are sensitive. A shared secret means the server holds a copy that can produce signatures indistinguishable from this client's; asymmetric keys have no such property.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"keyID": {
+						SchemaProps: spec.SchemaProps{
+							Description: "KeyID is the name the server knows this key by. For a derived key it is the name alone, without the scope segments the signature adds.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"secret": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Secret is a shared secret for hmac-sha256, as a UTF-8 string. Exactly one of Secret, SecretBase64, or PrivateKey is set.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"secretBase64": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SecretBase64 is a shared secret as base64. An intermediate rung of a derivation ladder is raw hash output rather than text, so it travels this way.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"privateKey": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PrivateKey is a PEM-encoded private key, for the asymmetric algorithms.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"stage": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Stage is this material's position on the derivation ladder. Absent means the material is the root secret and the whole ladder is folded at signing time. Set means it is an intermediate rung, which bounds what the holder can sign for.",
+							Ref:         ref(clientauthenticationv1beta1.HTTPSignatureStage{}.OpenAPIModelName()),
+						},
+					},
+					"signedHeaders": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SignedHeaders are values for the headers the client covers, keyed by header name. This is what lets a rotating session token stay out of the kubeconfig and rotate without one.",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Type:   []string{"string"},
+										Format: "",
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"keyID"},
+			},
+		},
+		Dependencies: []string{
+			clientauthenticationv1beta1.HTTPSignatureStage{}.OpenAPIModelName()},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureHeader(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureHeader names a header covered by the signature.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name is the header name.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"name"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureKeyDerivation(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureKeyDerivation is a key derivation ladder: a chain of HMAC steps that turns a root secret into a signing key scoped to a purpose and, with a date step, to a day. A ladder is not a secret and not specific to one party.\n\nThe transport passes the ladder from its configuration to the plugin, because a plugin that hands back an intermediate rung has to derive that rung, and it cannot do so without knowing the chain.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind discriminates the derivation form. Only \"hmac-ladder\" is defined.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"hash": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Hash is the HMAC hash used to derive: \"sha-256\" or \"sha-512\". The signature algorithm is always hmac-sha256; this governs derivation only.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"secretPrefix": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SecretPrefix is prepended to the root secret before the first step. It applies only when the material is the root secret, never to an intermediate rung.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"steps": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Steps are the rungs, applied in order. Each step's input is fed to HMAC keyed by the previous step's output, and the last output is the signing key.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Ref: ref(clientauthenticationv1beta1.HTTPSignatureKeyDerivationStep{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"kind", "steps"},
+			},
+		},
+		Dependencies: []string{
+			clientauthenticationv1beta1.HTTPSignatureKeyDerivationStep{}.OpenAPIModelName()},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureKeyDerivationStep(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureKeyDerivationStep is one rung of a ladder. Exactly one of Literal, Scope, or Date supplies the step's input.\n\nStep names are arbitrary labels chosen by whoever writes the ladder. Nothing in the implementation treats a name, a prefix, or a literal as meaningful.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name identifies the step. Names are unique within a ladder and key the scope map each party supplies. A name may not contain \"/\", because step values are joined by slashes into the key ID a signature carries.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"literal": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Literal is a fixed input value, the same for every party.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"scope": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Scope marks the input as a deployment-scoped value, such as a cell or a purpose name, supplied by each party's stage.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"date": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Date names a date format from a closed set: \"YYYYMMDD\" or \"YYYY-MM-DD\". The input is the signature's created timestamp rendered in UTC, so the signer and the verifier render the same value without consulting their own clocks.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"name"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureRequest(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureRequest tells a plugin what a signing credential has to satisfy. It is the part of the client's signing configuration a plugin needs in order to produce a usable credential, and nothing in it is secret.\n\nWithout it a plugin has to guess the covered header set, and a credential that omits a value for a header the client covers is rejected before any request is sent.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"algorithm": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Algorithm is the signing algorithm the client is configured for, named as in the IANA \"HTTP Signature Algorithms\" registry. It tells the plugin which kind of key material to return.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"keyDerivation": {
+						SchemaProps: spec.SchemaProps{
+							Description: "KeyDerivation is the ladder the client derives through, when it derives. A plugin returning an intermediate rung derives through this same ladder; a plugin returning the root secret can ignore it.",
+							Ref:         ref(clientauthenticationv1beta1.HTTPSignatureKeyDerivation{}.OpenAPIModelName()),
+						},
+					},
+					"signedHeaders": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "SignedHeaders are the names of headers the client covers with the signature. The plugin has to return a value for every one of them.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Ref: ref(clientauthenticationv1beta1.HTTPSignatureHeader{}.OpenAPIModelName()),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"algorithm"},
+			},
+		},
+		Dependencies: []string{
+			clientauthenticationv1beta1.HTTPSignatureHeader{}.OpenAPIModelName(), clientauthenticationv1beta1.HTTPSignatureKeyDerivation{}.OpenAPIModelName()},
+	}
+}
+
+func schema_pkg_apis_clientauthentication_v1beta1_HTTPSignatureStage(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "HTTPSignatureStage is a position on a derivation ladder.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"from": {
+						SchemaProps: spec.SchemaProps{
+							Description: "From names the ladder step whose output the material is. Empty means the material is the root secret.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"scope": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Scope holds values for the ladder's scope steps, and assertions for the date steps at or before From. It has to cover exactly those; a missing key and an unexpected key are both errors.",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Type:   []string{"string"},
+										Format: "",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 }
 

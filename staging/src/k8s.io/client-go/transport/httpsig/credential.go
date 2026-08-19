@@ -121,6 +121,16 @@ type Credential struct {
 	// keyed by header name.
 	SignedHeaders map[string]string
 
+	// Certificate is the DER encoding of the leaf certificate that vouches for
+	// the signer's key, for a credential whose identity is asserted by a
+	// certificate rather than named by a configured key. Empty otherwise.
+	//
+	// When set, the round tripper carries it in the Signature-Certificate header
+	// and KeyID names its digest. It is not part of SignedHeaders because its
+	// header name is not configurable, and a value that could be configured
+	// could be configured wrongly.
+	Certificate []byte
+
 	// NotAfter is when this credential stops being usable, or the zero time if
 	// it does not expire on its own. The caller fails closed rather than
 	// signing with an expired credential and letting the server reject it.
@@ -157,9 +167,15 @@ type fileWatcher struct {
 	modTime time.Time
 	size    int64
 	loaded  bool
+	// data is the bytes of the last read, retained so that contents can answer
+	// with them when nothing has changed. A caller reading a pair of files needs
+	// the unchanged half's bytes when the other half moves, and re-reading it
+	// would be a second read of a file this watcher has already read.
+	data []byte
 }
 
-// contents returns the file's bytes and whether they differ from the last read.
+// contents returns the file's current bytes and whether they differ from the
+// last read.
 func (w *fileWatcher) contents() (data []byte, changed bool, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -169,13 +185,13 @@ func (w *fileWatcher) contents() (data []byte, changed bool, err error) {
 		return nil, false, fmt.Errorf("httpsig: %w", err)
 	}
 	if w.loaded && info.ModTime().Equal(w.modTime) && info.Size() == w.size {
-		return nil, false, nil
+		return w.data, false, nil
 	}
 	data, err = os.ReadFile(w.path)
 	if err != nil {
 		return nil, false, fmt.Errorf("httpsig: %w", err)
 	}
-	w.modTime, w.size, w.loaded = info.ModTime(), info.Size(), true
+	w.modTime, w.size, w.loaded, w.data = info.ModTime(), info.Size(), true, data
 	return data, true, nil
 }
 

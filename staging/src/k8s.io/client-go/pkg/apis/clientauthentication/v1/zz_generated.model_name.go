@@ -40,3 +40,33 @@ func (in ExecCredentialSpec) OpenAPIModelName() string {
 func (in ExecCredentialStatus) OpenAPIModelName() string {
 	return "io.k8s.client-go.pkg.apis.clientauthentication.v1.ExecCredentialStatus"
 }
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HTTPSignatureCredential) OpenAPIModelName() string {
+	return "io.k8s.client-go.pkg.apis.clientauthentication.v1.HTTPSignatureCredential"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HTTPSignatureHeader) OpenAPIModelName() string {
+	return "io.k8s.client-go.pkg.apis.clientauthentication.v1.HTTPSignatureHeader"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HTTPSignatureKeyDerivation) OpenAPIModelName() string {
+	return "io.k8s.client-go.pkg.apis.clientauthentication.v1.HTTPSignatureKeyDerivation"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HTTPSignatureKeyDerivationStep) OpenAPIModelName() string {
+	return "io.k8s.client-go.pkg.apis.clientauthentication.v1.HTTPSignatureKeyDerivationStep"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HTTPSignatureRequest) OpenAPIModelName() string {
+	return "io.k8s.client-go.pkg.apis.clientauthentication.v1.HTTPSignatureRequest"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in HTTPSignatureStage) OpenAPIModelName() string {
+	return "io.k8s.client-go.pkg.apis.clientauthentication.v1.HTTPSignatureStage"
+}

@@ -65,11 +65,17 @@ const nonceBytes = 16
 type Config struct {
 	// Algorithm is the signing algorithm, named as in the IANA "HTTP
 	// Signature Algorithms" registry.
+	//
+	// Required, except with CertFile or CredentialBundleFile, where it must be
+	// empty: a certificate's key type determines the algorithm, and stating a
+	// second copy of a value with one correct answer is a place for the two to
+	// disagree. See CertificateAlgorithm.
 	Algorithm string
 
 	// KeyID is the name the server knows the key by. It is set only with
 	// KeyFile; with CredentialFile the key ID rotates with the key and comes
-	// from the credential.
+	// from the credential, and with a certificate it is derived from the
+	// certificate.
 	KeyID string
 
 	// Credential is signing material held in memory, for a caller that already
@@ -85,6 +91,27 @@ type Config struct {
 	// sidecar produces.
 	KeyFile        string
 	CredentialFile string
+
+	// CertFile is a PEM-encoded certificate whose key is in KeyFile, for a
+	// client whose identity is asserted by a certificate rather than named by a
+	// configured key. The key ID and the algorithm are derived from it, and its
+	// notAfter becomes the credential's expiry, so this client refuses to sign
+	// with an expired certificate.
+	//
+	// Both files are re-read when either changes, and a key that does not match
+	// the certificate is rejected rather than used, because that is what reading
+	// two separately-written files mid-rotation produces. CredentialBundleFile
+	// avoids that case entirely.
+	CertFile string
+
+	// CredentialBundleFile is one PEM document whose first block is a private
+	// key and whose remaining blocks are the issued certificate chain, leaf
+	// first. This is what a PodCertificateProjection writes.
+	//
+	// Prefer it to CertFile and KeyFile wherever it is available: one read
+	// returns a consistent key and certificate, where two files can be read
+	// between the two writes of a rotation.
+	CredentialBundleFile string
 
 	// KeyDerivation is a key derivation ladder (see DerivationFrom): the signing
 	// key is derived from the credential's secret through the ladder rather than
@@ -129,10 +156,6 @@ func NewRoundTripper(cfg Config, base http.RoundTripper) (http.RoundTripper, err
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	if cfg.Algorithm == "" {
-		return nil, fmt.Errorf("httpsig: algorithm is required")
-	}
-	alg := httpsig.Algorithm(cfg.Algorithm)
 
 	rt := &roundTripper{base: base, ttl: cfg.TTL, maxBody: cfg.MaxBodyBytes}
 	if rt.maxBody == 0 {
@@ -155,6 +178,49 @@ func NewRoundTripper(cfg Config, base http.RoundTripper) (http.RoundTripper, err
 		rt.extraHeaderNames = append(rt.extraHeaderNames, name)
 	}
 
+	sources := 0
+	for _, set := range []bool{
+		cfg.Credential != nil,
+		cfg.KeyFile != "",
+		cfg.CredentialFile != "",
+		cfg.CertFile != "",
+		cfg.CredentialBundleFile != "",
+	} {
+		if set {
+			sources++
+		}
+	}
+	// A certificate is asserted rather than configured, so these forms share a
+	// set of rules that do not apply to the others: no algorithm, no key ID, and
+	// no derivation.
+	assertsCertificate := cfg.CertFile != "" || cfg.CredentialBundleFile != ""
+	if assertsCertificate {
+		// CertFile and KeyFile are one source together, so the count above has
+		// to forgive the pair.
+		if cfg.CertFile != "" && cfg.KeyFile != "" {
+			sources--
+		}
+		if cfg.CertFile != "" && cfg.KeyFile == "" {
+			return nil, fmt.Errorf("httpsig: keyFile is required with certFile, because a certificate carries no private key")
+		}
+		if cfg.Algorithm != "" {
+			return nil, fmt.Errorf("httpsig: algorithm must not be set with certFile or credentialBundleFile: "+
+				"a certificate's key type determines the algorithm, and this one would be %s", cfg.Algorithm)
+		}
+		if cfg.KeyID != "" {
+			return nil, fmt.Errorf("httpsig: keyID must not be set with certFile or credentialBundleFile, because it names the certificate's digest")
+		}
+		if cfg.KeyDerivation != nil {
+			return nil, fmt.Errorf("httpsig: keyDerivation applies to hmac-sha256 only, and a certificate carries its own key")
+		}
+		if len(cfg.SignedHeaders) > 0 {
+			return nil, fmt.Errorf("httpsig: signed header values come from a credential, so signedHeaders requires credentialFile rather than a certificate")
+		}
+	} else if cfg.Algorithm == "" {
+		return nil, fmt.Errorf("httpsig: algorithm is required")
+	}
+	alg := httpsig.Algorithm(cfg.Algorithm)
+
 	// A ladder describes a derivation, and every path below that can derive
 	// needs it, so it is resolved once here.
 	ladder := cfg.KeyDerivation
@@ -165,18 +231,13 @@ func NewRoundTripper(cfg Config, base http.RoundTripper) (http.RoundTripper, err
 		// The digest is the drift check: the verifier logs the same value for
 		// its copy, and a mismatch is otherwise a bare signature failure with
 		// nothing to say why.
-		klog.V(2).InfoS("Using key derivation ladder", "sha256", CanonicalDigest(*ladder))
+		klog.Background().V(2).Info("Using key derivation ladder", "sha256", CanonicalDigest(*ladder))
 	}
 
-	sources := 0
-	for _, set := range []bool{cfg.Credential != nil, cfg.KeyFile != "", cfg.CredentialFile != ""} {
-		if set {
-			sources++
-		}
-	}
 	switch {
 	case sources != 1:
-		return nil, fmt.Errorf("httpsig: exactly one of credential, keyFile, or credentialFile is required; a credential that arrives some other way needs NewRoundTripperWithSource")
+		return nil, fmt.Errorf("httpsig: exactly one of credential, keyFile, credentialFile, certFile with keyFile, or credentialBundleFile is required; " +
+			"a credential that arrives some other way needs NewRoundTripperWithSource")
 
 	case cfg.Credential != nil:
 		// Held in memory and never re-read, so it is validated here and then
@@ -186,6 +247,17 @@ func NewRoundTripper(cfg Config, base http.RoundTripper) (http.RoundTripper, err
 			return nil, err
 		}
 		rt.source = &staticSource{bound: bound}
+
+	case cfg.CredentialBundleFile != "":
+		// One document holds both, so there is one watcher and no second file to
+		// be out of step with.
+		rt.source = &certificateFileSource{certWatcher: &fileWatcher{path: cfg.CredentialBundleFile}}
+
+	case cfg.CertFile != "":
+		rt.source = &certificateFileSource{
+			certWatcher: &fileWatcher{path: cfg.CertFile},
+			keyWatcher:  &fileWatcher{path: cfg.KeyFile},
+		}
 
 	case cfg.KeyFile != "":
 		// A key file carries no key ID, no header values, and no expiry, so it
@@ -283,9 +355,17 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	for _, name := range rt.extraHeaderNames {
 		value, ok := lookupHeader(cred.SignedHeaders, name)
 		if !ok {
-			return nil, fmt.Errorf("httpsig: the credential has no value for signed header %q", name)
+			return nil, fmt.Errorf("httpsig: the credential source returned no value for signed header %q", name)
 		}
 		clone.Header.Set(name, value)
+	}
+	// The certificate the server resolves the identity from. It is set here
+	// rather than being one of the configured signed headers because its name is
+	// fixed: a verifier has to read the assertion from a place a signature cannot
+	// relocate. Setting it before Components runs is what gets it covered, since
+	// it is a protected header and coverage is conditional on presence.
+	if len(cred.Certificate) > 0 {
+		clone.Header.Set(CertificateHeader, CertificateHeaderValue(cred.Certificate))
 	}
 
 	body, err := rt.readBody(req)
@@ -472,8 +552,8 @@ func (c *Config) String() string {
 		// reader compares against the server's anyway.
 		derivation = CanonicalDigest(*c.KeyDerivation)
 	}
-	return fmt.Sprintf("httpsig.Config{Algorithm: %q, KeyID: %q, Credential: %s, KeyFile: %q, CredentialFile: %q, KeyDerivation: %s, SignedHeaders: [%s], TTL: %s, MaxBodyBytes: %d}",
-		c.Algorithm, c.KeyID, credential, c.KeyFile, c.CredentialFile, derivation, strings.Join(names, ", "), c.TTL, c.MaxBodyBytes)
+	return fmt.Sprintf("httpsig.Config{Algorithm: %q, KeyID: %q, Credential: %s, KeyFile: %q, CertFile: %q, CredentialFile: %q, CredentialBundleFile: %q, KeyDerivation: %s, SignedHeaders: [%s], TTL: %s, MaxBodyBytes: %d}",
+		c.Algorithm, c.KeyID, credential, c.KeyFile, c.CertFile, c.CredentialFile, c.CredentialBundleFile, derivation, strings.Join(names, ", "), c.TTL, c.MaxBodyBytes)
 }
 
 // canonicalHeaderName lowercases a header name. Signature components use

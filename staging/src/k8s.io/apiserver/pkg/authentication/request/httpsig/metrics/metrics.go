@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package metrics instruments the API server's calls to an HTTP signature key
-// resolver.
+// Package metrics instruments HTTP message signature authentication: the API
+// server's calls to a key resolver, and the fate of the signatures themselves.
 //
-// Every metric here is labeled by resolver, because a deployment can configure
-// several and an aggregate that mixes them cannot answer the only question worth
-// asking during an incident, which is which one is broken.
+// Every metric here is labeled by the authenticator or resolver it describes,
+// because a deployment can configure several and an aggregate that mixes them
+// cannot answer the only question worth asking during an incident, which is which
+// one is broken.
 package metrics
 
 import (
@@ -46,6 +47,36 @@ const (
 	CacheResultHit         = "hit"
 	CacheResultMiss        = "miss"
 	CacheResultNegativeHit = "negative_hit"
+)
+
+// Signature outcomes say which check decided a signature. They are what
+// distinguishes an attack from a misconfiguration: a rise in UncoveredHeader and a
+// rise in BadSignature call for different investigations, and a single failure
+// total would hide the difference.
+//
+// The set is deliberately coarse and closed. It says which check refused a
+// signature, never which key, which certificate, or which user, so no label
+// carries a value a peer chooses.
+const (
+	OutcomeAuthenticated = "authenticated"
+	// OutcomeUnresolved means the authenticator could not produce a verifier: an
+	// unknown keyID, a resolver that does not serve it or could not be reached, a
+	// missing or malformed certificate header, or a keyID naming a different
+	// certificate than the one carried.
+	OutcomeUnresolved = "unresolved"
+	// OutcomeBadSignature means the signature did not verify, or violated the
+	// coverage, age, or algorithm policy.
+	OutcomeBadSignature = "bad_signature"
+	// OutcomeUncoveredHeader means a protected header was present but not covered,
+	// which is the header injection case.
+	OutcomeUncoveredHeader = "uncovered_header"
+	OutcomeBadDigest       = "bad_digest"
+	// OutcomeRejectedIdentity means the signature was good but the identity was
+	// refused: a certificate did not chain, a certificate rule failed, a mapping
+	// failed, a user rule failed, or a resolver refused the nonce as a replay.
+	// Distinct from BadSignature because it means a legitimate key holder was
+	// turned away, which is a configuration question rather than an attack.
+	OutcomeRejectedIdentity = "rejected_identity"
 )
 
 var (
@@ -125,6 +156,33 @@ var (
 		[]string{"resolver"},
 	)
 
+	// signatureOutcomeTotal counts signatures by which check decided them.
+	signatureOutcomeTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Namespace:      namespace,
+			Subsystem:      subsystem,
+			Name:           "signature_outcomes_total",
+			Help:           "Number of HTTP message signatures processed, by authenticator and outcome.",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"authenticator", "outcome"},
+	)
+
+	// certificateCacheLookupTotal is what says whether the validation cache is
+	// doing anything. A miss rate near one means every request is paying for a
+	// chain build and an expression evaluation, which is the case the cache exists
+	// to remove and the case a too-small maxEntries produces.
+	certificateCacheLookupTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Namespace:      namespace,
+			Subsystem:      subsystem,
+			Name:           "certificate_validation_cache_lookups_total",
+			Help:           "Number of certificate validation cache lookups, by authenticator and result.",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"authenticator", "result"},
+	)
+
 	registerOnce sync.Once
 )
 
@@ -137,6 +195,8 @@ func RegisterMetrics() {
 		legacyregistry.MustRegister(keyCacheLookupTotal)
 		legacyregistry.MustRegister(keyDerivationInfo)
 		legacyregistry.MustRegister(nonceHandling)
+		legacyregistry.MustRegister(signatureOutcomeTotal)
+		legacyregistry.MustRegister(certificateCacheLookupTotal)
 	})
 }
 
@@ -174,6 +234,21 @@ func RecordKeyDerivation(resolver, digest string) {
 	keyDerivationInfo.WithLabelValues(resolver, digest).Set(1)
 }
 
+// RecordOutcome notes which check decided a signature, one of the Outcome
+// constants.
+func RecordOutcome(authenticator, outcome string) {
+	signatureOutcomeTotal.WithLabelValues(authenticator, outcome).Inc()
+}
+
+// RecordCertificateCacheLookup notes a certificate validation cache lookup.
+func RecordCertificateCacheLookup(authenticator string, hit bool) {
+	result := CacheResultMiss
+	if hit {
+		result = CacheResultHit
+	}
+	certificateCacheLookupTotal.WithLabelValues(authenticator, result).Inc()
+}
+
 // ResetForTest clears every metric. It exists for tests and is not called from
 // production code.
 func ResetForTest() {
@@ -183,6 +258,8 @@ func ResetForTest() {
 	keyCacheLookupTotal.Reset()
 	keyDerivationInfo.Reset()
 	nonceHandling.Reset()
+	signatureOutcomeTotal.Reset()
+	certificateCacheLookupTotal.Reset()
 }
 
 // OutboundRequestInterceptor records the outcome and latency of every resolver

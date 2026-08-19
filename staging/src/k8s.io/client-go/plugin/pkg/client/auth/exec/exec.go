@@ -348,14 +348,31 @@ type credentials struct {
 // UpdateTransportConfig updates the transport.Config to use credentials
 // returned by the plugin.
 func (a *Authenticator) UpdateTransportConfig(c *transport.Config) error {
-	// If a bearer token is present in the request - avoid the GetCert callback when
-	// setting up the transport, as that triggers the exec action if the server is
-	// also configured to allow client certificates for authentication. For requests
-	// like "kubectl get --token (token) pods" we should assume the intention is to
-	// use the provided token for authentication. The same can be said for when the
-	// user specifies basic auth or cert auth.
-	if c.HasTokenAuth() || c.HasBasicAuth() || c.HasCertAuth() {
-		return nil
+	// A client configured to sign is configured to sign. The precedence rules
+	// below exist so that a credential stated on the command line wins over an
+	// exec plugin, which is a choice between two credentials that transit; a
+	// signature is not one of those, and silently not installing the signer would
+	// authenticate the request as something else with nothing said about it.
+	//
+	// The conflicting cases are refused rather than ranked, by
+	// rest.Config.validateHTTPSignatureExclusive and by clientcmd validation, so
+	// reaching here with signing configured means there is nothing to rank.
+	if a.signing == nil {
+		// If a bearer token is present in the request - avoid the GetCert callback when
+		// setting up the transport, as that triggers the exec action if the server is
+		// also configured to allow client certificates for authentication. For requests
+		// like "kubectl get --token (token) pods" we should assume the intention is to
+		// use the provided token for authentication. The same can be said for when the
+		// user specifies basic auth or cert auth.
+		if c.HasTokenAuth() || c.HasBasicAuth() || c.HasCertAuth() {
+			return nil
+		}
+	} else if c.HasCertAuth() {
+		// Not reachable through clientcmd or rest.Config, both of which refuse the
+		// combination. Refused here too rather than trusted to be unreachable,
+		// because the failure mode is silent authentication as the wrong identity.
+		return fmt.Errorf("exec plugin is configured to sign requests, but the client also has a client certificate; " +
+			"to sign with that certificate set httpSignature.certFile and httpSignature.keyFile instead")
 	}
 
 	if a.signing != nil {
@@ -565,14 +582,42 @@ func (a *Authenticator) refreshCredsLocked() error {
 	// server to authenticate whichever its authenticator chain reached first, so
 	// the identity would depend on server ordering rather than on this
 	// configuration.
-	if cred.Status.HTTPSignature != nil && (cred.Status.Token != "" || cred.Status.ClientCertificateData != "") {
-		return fmt.Errorf("exec plugin returned signing key material alongside a token or certificate, which are alternatives rather than additions")
+	//
+	// A certificate is not in that category when the client is configured to sign.
+	// Then the certificate is the assertion of who the signer is, used locally to
+	// derive the key ID and carried in a covered header, and it never becomes the
+	// client's TLS material. So the pair serves one purpose or the other, chosen by
+	// configuration, and only a token is unconditionally in conflict.
+	if cred.Status.HTTPSignature != nil && cred.Status.Token != "" {
+		return fmt.Errorf("exec plugin returned signing key material alongside a token, which are alternatives rather than additions")
+	}
+	if cred.Status.HTTPSignature != nil && cred.Status.ClientCertificateData != "" {
+		return fmt.Errorf("exec plugin returned both signing key material and a certificate; a signature is made under one key, so return the certificate and its key, or the key material, not both")
+	}
+	if a.signing != nil && cred.Status.Token != "" {
+		return fmt.Errorf("exec plugin returned a token, but this client is configured to sign requests rather than to send a credential")
 	}
 	if cred.Status.HTTPSignature != nil && a.signing == nil {
 		return fmt.Errorf("exec plugin returned signing key material, but this client is not configured to sign requests")
 	}
-	if cred.Status.HTTPSignature == nil && a.signing != nil {
-		return fmt.Errorf("exec plugin returned no signing key material, which this client is configured to require")
+	signsWithCertificate := a.signing != nil && cred.Status.ClientCertificateData != ""
+	if a.signing != nil && cred.Status.HTTPSignature == nil && !signsWithCertificate {
+		return fmt.Errorf("exec plugin returned no signing key material and no certificate, and this client is configured to sign requests")
+	}
+	// The algorithm is stated in the kubeconfig for key material and derived from
+	// the key type for a certificate. Which one the plugin would return is not
+	// knowable before it runs, so this is the first point where both facts exist,
+	// and it is therefore where they are compared.
+	if signsWithCertificate && a.signing.Algorithm != "" {
+		return fmt.Errorf("exec plugin returned a certificate to sign with, but the kubeconfig states algorithm %q; "+
+			"a certificate's key type determines the algorithm, so leave it unset when the plugin returns one", a.signing.Algorithm)
+	}
+	if cred.Status.HTTPSignature != nil && a.signing.Algorithm == "" {
+		return fmt.Errorf("exec plugin returned signing key material, but the kubeconfig states no algorithm; " +
+			"algorithm is required unless the plugin returns a certificate, whose key type determines it")
+	}
+	if signsWithCertificate && len(a.declaredHeaders) > 0 {
+		return fmt.Errorf("exec plugin returned a certificate to sign with, but the kubeconfig covers signed headers, whose values only a signing credential carries")
 	}
 
 	if cred.Status.ExpirationTimestamp != nil {
@@ -595,7 +640,20 @@ func (a *Authenticator) refreshCredsLocked() error {
 		}
 		newCreds.signing = bound
 	}
-	if cred.Status.ClientKeyData != "" && cred.Status.ClientCertificateData != "" {
+	if signsWithCertificate {
+		// The certificate is signing material, so it is built into a credential
+		// here and deliberately not installed below as the client's TLS
+		// certificate. The same bytes would otherwise authenticate the connection
+		// as well, which is the ordering ambiguity this whole flow exists to avoid.
+		bound, err := httpsig.NewCertificateCredential("exec plugin "+a.cmd,
+			[]byte(cred.Status.ClientCertificateData), []byte(cred.Status.ClientKeyData),
+			cred.Status.ExpirationTimestamp)
+		if err != nil {
+			return err
+		}
+		newCreds.signing = bound
+	}
+	if cred.Status.ClientKeyData != "" && cred.Status.ClientCertificateData != "" && !signsWithCertificate {
 		cert, err := tls.X509KeyPair([]byte(cred.Status.ClientCertificateData), []byte(cred.Status.ClientKeyData))
 		if err != nil {
 			return fmt.Errorf("failed parsing client key/certificate: %v", err)

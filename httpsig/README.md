@@ -102,22 +102,30 @@ kube-apiserver is configured by an `httpSignature` list in `AuthenticationConfig
 file that already configures JWT and anonymous authentication, behind the
 `HTTPSignatureAuthentication` alpha feature gate. Editing the file takes effect without a restart.
 
-One entry, pointing at a resolver:
+A complete, commented reference covering both ways of resolving a signature is in
+[`examples/authentication-config.yaml`](examples/authentication-config.yaml). It is validated on
+every test run with the same decode and validation kube-apiserver performs at startup, so it is a
+file to copy from rather than a snippet to retype.
+
+The trimmed versions below are for reading. There are two kinds of authenticator, and an
+`httpSignature` section may hold any mix of them. One names a resolver process:
 
 ```yaml
 apiVersion: apiserver.config.k8s.io/v1
 kind: AuthenticationConfiguration
 httpSignature:
-- endpoint: unix:///var/run/httpsig/resolver.sock
-  # Checked against the created timestamp in the signature, so a stale request is
-  # refused and the resolver knows how long to remember its nonce.
-  maxAge: 1m
-  # Only key IDs whose first segment matches reach this resolver. Omitting this
-  # means it is asked about every key ID.
-  keyIDPrefixes: [corp]
-  # A value the client covers with its signature and this server passes on, for a
-  # resolver that decides identity from a session token rather than from a key ID.
-  relayedHeaders: [X-Session-Token]
+  authenticators:
+  - name: corp-resolver
+    endpoint: unix:///var/run/httpsig/resolver.sock
+    # Checked against the created timestamp in the signature, so a stale request is
+    # refused and the resolver knows how long to remember its nonce.
+    maxAge: 1m
+    # Only key IDs whose first segment matches reach this resolver. Omitting this
+    # means it is asked about every key ID.
+    keyIDPrefixes: [corp]
+    # A value the client covers with its signature and this server passes on, for a
+    # resolver that decides identity from a session token rather than from a key ID.
+    relayedHeaders: [X-Session-Token]
 ```
 
 No key material and no identity appears in this file. The resolver on that socket answers two
@@ -145,15 +153,98 @@ What a resolver returns is a claim, not a conclusion. The API server refuses a u
 the `system:` prefix, because whoever holds the resolver's socket can vend an identity to the cluster
 and claiming a name Kubernetes issues would be a larger grant than vending a key.
 
+## Identity from a certificate instead
+
+A resolver answers over a socket, which means the server depends on a process being reachable to
+authenticate anything. The alternative is for the client to carry an X.509 certificate and for the
+server to hold only the authority that issued it, and then it depends on nothing at request time:
+
+```yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+httpSignature:
+  authenticators:
+  - name: workload-certificates
+    x509:
+      # Issue an authority for this purpose. Pointing this at the cluster's
+      # client CA would let every certificate already issued for connection
+      # authentication sign detached messages, which its issuer never agreed to.
+      certificateAuthority: |
+        -----BEGIN CERTIFICATE-----
+        ...
+        -----END CERTIFICATE-----
+    # Rules run before the mappings, so a mapping never reads a certificate no
+    # rule has vetted.
+    certificateValidationRules:
+    - expression: cert.notAfter - cert.notBefore <= duration('24h')
+      message: certificate lifetime must not exceed 24 hours
+    claimMappings:
+      username:
+        expression: '"cert:" + cert.uriSANs[0]'
+      groups:
+        expression: cert.subject.organization
+    # The mapping above derives groups from the certificate's subject, which hands
+    # the choice of group to whoever can request one. Without this rule a requester
+    # naming system:masters in their organization would receive cluster administrator.
+    userValidationRules:
+    - expression: '!user.username.startsWith("system:") && !user.groups.exists(g, g.startsWith("system:"))'
+      message: 'this authenticator may not assert an identity under the system: prefix'
+```
+
+The client side states the certificate and its key, and nothing else:
+
+```yaml
+users:
+- name: workload
+  user:
+    httpSignature:
+      apiVersion: client.authentication.k8s.io/v1alpha1
+      certFile: /var/run/secrets/workload/tls.crt
+      keyFile:  /var/run/secrets/workload/tls.key
+      # No algorithm and no keyID. The certificate's key type determines the
+      # algorithm, and the key ID is the certificate's digest.
+```
+
+For a pod there is a one-file form, `credentialBundleFile`, which is what a
+`PodCertificateProjection` writes: one read returns a consistent key and certificate, where two
+files can be read between the two writes of a rotation.
+
+This is mutual TLS with the handshake replaced by a message signature. The same authority, the same
+issuance, and the same subject conventions apply; only the point of authentication moves into the
+message, which is what lets it survive a TLS-terminating hop.
+
+What binds the certificate to the signature is the `keyid`, which must be `x509-sha256:` followed by
+the leaf's digest. A signature's parameters are always part of its signature base, so a `keyid`
+naming the certificate is covered by every signature that carries one. The server recomputes the
+digest from the bytes it received rather than trusting the claim.
+
 ## What is not solved
 
-**Key distribution.** The API server knows how to ask. Deciding which party holds which key material
-and how it gets there is the resolver operator's problem.
+**Key distribution, for a resolver.** The API server knows how to ask. Deciding which party holds
+which key material and how it gets there is the resolver operator's problem.
 
 There is a resolver in `e2e/cmd/httpsig-resolver`, backed by a YAML file, which the integration tests
 and the kind demo both run a real API server against. It is a demo: key material sits in plaintext next
 to the identity it authenticates, and nonce state is in memory in one process. Both are the shape of the
 answer rather than the answer, and its README says so.
+
+**Revocation, for a certificate.** The server holds nothing per client, which is the point, so there
+is nothing to delete. A certificate's lifetime is the window, narrowed by the validation cache's TTL
+and by whatever lifetime rule the configuration states. For pods, kube-apiserver caps issuance.
+
+**Replay, for a certificate.** Recording nonces requires somewhere to record them that every API
+server shares, and the only such place here is a resolver. A certificate authenticator has none, so
+`maxAge` plus `tolerance` is the whole replay window there, and the configuration says so rather than
+leaving it to be inferred: `nonceHandling` is rejected on an x509 authenticator instead of being
+accepted and ignored.
+
+The nonce parameter is still required on the wire and still covered by the signature, so recording it
+can begin later without a change at any client. What it needs is a design rather than a constant. A
+bucket keyed on the trust anchor would put every client under one authority into one shared,
+peer-driven cache, which is the arrangement that turns replay tracking into a replay enabling
+mechanism. Pointing a certificate authenticator at a resolver purely to record nonces was considered
+and rejected: it would make `endpoint` mean two different things depending on whether `x509` was also
+set, and cost a round trip per request for a client whose key the resolver never sees.
 
 **Bounding lookups from an unauthenticated caller.** A key lookup happens before any signature has
 verified, because verifying needs the key. Length caps, an age check before the lookup, collapsing
@@ -166,17 +257,13 @@ have different owners: the resolver's copy comes from an identity system, the cl
 a kubeconfig. Both publish a digest of theirs, so comparing them is one metric read against one log
 line, but a mismatch still surfaces at the client as a signature that does not verify.
 
-An alternative direction that would replace key lookup rather than implement it is worked through in
-`DECISIONS.md` section 6: an X.509 certificate carried as a user assertion, which is mTLS with the
-handshake replaced by a message signature, and for pods most of the delivery machinery already exists
-in tree.
-
 ## Status
 
-Not yet a KEP. Not proposed upstream. A fork with working client and server plumbing, an external key
-resolution API, a file-backed resolver, unit tests, integration tests against a real kube-apiserver, and
-a kind demo that runs the whole arrangement.
+Not yet a KEP. Not proposed upstream. A fork with working client and server plumbing, two ways of
+resolving a signature to an identity, an external key resolution API, a file-backed resolver, unit
+tests, integration tests against a real kube-apiserver, and a kind demo that runs the whole
+arrangement.
 
-Five parts are meant to be read as proposals: the kubeconfig surface, the credential sources behind
-it, the wire format and coverage rules, the verifier, and the mapping from a verified key to an
-identity.
+Six parts are meant to be read as proposals: the kubeconfig surface, the credential sources behind
+it, the wire format and coverage rules, the verifier, the resolver API, and the mapping from a
+verified key or certificate to an identity.

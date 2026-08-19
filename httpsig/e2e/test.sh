@@ -14,17 +14,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Exercises both keys end to end against the demo cluster.
+# Exercises every credential end to end against the demo cluster.
 #
-# Each key proves three separate things, and they are worth keeping apart:
-#   whoami   the API server verified a signature and mapped the key to an identity
+# Each proves three separate things, and they are worth keeping apart:
+#   whoami   the API server verified a signature and resolved it to an identity
 #   SSAR     that identity's groups reached the authorizer
-#   tamper   a wrong key is rejected, so the checks above are not passing for
-#            some other reason such as the client certificate or anonymous access
+#   negative the wrong credential is rejected, so the checks above are not passing
+#            for some other reason such as a client certificate or anonymous access
+#
+# Two ways of resolving a signature are covered. For the configured keys the server
+# holds a key and an identity per client. For the certificate the server holds a
+# certificate authority and nothing per client: the identity comes from the
+# certificate the request carries, which is why the rogue context matters. Its
+# certificate has the same subject and a signature that verifies against its own
+# key, so the only thing wrong with it is who issued it.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 root="$(cd ../.. && pwd)"
+
+# env.sh owns the cluster name, and kind names the container after it. Reading it
+# from kind.yaml would be wrong now that up.sh renders that file rather than
+# treating it as the source.
+source ./env.sh
+cluster="$HTTPSIG_CLUSTER"
 
 kubectl="${HTTPSIG_KUBECTL:-$root/_output/bin/kubectl}"
 export KUBECONFIG="$PWD/fixtures/kubeconfig"
@@ -78,6 +91,19 @@ else
   echo "  FAIL the resolver is not running. Run ./up.sh, or ./resolver.sh start"
   failures=1
 fi
+
+# The same property for the assertion flow. The server is given the certificate
+# authority and nothing else: no private key, and nothing naming this client.
+if ls fixtures/node/ | grep -qE '\.key$|bundle'; then
+  echo "  FAIL a private key is in fixtures/node/, which the API server mounts"
+  failures=1
+elif grep -qs "cert-demo" fixtures/node/authentication-config.yaml; then
+  echo "  FAIL the API server's configuration names the certificate client; its identity"
+  echo "       is supposed to come from the certificate rather than from this file"
+  failures=1
+else
+  echo "  ok   the API server holds only the CA, and names no certificate client"
+fi
 check() {
   local what="$1" want="$2" got="$3"
   if [[ "$got" == "$want" ]]; then
@@ -100,7 +126,10 @@ spec:
 EOF
 }
 
-for spec in "hmac:hmac-demo:httpsig-hmac" "ecdsa:ecdsa-demo:httpsig-asymmetric"; do
+for spec in "hmac:hmac-demo:httpsig-hmac" \
+            "ecdsa:ecdsa-demo:httpsig-asymmetric" \
+            "cert:cert-demo:httpsig-certificate" \
+            "bundle:cert-demo:httpsig-certificate"; do
   IFS=: read -r context username group <<<"$spec"
   echo "== $context"
 
@@ -121,6 +150,18 @@ for spec in "hmac:hmac-demo:httpsig-hmac" "ecdsa:ecdsa-demo:httpsig-asymmetric";
   check "SSAR list pods (view allows)" "true" "$(ssar "$context" list pods)"
   check "SSAR create pods (view denies)" "false" "$(ssar "$context" create pods)"
 
+  # The identity is the certificate's own when the certificate is the assertion, so
+  # the thumbprint the server reports has to be the one this client holds. A
+  # mismatch would mean the two sides digest different bytes, which the keyid
+  # binding rests on.
+  if [[ "$context" == cert || "$context" == bundle ]]; then
+    want_uid="$(openssl x509 -in fixtures/client/cert-demo.crt -outform der | openssl dgst -sha256 -hex | awk '{print $NF}')"
+    check "uid is the certificate digest" "$want_uid" "$(jq -r '.status.userInfo.uid' <<<"$whoami")"
+    check "issuer arrives as an extra" "httpsig-demo-ca" \
+      "$(jq -r '.status.userInfo.extra["httpsig.example.com/issuer"][0] // ""' <<<"$whoami")"
+    continue
+  fi
+
   # A wrong key of the right kind. The client signs happily and the server
   # rejects, with a 401 that deliberately does not say which part was wrong.
   tampered="$(HTTPSIG_DEMO_TAMPER=1 "$kubectl" --context "$context" auth whoami 2>&1 || true)"
@@ -135,13 +176,26 @@ for spec in "hmac:hmac-demo:httpsig-hmac" "ecdsa:ecdsa-demo:httpsig-asymmetric";
   fi
 done
 
+# The trust boundary, over the wire. This certificate has the same subject as the
+# accepted one and its signature verifies against its own key, so possession is not
+# what is wrong with it. The server refuses it because nothing it holds issued it,
+# which is the property that lets the server hold no per-client state at all.
+echo "== rogue"
+rogue="$("$kubectl" --context rogue auth whoami 2>&1 || true)"
+if grep -q "Unauthorized" <<<"$rogue"; then
+  printf '  ok   %-34s rejected\n' "certificate from another CA"
+else
+  printf '  FAIL %-34s expected rejection, got %q\n' "certificate from another CA" "${rogue//$'\n'/ }"
+  failures=$((failures + 1))
+fi
+
 echo
 if (( failures )); then
   echo "test.sh: $failures failed"
   echo "If whoami came back anonymous or unauthorized for both keys, check that"
   echo "  - \$kubectl is the source build, since a released one silently ignores"
   echo "    the httpSignature block in the kubeconfig, and"
-  echo "  - the API server has the feature gate: docker exec httpsig-control-plane \\"
+  echo "  - the API server has the feature gate: docker exec $cluster-control-plane \\"
   echo "      grep -e authentication-config -e feature-gates /etc/kubernetes/manifests/kube-apiserver.yaml"
   exit 1
 fi

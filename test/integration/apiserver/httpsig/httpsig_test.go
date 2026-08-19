@@ -33,11 +33,14 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,6 +126,14 @@ func writeTempFile(t *testing.T, name, content string) string {
 	return path
 }
 
+// indent pushes a PEM document to the depth a block scalar needs inside the
+// authentication config. Authenticators are list items at indent 2, so their
+// fields sit at indent 4 and block scalar content has to be deeper than that.
+func indent(s string) string {
+	const pad = "        "
+	return pad + strings.ReplaceAll(strings.TrimRight(s, "\n"), "\n", "\n"+pad)
+}
+
 // newResolver starts a resolver on a socket unique to this test.
 func newResolver(t *testing.T, name string) *resolvertesting.Resolver {
 	t.Helper()
@@ -134,9 +145,9 @@ func newResolver(t *testing.T, name string) *resolvertesting.Resolver {
 // section points at the given resolvers, in order.
 func authConfigFor(resolvers ...*resolvertesting.Resolver) string {
 	var b strings.Builder
-	b.WriteString("apiVersion: apiserver.config.k8s.io/v1alpha1\nkind: AuthenticationConfiguration\nhttpSignature:\n")
-	for _, r := range resolvers {
-		fmt.Fprintf(&b, "- endpoint: %s\n", r.Endpoint())
+	b.WriteString("apiVersion: apiserver.config.k8s.io/v1alpha1\nkind: AuthenticationConfiguration\nhttpSignature:\n  authenticators:\n")
+	for i, r := range resolvers {
+		fmt.Fprintf(&b, "  - name: resolver-%d\n    endpoint: %s\n", i, r.Endpoint())
 	}
 	return b.String()
 }
@@ -427,10 +438,13 @@ func TestResolverRoutingByKeyIDPrefix(t *testing.T) {
 	authConfig := fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1alpha1
 kind: AuthenticationConfiguration
 httpSignature:
-- endpoint: %s
-  keyIDPrefixes: [%s]
-- endpoint: %s
-  keyIDPrefixes: [%s]
+  authenticators:
+  - name: alice-resolver
+    endpoint: %s
+    keyIDPrefixes: [%s]
+  - name: bob-resolver
+    endpoint: %s
+    keyIDPrefixes: [%s]
 `, aliceResolver.Endpoint(), aliceKeyID, bobResolver.Endpoint(), bobKeyID)
 
 	server, _ := startServer(t, authConfig)
@@ -477,8 +491,10 @@ func TestRelayedSessionTokenHeader(t *testing.T) {
 	server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1alpha1
 kind: AuthenticationConfiguration
 httpSignature:
-- endpoint: %s
-  relayedHeaders: [X-Session-Token]
+  authenticators:
+  - name: session-resolver
+    endpoint: %s
+    relayedHeaders: [X-Session-Token]
 `, r.Endpoint()))
 	grantPodReader(t, server)
 
@@ -854,8 +870,10 @@ JSON
 	server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1alpha1
 kind: AuthenticationConfiguration
 httpSignature:
-- endpoint: %s
-  relayedHeaders: [X-Session-Token]
+  authenticators:
+  - name: session-resolver
+    endpoint: %s
+    relayedHeaders: [X-Session-Token]
 `, r.Endpoint()))
 	grantPodReader(t, server)
 
@@ -963,8 +981,10 @@ func TestNonceHandlingIgnoreAcceptsReplay(t *testing.T) {
 	server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1
 kind: AuthenticationConfiguration
 httpSignature:
-- endpoint: %s
-  nonceHandling: Ignore
+  authenticators:
+  - name: resolver
+    endpoint: %s
+    nonceHandling: Ignore
 `, r.Endpoint()))
 	grantPodReader(t, server)
 
@@ -1033,8 +1053,10 @@ func TestNonceHandlingIsValidatedAcrossVersions(t *testing.T) {
 			server, _ := startServer(t, fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/%s
 kind: AuthenticationConfiguration
 httpSignature:
-- endpoint: %s
-  nonceHandling: Consume
+  authenticators:
+  - name: resolver
+    endpoint: %s
+    nonceHandling: Consume
 `, version, r.Endpoint()))
 
 			clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
@@ -1049,5 +1071,371 @@ httpSignature:
 				t.Errorf("ConsumeNonce calls: got %d, want 1", nonceCalls)
 			}
 		})
+	}
+}
+
+// issueCertificate mints a certificate authority and one leaf it signed, writing
+// the leaf's certificate and key to disk. The authority's PEM is what the server's
+// configuration holds.
+func issueCertificate(t *testing.T, commonName string, organizations []string, uris []string) (caPEM, certFile, keyFile, bundleFile string) {
+	t.Helper()
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "httpsig-test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, caKey.Public(), caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedURIs := make([]*url.URL, 0, len(uris))
+	for _, raw := range uris {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsedURIs = append(parsedURIs, u)
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: commonName, Organization: organizations},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(12 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		URIs:         parsedURIs,
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, leafKey.Public(), caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafKeyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	caPEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}))
+	leafCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	leafKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: leafKeyDER})
+
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "tls.crt")
+	keyFile = filepath.Join(dir, "tls.key")
+	// Key block first, then the chain, which is what a pod certificate projected
+	// volume writes.
+	bundleFile = filepath.Join(dir, "bundle.pem")
+	for path, content := range map[string][]byte{
+		certFile:   leafCertPEM,
+		keyFile:    leafKeyPEM,
+		bundleFile: append(append([]byte{}, leafKeyPEM...), leafCertPEM...),
+	} {
+		if err := os.WriteFile(path, content, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return caPEM, certFile, keyFile, bundleFile
+}
+
+// certificateAuthConfig is the server configuration used by the certificate tests:
+// one authenticator holding a trust anchor bundle and nothing per client.
+func certificateAuthConfig(t *testing.T, caPEM string, extra string) string {
+	t.Helper()
+	return fmt.Sprintf(`
+apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+httpSignature:
+  authenticators:
+  - name: workload-certificates
+    x509:
+      certificateAuthority: |
+%s
+    claimMappings:
+      username:
+        expression: '"cert:" + cert.subject.commonName'
+      groups:
+        expression: cert.subject.organization
+      uid:
+        expression: cert.sha256Thumbprint
+      extra:
+      - key: example.org/workload-id
+        valueExpression: cert.uriSANs
+%s`, indent(caPEM), extra)
+}
+
+// TestCertificateSignedRequestAuthenticates is the end-to-end claim for the
+// certificate flow: a kubeconfig naming a certificate and key produces a client
+// the API server accepts, with an identity derived from the certificate. The server
+// holds a trust anchor bundle and nothing about this client.
+func TestCertificateSignedRequestAuthenticates(t *testing.T) {
+	caPEM, certFile, keyFile, _ := issueCertificate(t, "builder", []string{signerGrp}, []string{"spiffe://cluster.local/ns/default/sa/builder"})
+	server, _ := startServer(t, certificateAuthConfig(t, caPEM, ""))
+	grantPodReader(t, server)
+
+	clientConfig := signingClientConfig(t, server, "builder", &clientcmdapi.HTTPSignatureConfig{
+		APIVersion: "client.authentication.k8s.io/v1alpha1",
+		// No algorithm and no keyID: the certificate determines both.
+		CertFile: certFile,
+		KeyFile:  keyFile,
+	})
+	client := kubernetes.NewForConfigOrDie(clientConfig)
+	ctx := context.Background()
+
+	review, err := client.AuthenticationV1().SelfSubjectReviews().Create(ctx, &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("a request signed with a certificate was not authenticated: %v", err)
+	}
+	if got, want := review.Status.UserInfo.Username, "cert:builder"; got != want {
+		t.Errorf("username = %q, want %q", got, want)
+	}
+	if got := review.Status.UserInfo.Groups; !containsString(got, signerGrp) {
+		t.Errorf("groups = %v, want to contain %q", got, signerGrp)
+	}
+	if got := review.Status.UserInfo.Extra["example.org/workload-id"]; len(got) != 1 || got[0] != "spiffe://cluster.local/ns/default/sa/builder" {
+		t.Errorf("workload-id extra = %v, want the URI SAN", got)
+	}
+
+	// Authorized by a group the certificate carried, so the identity is doing
+	// something and not merely being reported.
+	if _, err := client.CoreV1().Pods("default").List(ctx, metav1.ListOptions{}); err != nil {
+		t.Errorf("listing pods as the mapped identity: %v", err)
+	}
+	// A write, so the body digest is covered over the wire and not only in a unit
+	// test.
+	if _, err := client.CoreV1().ConfigMaps("default").Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "signed-by-certificate"},
+		Data:       map[string]string{"signed": "true"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Errorf("creating a configmap with a signed body: %v", err)
+	}
+}
+
+// TestCertificateBundleAuthenticates covers the one-file form, which is the form a
+// pod gets and the one that cannot be read mid-rotation.
+func TestCertificateBundleAuthenticates(t *testing.T) {
+	caPEM, _, _, bundleFile := issueCertificate(t, "pod", []string{signerGrp}, nil)
+	server, _ := startServer(t, certificateAuthConfig(t, caPEM, ""))
+	grantPodReader(t, server)
+
+	clientConfig := signingClientConfig(t, server, "pod", &clientcmdapi.HTTPSignatureConfig{
+		APIVersion:           "client.authentication.k8s.io/v1alpha1",
+		CredentialBundleFile: bundleFile,
+	})
+	client := kubernetes.NewForConfigOrDie(clientConfig)
+
+	review, err := client.AuthenticationV1().SelfSubjectReviews().Create(context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("a request signed from a credential bundle was not authenticated: %v", err)
+	}
+	if got, want := review.Status.UserInfo.Username, "cert:pod"; got != want {
+		t.Errorf("username = %q, want %q", got, want)
+	}
+}
+
+// TestCertificateFromAnotherAuthorityIsRejected is the trust boundary over the
+// wire. Holding the key of a well-formed certificate proves possession and nothing
+// else, so a certificate from an authority the server does not hold gets a 401.
+func TestCertificateFromAnotherAuthorityIsRejected(t *testing.T) {
+	configuredCA, _, _, _ := issueCertificate(t, "unused", nil, nil)
+	_, otherCert, otherKey, _ := issueCertificate(t, "builder", []string{signerGrp}, nil)
+
+	server, _ := startServer(t, certificateAuthConfig(t, configuredCA, ""))
+	grantPodReader(t, server)
+
+	clientConfig := signingClientConfig(t, server, "builder", &clientcmdapi.HTTPSignatureConfig{
+		APIVersion: "client.authentication.k8s.io/v1alpha1",
+		CertFile:   otherCert,
+		KeyFile:    otherKey,
+	})
+	client := kubernetes.NewForConfigOrDie(clientConfig)
+
+	_, err := client.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{})
+	if err == nil {
+		t.Fatal("a certificate from an unconfigured authority was accepted")
+	}
+	if !apierrors.IsUnauthorized(err) {
+		t.Errorf("want 401 Unauthorized, got %v", err)
+	}
+}
+
+// TestCertificateRulesRejectOverTheWire checks that the rules and the mappings are
+// the cluster's say over what a certificate may claim, and that refusing produces a
+// 401 rather than an identity.
+func TestCertificateRulesRejectOverTheWire(t *testing.T) {
+	caPEM, certFile, keyFile, _ := issueCertificate(t, "builder", []string{"wrong-org"}, nil)
+	server, _ := startServer(t, certificateAuthConfig(t, caPEM, `
+    certificateValidationRules:
+    - expression: cert.subject.organization.exists(o, o == "`+signerGrp+`")
+      message: certificate must be issued to the signers organization
+`))
+	grantPodReader(t, server)
+
+	clientConfig := signingClientConfig(t, server, "builder", &clientcmdapi.HTTPSignatureConfig{
+		APIVersion: "client.authentication.k8s.io/v1alpha1",
+		CertFile:   certFile,
+		KeyFile:    keyFile,
+	})
+	client := kubernetes.NewForConfigOrDie(clientConfig)
+
+	_, err := client.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{})
+	if err == nil {
+		t.Fatal("a certificate a validation rule rejects was accepted")
+	}
+	if !apierrors.IsUnauthorized(err) {
+		t.Errorf("want 401 Unauthorized, got %v", err)
+	}
+}
+
+// TestCertificateSubstitutionIsRejected replays a captured request with a different
+// certificate from the same authority. The keyid names the certificate's digest and
+// is covered by the signature, so this is refused by the binding rather than by the
+// trust anchors.
+func TestCertificateSubstitutionIsRejected(t *testing.T) {
+	caPEM, certFile, keyFile, _ := issueCertificate(t, "builder", []string{signerGrp}, nil)
+	server, _ := startServer(t, certificateAuthConfig(t, caPEM, ""))
+	grantPodReader(t, server)
+
+	clientConfig := signingClientConfig(t, server, "builder", &clientcmdapi.HTTPSignatureConfig{
+		APIVersion: "client.authentication.k8s.io/v1alpha1",
+		CertFile:   certFile,
+		KeyFile:    keyFile,
+	})
+
+	// Capture a signed request, then send it again with someone else's certificate
+	// in the header. The signature and its keyid are untouched.
+	var captured *http.Request
+	capturing := rest.CopyConfig(clientConfig)
+	capturing.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+		return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			captured = req.Clone(req.Context())
+			return rt.RoundTrip(req)
+		})
+	})
+	client := kubernetes.NewForConfigOrDie(capturing)
+	if _, err := client.CoreV1().Pods("default").List(context.Background(), metav1.ListOptions{}); err != nil {
+		t.Fatalf("the original request should authenticate: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("no request was captured")
+	}
+
+	// A different leaf from the same authority, which would chain fine.
+	_, _, _, otherBundle := issueCertificate(t, "someone-else", []string{signerGrp}, nil)
+	otherPEM, err := os.ReadFile(otherBundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherDER := firstCertificateDER(t, otherPEM)
+	captured.Header.Set(transporthttpsig.CertificateHeader, transporthttpsig.CertificateHeaderValue(otherDER))
+
+	base, err := rest.TransportFor(rest.AnonymousClientConfig(clientConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := base.RoundTrip(captured.Clone(context.Background()))
+	if err != nil {
+		t.Fatalf("sending the altered request: %v", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("a request whose certificate was swapped got %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestCertificateAndEndpointCoexistOverTheWire is the deployment shape the
+// authenticator list exists for: a resolver serving ordinary keyids alongside a
+// certificate authority, over the wire, with a real API server deciding which one
+// answers each request.
+//
+// The resolver is listed first and states no prefixes, so it is asked about every
+// keyid it is allowed to be. The certificate request still reaches the certificate
+// authenticator, because the certificate keyid form is reserved from resolvers.
+func TestCertificateAndEndpointCoexistOverTheWire(t *testing.T) {
+	keyFile, publicKeyDER := keyPair(t, "alice", "ed25519")
+	caPEM, certFile, certKeyFile, _ := issueCertificate(t, "builder", []string{signerGrp}, nil)
+
+	r := newResolver(t, "coexist")
+	r.SetKey(aliceKeyID, asymmetricAnswer("ed25519", publicKeyDER, aliceUser, signerGrp))
+
+	server, _ := startServer(t, fmt.Sprintf(`
+apiVersion: apiserver.config.k8s.io/v1
+kind: AuthenticationConfiguration
+httpSignature:
+  authenticators:
+  - name: resolver
+    endpoint: %s
+  - name: workload-certificates
+    x509:
+      certificateAuthority: |
+%s
+    claimMappings:
+      username:
+        expression: '"cert:" + cert.subject.commonName'
+      groups:
+        expression: cert.subject.organization
+`, r.Endpoint(), indent(caPEM)))
+	grantPodReader(t, server)
+
+	for _, tc := range []struct {
+		name string
+		sig  *clientcmdapi.HTTPSignatureConfig
+		want string
+	}{{
+		name: "resolved key",
+		sig: &clientcmdapi.HTTPSignatureConfig{
+			APIVersion: "client.authentication.k8s.io/v1alpha1",
+			Algorithm:  "ed25519",
+			KeyID:      aliceKeyID,
+			KeyFile:    keyFile,
+		},
+		want: aliceUser,
+	}, {
+		name: "certificate",
+		sig: &clientcmdapi.HTTPSignatureConfig{
+			APIVersion: "client.authentication.k8s.io/v1alpha1",
+			CertFile:   certFile,
+			KeyFile:    certKeyFile,
+		},
+		want: "cert:builder",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := kubernetes.NewForConfigOrDie(signingClientConfig(t, server, tc.want, tc.sig))
+			review := selfReview(t, client)
+			if got := review.Status.UserInfo.Username; got != tc.want {
+				t.Errorf("username = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// firstCertificateDER returns the DER of the first certificate in a PEM document.
+func firstCertificateDER(t *testing.T, data []byte) []byte {
+	t.Helper()
+	rest := data
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			t.Fatal("no CERTIFICATE block found")
+		}
+		if block.Type == "CERTIFICATE" {
+			return block.Bytes
+		}
 	}
 }

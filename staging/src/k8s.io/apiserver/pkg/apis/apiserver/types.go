@@ -174,9 +174,8 @@ type AuthenticationConfiguration struct {
 	Anonymous *AnonymousAuthConfig
 
 	// HTTPSignature authenticates requests by HTTP message signature (RFC 9421)
-	// rather than by a credential the client sends. Each entry names a resolver,
-	// and entries are consulted in the order given.
-	HTTPSignature []HTTPSignatureAuthenticator
+	// rather than by a credential the client sends.
+	HTTPSignature *HTTPSignatureConfig
 }
 
 // AnonymousAuthConfig provides the configuration for the anonymous authenticator.
@@ -440,16 +439,48 @@ type WebhookMatchCondition struct {
 	Expression string
 }
 
-// HTTPSignatureAuthenticator provides the configuration for authenticating
-// requests by HTTP message signature (RFC 9421).
+// HTTPSignatureConfig provides the configuration for authenticating requests by
+// HTTP message signature (RFC 9421).
 //
-// Keys are not configured here. Endpoint names a resolver, which answers for a
-// key ID with the key that verifies signatures bearing it and the identity it
-// authenticates as, and which records the nonces those signatures carry. A
-// resolver's answer is a claim rather than a conclusion: this server validates
-// the identity on arrival and rejects a name or group under the "system:"
+// Authority and Scheme sit here rather than on each authenticator because they
+// describe how clients reach this one server. They are also consumed before any
+// authenticator has been selected, when the request's signatures are parsed, so
+// they could not be per-authenticator without parsing every signature once per
+// authenticator.
+type HTTPSignatureConfig struct {
+	// Authority and Scheme are the external values clients sign, for a server
+	// behind a TLS-terminating proxy or load balancer. Unset means they are
+	// derived from the connection, which is correct only when clients reach
+	// this server directly. The Forwarded and X-Forwarded-* fields are
+	// unsigned input and are never consulted.
+	Authority string
+	Scheme    string
+
+	// Authenticators are attempted in the order given. Which one handles a
+	// signature is decided by the signature's keyid: a keyid in the certificate
+	// form selects the certificate authenticators, which are tried until one's
+	// trust anchors validate the presented certificate, and any other keyid
+	// selects the resolver authenticators whose key ID prefixes admit it.
+	Authenticators []HTTPSignatureAuthenticator
+}
+
+// HTTPSignatureAuthenticator is one way of resolving a signature's keyid to a
+// verification key and an identity. Exactly one of Endpoint or X509 is set.
+//
+// Neither states an identity in configuration. Endpoint names a resolver, which
+// answers for a key ID with the key that verifies signatures bearing it and the
+// identity it authenticates as, and which records the nonces those signatures
+// carry. X509 takes both key and identity from a certificate the request
+// carries, which the configured trust anchors have to validate.
+//
+// Either way the identity is a claim rather than a conclusion: this server
+// validates it on arrival and rejects a name or group under the "system:"
 // prefix.
 type HTTPSignatureAuthenticator struct {
+	// Name identifies this authenticator in errors and metrics. Required to be
+	// unique. It never appears on the wire.
+	Name string
+
 	// Endpoint is the resolver's Unix domain socket, as unix:///path/to/socket,
 	// or unix://@name for a Linux abstract socket.
 	//
@@ -459,6 +490,7 @@ type HTTPSignatureAuthenticator struct {
 
 	// KeyIDPrefixes narrows which key IDs this resolver is asked about, matched
 	// against the segment before a key ID's first "/". Unset means every key ID.
+	// Valid only with Endpoint.
 	//
 	// Resolvers are consulted in order, so a key ID no resolver serves costs one
 	// call per resolver whose prefixes admit it, driven by a caller who has
@@ -466,7 +498,8 @@ type HTTPSignatureAuthenticator struct {
 	KeyIDPrefixes []string
 
 	// RelayedHeaders names request headers whose values are sent to this resolver
-	// with a key lookup. Nothing else about the request is sent.
+	// with a key lookup. Nothing else about the request is sent. Valid only with
+	// Endpoint.
 	//
 	// A named header present but not covered by the signature rejects the request
 	// before any lookup. Covered is not verified: at lookup time the value is
@@ -480,30 +513,162 @@ type HTTPSignatureAuthenticator struct {
 	//
 	// Ignore makes the replay window MaxAge plus Tolerance, during which a captured
 	// request can be replayed against every API server without limit.
+	//
+	// Valid only with Endpoint. A nonce record needs somewhere to live that every
+	// API server shares, and X509 has no resolver to hold one.
 	NonceHandling NonceHandling
 
-	// Cache bounds what this server remembers of this resolver's answers.
+	// Cache bounds what this server remembers of this resolver's answers. Valid
+	// only with Endpoint. The certificate equivalent is X509.CertificateCache,
+	// which is separate because it is keyed on a certificate rather than a key ID
+	// and is bounded by the validated chain's remaining life.
 	Cache *HTTPSignatureCache
+
+	// X509 resolves the key and the identity from a certificate the request
+	// carries in the Signature-Certificate header, validated against this
+	// authenticator's trust anchors.
+	X509 *HTTPSignatureX509
 
 	// MaxAge bounds how old a signature may be, measured from its created
 	// parameter. Unset means five minutes.
 	//
-	// Replay is closed by the resolver recording nonces, not by this. What this
-	// bounds is how stale a request may be, and so how long a resolver has to
-	// remember a nonce.
+	// With Endpoint and the default nonce handling, replay is closed by the
+	// resolver recording nonces rather than by this, and what this bounds is how
+	// stale a request may be, and so how long a resolver has to remember a nonce.
+	//
+	// With X509, or with NonceHandling Ignore, nothing records nonces and this
+	// plus Tolerance is the entire replay window: a captured request can be
+	// replayed within it against every API server without limit.
 	MaxAge *metav1.Duration
 
 	// Tolerance is added to time comparisons to allow for clock skew between
 	// the signer and this server. Unset means no tolerance.
 	Tolerance *metav1.Duration
 
-	// Authority and Scheme are the external values clients sign, for a server
-	// behind a TLS-terminating proxy or load balancer. Unset means they are
-	// derived from the connection, which is correct only when clients reach
-	// this server directly. The Forwarded and X-Forwarded-* fields are
-	// unsigned input and are never consulted.
-	Authority string
-	Scheme    string
+	// CertificateValidationRules constrain which certificates this
+	// authenticator accepts, beyond chaining to its trust anchors. They run
+	// before ClaimMappings, so a mapping expression never sees a certificate no
+	// rule has vetted. Valid only with X509.
+	CertificateValidationRules []CertificateValidationRule
+
+	// ClaimMappings derives the user attributes from the certificate. Required
+	// with X509 and invalid with Endpoint, whose resolver states the identity
+	// with each answer.
+	ClaimMappings *HTTPSignatureClaimMappings
+
+	// UserValidationRules are applied to the mapped identity, and all must pass.
+	// They are the cluster's say over what an assertion may claim, which matters
+	// because the identity comes from a certificate rather than from this file.
+	// Valid only with X509.
+	UserValidationRules []UserValidationRule
+}
+
+// HTTPSignatureX509 resolves a signature's key and identity from an X.509
+// certificate the request carries, rather than from configuration.
+//
+// This is mutual TLS with the handshake replaced by a message signature. The
+// same certificate authority, the same issuance, and the same subject
+// conventions apply; only the point of authentication moves into the message,
+// which is what lets it survive a TLS-terminating hop.
+//
+// The certificate is bound to the signature by the keyid, which has to be
+// "x509-sha256:" followed by the hex SHA-256 digest of the leaf's DER encoding.
+// A signature's parameters are always part of its signature base, so a keyid
+// that names the certificate binds the certificate without any header coverage
+// rule. The header is covered as well, but that is belt and braces.
+type HTTPSignatureX509 struct {
+	// CertificateAuthority contains PEM-encoded certificate authority
+	// certificates that a presented certificate must chain to. A certificate
+	// authority is public trust material, so it is stated inline rather than
+	// referenced by path.
+	//
+	// Point this at a certificate authority issued for this purpose. Pointing
+	// it at the cluster's client certificate authority would give every
+	// certificate already issued for connection authentication the ability to
+	// sign detached messages, which its issuer never agreed to and nobody opted
+	// in to.
+	CertificateAuthority string
+
+	// CertificateCache holds the results of successful certificate validation,
+	// so a client's second request does not repeat the chain build and the CEL
+	// evaluation its first one paid for.
+	CertificateCache *HTTPSignatureCertificateCache
+}
+
+// HTTPSignatureCertificateCache bounds the memoization of certificate
+// validation. Only successful validations are cached. A negative cache would be
+// keyed on bytes a peer chooses, which is unbounded cardinality for anyone who
+// can send a request, and it would buy nothing: an untrusted certificate is
+// rejected by one chain build.
+//
+// Caching the mapped identity, rather than only the key, is sound because the
+// mapping is a pure function of the certificate. The CEL environment declares no
+// clock and no request-scoped variable, so no expression can produce a different
+// answer for the same certificate at a different time.
+type HTTPSignatureCertificateCache struct {
+	// MaxEntries caps how many validated certificates are remembered. Unset
+	// means 1024. Eviction costs the evicted client one revalidation.
+	MaxEntries *int32
+
+	// TTL bounds how long a validation is trusted, and is therefore the window
+	// in which withdrawing a certificate has no effect. Unset means five
+	// minutes.
+	//
+	// The effective lifetime of an entry is the smallest of this, the time
+	// remaining on the leaf, and the time remaining on every certificate in the
+	// validated chain. Without the chain bound, a TTL longer than a trust
+	// anchor's remaining life would keep admitting past the anchor's expiry.
+	TTL *metav1.Duration
+}
+
+// CertificateValidationRule is one CEL rule a presented certificate must
+// satisfy. Rules are logically ANDed.
+type CertificateValidationRule struct {
+	// Expression is evaluated by CEL and must return true for the certificate
+	// to be accepted.
+	//
+	// Expressions have access to the certificate as the CEL variable 'cert', a
+	// kubernetes.Certificate. Nothing else is in scope: there is no clock and no
+	// request, which is what makes the result cacheable per certificate.
+	Expression string
+
+	// Message customizes the error returned when Expression returns false.
+	Message string
+}
+
+// HTTPSignatureClaimMappings maps a certificate's attributes onto the user
+// attributes a request authenticates as.
+//
+// Mappings are expressions and never field references. A certificate is not a
+// map of names to values the way a token's claim set is, so there is no
+// equivalent of the JWT authenticator's claim form. The name is kept for the
+// analogy with that authenticator, which is what a reader will look for.
+//
+// No prefix is applied to any mapped value. An administrator owns avoiding
+// collision with the names other authenticators issue, and an expression can
+// prepend a literal where a prefix is wanted.
+type HTTPSignatureClaimMappings struct {
+	// Username is the mapped user name. Required. The expression must produce a
+	// non-empty string.
+	Username HTTPSignatureClaimExpression
+
+	// Groups are the mapped groups. The expression must produce a string or a
+	// list of strings; "", [], and null are treated as no groups.
+	Groups HTTPSignatureClaimExpression
+
+	// UID is the mapped user UID. The expression must produce a string.
+	UID HTTPSignatureClaimExpression
+
+	// Extra are mapped extra attributes.
+	Extra []ExtraMapping
+}
+
+// HTTPSignatureClaimExpression is one CEL expression over the certificate. It is
+// a struct rather than a bare string so that the field reads the same as the JWT
+// authenticator's equivalent.
+type HTTPSignatureClaimExpression struct {
+	// Expression is evaluated by CEL against the 'cert' variable.
+	Expression string
 }
 
 // HTTPSignatureCache bounds what this server remembers of a resolver's answers.
