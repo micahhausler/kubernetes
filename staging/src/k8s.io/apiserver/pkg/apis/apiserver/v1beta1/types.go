@@ -676,36 +676,61 @@ type HTTPSignatureConfig struct {
 	// +optional
 	Scheme string `json:"scheme,omitempty"`
 
+	// maxClockSkew is added to every time comparison, to allow for the signer's
+	// clock differing from this server's. It widens the window in which a
+	// signature is accepted by the same amount. Unset means none, which requires
+	// signers to agree with this server's clock to the second.
+	//
+	// Size it against what it widens. On a resolver, replay is closed by the nonce
+	// record and this only lengthens how long the resolver is asked to remember one:
+	// nonceHandling defaults to recording, so that holds unless a deployment turns it
+	// off in so many words. On an x509 authenticator, or on a resolver that has, there
+	// is no record and maxAge plus this value is the entire window in which a captured
+	// request can be replayed against every API server.
+	//
+	// This is a statement about this server's own time synchronisation, not about
+	// any one signer: a verifier cannot measure a client's clock, so what is being
+	// set is a risk budget, and the budget's justification is the same whichever
+	// authenticator answers. Stating it per authenticator would be a place for two
+	// of them to disagree about a fact with one answer.
+	// +optional
+	MaxClockSkew *metav1.Duration `json:"maxClockSkew,omitempty"`
+
 	// authenticators resolve a signature's keyid to a verification key and an
 	// identity. They are attempted in the order given.
 	//
-	// authority and scheme are not repeated per authenticator: they describe how
-	// clients reach this one server, and they are consumed when a request's
-	// signatures are parsed, which happens once, before any authenticator has
-	// been selected.
+	// The fields above are not repeated per authenticator. authority and scheme
+	// describe how clients reach this one server; maxClockSkew describes this
+	// server's clock. What belongs on an authenticator is trust policy for one
+	// backend, and what belongs here is this server's description of itself as
+	// clients experience it.
 	// +required
 	// +listType=atomic
 	Authenticators []HTTPSignatureAuthenticator `json:"authenticators"`
 }
 
 // HTTPSignatureAuthenticator is one way of resolving a signature's keyid to a
-// verification key and an identity. Exactly one of endpoint or x509 is required.
+// verification key and an identity. Exactly one of resolver or x509 is required.
 //
-// Neither states an identity in this file. endpoint names a resolver process,
-// which answers for a key ID with the key that verifies signatures bearing it
-// and the identity it authenticates as, and which records the nonces those
-// signatures carry. x509 takes both key and identity from a certificate the
-// request carries, which this authenticator's trust anchors have to validate.
+// Neither states an identity in this file. resolver names a process, which
+// answers for a key ID with the key that verifies signatures bearing it and the
+// identity it authenticates as, and which records the nonces those signatures
+// carry. x509 takes both key and identity from a certificate the request
+// carries, which this authenticator's trust anchors have to validate.
 //
-// The difference is what the server depends on at request time. With endpoint it
-// depends on a resolver being reachable, and gets revocation and cross-server
+// The difference is what the server depends on at request time. With resolver it
+// depends on a process being reachable, and gets revocation and cross-server
 // replay protection from it. With x509 it depends on nothing beyond a
 // certificate authority bundle, and gets neither: a certificate's lifetime is
 // the withdrawal window, and nothing records nonces.
 //
-// Either way the identity is a claim rather than a conclusion. This server
-// validates it on arrival and rejects a name or group under the "system:"
-// prefix, which is reserved for identities Kubernetes issues.
+// Either way the identity is a claim rather than a conclusion. This server refuses
+// the three names it asserts itself, and userValidationRules is where a cluster
+// states what else an authenticator may not claim.
+//
+// A field that means something to only one of the two lives inside that one's
+// struct. Only what applies to both is stated here, so there is no way to write
+// a field down and have it silently ignored.
 type HTTPSignatureAuthenticator struct {
 	// name identifies this authenticator in errors and in metrics. It never
 	// appears on the wire, and it is not what a signature's keyid names.
@@ -713,6 +738,62 @@ type HTTPSignatureAuthenticator struct {
 	// +required
 	Name string `json:"name"`
 
+	// resolver takes the verification key and the identity from a process this
+	// server calls.
+	//
+	// Mutually exclusive with x509.
+	// +optional
+	Resolver *HTTPSignatureResolver `json:"resolver,omitempty"`
+
+	// x509 takes the verification key and the identity from a certificate the
+	// request carries.
+	//
+	// Mutually exclusive with resolver.
+	// +optional
+	X509 *HTTPSignatureX509 `json:"x509,omitempty"`
+
+	// maxAge bounds how old a signature may be, measured from its created
+	// parameter. Signatures without created are rejected. Unset means 5m.
+	//
+	// With resolver and the default nonce handling, replay is closed by the
+	// resolver recording nonces rather than by this value. What this bounds is how
+	// stale a request may be, and therefore how long the resolver has to remember
+	// a nonce: it is told an expiry of created plus this value plus maxClockSkew,
+	// and may forget the nonce after that. A resolver may narrow it, for itself or
+	// for one key; nothing widens it.
+	//
+	// With x509, or with nonceHandling Ignore, nothing records nonces and this
+	// plus maxClockSkew is the entire replay window. That difference in role is why
+	// this sits here rather than in either backend: one field, one meaning, and a
+	// consequence that depends on what is resolving.
+	// +optional
+	MaxAge *metav1.Duration `json:"maxAge,omitempty"`
+
+	// userValidationRules are rules applied to the identity before authentication
+	// completes, whichever backend produced it. The rules are logically ANDed and
+	// must all return true.
+	//
+	// These allow invariants to be applied to incoming identities, such as
+	// preventing use of the system: prefix that Kubernetes components use. Neither
+	// backend states an identity in this file, so what either produces is a claim
+	// rather than a conclusion, and this is the cluster's say over it.
+	//
+	// There is no default rule. An authenticator with none stated may assert any
+	// name outside the three the server reserves for itself, including
+	// system:masters.
+	// +optional
+	// +listType=atomic
+	UserValidationRules []UserValidationRule `json:"userValidationRules,omitempty"`
+}
+
+// HTTPSignatureResolver resolves a signature's verification key and identity
+// through a process this server calls over a Unix domain socket.
+//
+// The resolver answers what this file cannot: which key verifies signatures
+// bearing a key ID, who that key authenticates as, and whether a nonce has
+// already been used for that key. The last of those is what closes replay across
+// every API server in the cluster, and no certificate can do it.
+type HTTPSignatureResolver struct {
 	// endpoint is the resolver's Unix domain socket, as unix:///path/to/socket,
 	// or unix://@name for a Linux abstract socket.
 	//
@@ -721,29 +802,22 @@ type HTTPSignatureAuthenticator struct {
 	// permissions decide who can vend an identity to this cluster. An abstract
 	// socket has no permissions at all and is bounded only by the network
 	// namespace.
-	//
-	// Mutually exclusive with x509.
-	// +optional
-	Endpoint string `json:"endpoint,omitempty"`
-
-	// x509 resolves the key and the identity from a certificate the request
-	// carries, rather than from a resolver.
-	//
-	// Mutually exclusive with endpoint.
-	// +optional
-	X509 *HTTPSignatureX509 `json:"x509,omitempty"`
+	// +required
+	Endpoint string `json:"endpoint"`
 
 	// keyIDPrefixes narrows which key IDs this resolver is asked about. A key ID
 	// matches when the segment before its first "/" equals one of these entries.
 	// Unset means this resolver is asked about every key ID.
 	//
-	// Resolvers are consulted in the order they appear here, and one that does
-	// not serve a key ID is asked before the next is tried. So a key ID that no
-	// resolver serves costs one call per resolver whose prefixes admit it, driven
-	// by a caller who has authenticated nothing. Stating prefixes reduces that to
-	// one call, or to none.
+	// Resolvers are consulted in the order their authenticators appear, and one
+	// that does not serve a key ID is asked before the next is tried. So a key ID
+	// that no resolver serves costs one call per resolver whose prefixes admit it,
+	// driven by a caller who has authenticated nothing. Stating prefixes reduces
+	// that to one call, or to none.
 	//
-	// Valid only with endpoint.
+	// There is deliberately no equivalent under x509. A certificate keyid is a
+	// digest of the certificate, so it carries no operator-chosen namespace to
+	// match on, and selecting an x509 authenticator costs no call.
 	// +optional
 	// +listType=atomic
 	KeyIDPrefixes []string `json:"keyIDPrefixes,omitempty"`
@@ -769,81 +843,16 @@ type HTTPSignatureAuthenticator struct {
 	// nonceHandling says whether this server asks the resolver to record the nonce
 	// each accepted signature carries. Unset means Consume.
 	//
-	// Set it to Ignore only with the replay window below understood: it becomes
-	// maxAge plus tolerance, during which a captured request can be replayed against
+	// Set it to Ignore only with the replay window understood: it becomes maxAge
+	// plus maxClockSkew, during which a captured request can be replayed against
 	// every API server, without limit. Nothing else detects that.
-	//
-	// Valid only with endpoint. A nonce record has to live somewhere every API
-	// server shares, and x509 has no resolver to hold one.
 	// +optional
 	NonceHandling NonceHandling `json:"nonceHandling,omitempty"`
 
 	// cache bounds what this server remembers of this resolver's answers. Unset
 	// means the default each field states.
-	//
-	// Valid only with endpoint. The certificate equivalent is x509's
-	// certificateCache, which is separate because it is keyed on a certificate
-	// rather than a key ID and is additionally bounded by the validated chain's
-	// remaining life.
 	// +optional
-	Cache *HTTPSignatureCache `json:"cache,omitempty"`
-
-	// maxAge bounds how old a signature may be, measured from its created
-	// parameter. Signatures without created are rejected. Unset means 5m.
-	//
-	// With endpoint and the default nonce handling, replay is closed by the
-	// resolver recording nonces rather than by this value. What this bounds is how
-	// stale a request may be, and therefore how long the resolver has to remember
-	// a nonce: it is told an expiry of created plus this value plus tolerance, and
-	// may forget the nonce after that. A resolver may narrow it, for itself or for
-	// one key; nothing widens it.
-	//
-	// With x509, or with nonceHandling Ignore, nothing records nonces and this
-	// plus tolerance is the entire replay window.
-	// +optional
-	MaxAge *metav1.Duration `json:"maxAge,omitempty"`
-
-	// tolerance is added to time comparisons to allow for clock skew between
-	// the signer and this server. It widens the window in which a signature is
-	// accepted by the same amount. Unset means no tolerance.
-	// +optional
-	Tolerance *metav1.Duration `json:"tolerance,omitempty"`
-
-	// certificateValidationRules constrain which certificates this
-	// authenticator accepts, beyond chaining to its trust anchors. The rules are
-	// logically ANDed and must all return true.
-	//
-	// They run before claimMappings, so a mapping expression never sees a
-	// certificate no rule has vetted. This is deliberately the opposite order
-	// from the JWT authenticator, which maps first and compensates for it.
-	//
-	// Valid only with x509.
-	// +optional
-	// +listType=atomic
-	CertificateValidationRules []CertificateValidationRule `json:"certificateValidationRules,omitempty"`
-
-	// claimMappings derives the user attributes from the certificate.
-	//
-	// Required with x509 and invalid with endpoint, whose resolver states the
-	// identity with each answer. This is where the cluster decides what a
-	// certificate is allowed to mean, which matters because the identity now comes
-	// from an assertion rather than from this file.
-	// +optional
-	ClaimMappings *HTTPSignatureClaimMappings `json:"claimMappings,omitempty"`
-
-	// userValidationRules are rules applied to the mapped identity before
-	// authentication completes. The rules are logically ANDed and must all
-	// return true.
-	//
-	// These allow invariants to be applied to incoming identities, such as
-	// preventing use of the system: prefix that Kubernetes components use. What
-	// an assertion claims is a claim, not a conclusion, and this is the
-	// cluster's say over it.
-	//
-	// Valid only with x509.
-	// +optional
-	// +listType=atomic
-	UserValidationRules []UserValidationRule `json:"userValidationRules,omitempty"`
+	Cache *HTTPSignatureResolverCache `json:"cache,omitempty"`
 }
 
 // HTTPSignatureX509 resolves a signature's verification key and identity from an
@@ -865,7 +874,12 @@ type HTTPSignatureAuthenticator struct {
 //
 // Only the leaf is read from the request. Intermediates come from
 // certificateAuthority, so the work an unauthenticated caller can cause is one
-// parse and one chain build against a fixed pool.
+// parse and one chain build against a fixed pool, whatever the number of
+// authenticators configured: the leaf's authorityKeyIdentifier names the trust
+// anchor that issued it, and that selects one of them.
+//
+// A presented certificate must carry that extension. RFC 5280 requires a conforming
+// issuer to set it, and without it there is nothing to select an authenticator by.
 //
 // The signature algorithm is not configurable and is determined by the leaf's
 // key type: ed25519 for an Ed25519 key, ecdsa-p256-sha256 for P-256,
@@ -877,6 +891,28 @@ type HTTPSignatureX509 struct {
 	// certificates that a presented certificate must chain to. A certificate
 	// authority is public trust material, so it is stated inline rather than
 	// referenced by path.
+	//
+	// Two authenticators may not share any certificate here, which means a shared
+	// organizational root cannot be used to give two of them different mappings. Put
+	// the intermediate in each bundle and leave the root out: an entry here is a trust
+	// anchor whether or not something above it signed it, so an intermediate alone is
+	// a complete bundle. That is the better configuration anyway, for the reason
+	// above, and the restriction is not arbitrary: a certificate the shared root
+	// issued directly would name it as its issuer and so select both authenticators.
+	//
+	// This bundle must contain the certificate that directly issued a presented
+	// certificate, not only the root above it. Intermediates are never read from the
+	// request, so a two-tier authority means putting both the root and the
+	// intermediate here. That was already required to build a chain; it now also
+	// decides which authenticator is asked, so a missing intermediate is reported as
+	// an unknown issuer rather than as a chain failure.
+	//
+	// Every certificate here must carry a subjectKeyIdentifier, which RFC 5280
+	// requires of a conforming certificate authority certificate. That is the value a
+	// presented certificate's authorityKeyIdentifier names, so it is what selects
+	// this authenticator. Two authenticators may not hold the same identifier, nor
+	// two certificates for the same public key: a certificate would then select both
+	// and which identity it received would depend on the order they appear here.
 	//
 	// Point this at a certificate authority issued for this purpose. Pointing
 	// it at the cluster's client certificate authority would give every
@@ -905,15 +941,34 @@ type HTTPSignatureX509 struct {
 	// +required
 	CertificateAuthority string `json:"certificateAuthority"`
 
-	// certificateCache holds the results of successful certificate validation,
-	// so a client's second request does not repeat the chain build and the
-	// expression evaluation its first one paid for.
+	// certificateValidationRules constrain which certificates this authenticator
+	// accepts, beyond chaining to its trust anchors. The rules are logically
+	// ANDed and must all return true.
+	//
+	// They run before claimMappings, so a mapping expression never sees a
+	// certificate no rule has vetted. This is deliberately the opposite order
+	// from the JWT authenticator, which maps first and compensates for it.
 	// +optional
-	CertificateCache *HTTPSignatureCertificateCache `json:"certificateCache,omitempty"`
+	// +listType=atomic
+	CertificateValidationRules []CertificateValidationRule `json:"certificateValidationRules,omitempty"`
+
+	// claimMappings derives the user attributes from the certificate.
+	//
+	// Required, because the identity comes from the certificate rather than from
+	// this file. This is where the cluster decides what a certificate is allowed
+	// to mean, which matters because the identity is now an assertion rather than
+	// something an administrator wrote down.
+	// +required
+	ClaimMappings *HTTPSignatureClaimMappings `json:"claimMappings,omitempty"`
+
+	// cache holds the results of successful certificate validation, so a client's
+	// second request does not repeat the chain build and the expression
+	// evaluation its first one paid for.
+	// +optional
+	Cache *HTTPSignatureX509Cache `json:"cache,omitempty"`
 }
 
-// HTTPSignatureCertificateCache bounds the memoization of certificate
-// validation.
+// HTTPSignatureX509Cache bounds the memoization of certificate validation.
 //
 // Only successful validations are cached. A negative cache would be keyed on
 // bytes a peer chooses, which is unbounded cardinality for anyone who can send a
@@ -925,7 +980,7 @@ type HTTPSignatureX509 struct {
 // because the mapping is a pure function of the certificate. The expression
 // environment declares no clock and no request, so no expression can produce a
 // different answer for the same certificate at a different time.
-type HTTPSignatureCertificateCache struct {
+type HTTPSignatureX509Cache struct {
 	// maxEntries caps how many validated certificates are remembered. Unset
 	// means 1024. Eviction costs the evicted client one revalidation and
 	// nothing else.
@@ -990,32 +1045,17 @@ type CertificateValidationRule struct {
 //
 // No prefix is applied to any mapped value. An administrator owns avoiding
 // collision with the names other authenticators issue, and an expression can
-// prepend a literal where a prefix is wanted. userValidationRules is where an
-// invariant such as refusing the system: prefix belongs.
+// prepend a literal where a prefix is wanted.
 //
-// Three names are refused outright, because the server asserts them itself
-// according to what it decided and an authenticator claiming one would be stating a
-// falsehood: the groups system:authenticated and system:unauthenticated, which the
-// server adds according to whether authentication succeeded, and the username
-// system:anonymous, which the anonymous authenticator asserts about a request that
-// carried no credential.
+// Three names are refused outright, because the server asserts them itself and an
+// authenticator claiming one would be stating a falsehood: the groups
+// system:authenticated and system:unauthenticated, which the server adds according
+// to whether authentication succeeded, and the username system:anonymous, which the
+// anonymous authenticator asserts about a request that carried no credential.
 //
-// Everything else, including system:masters, is left to userValidationRules. State
-// a rule there unless the deployment means otherwise:
-//
-//	userValidationRules:
-//	- expression: '!user.username.startsWith("system:") && !user.groups.exists(g, g.startsWith("system:"))'
-//	  message: 'this authenticator may not assert an identity under the system: prefix'
-//
-// Read what a derivation gives away before omitting that rule. A mapping such as
-// 'cert.subject.organization' hands the choice of group to whoever can request a
-// certificate from the configured authority, so with a general-purpose authority in
-// the bundle a requester naming system:masters in their organization would receive
-// cluster administrator.
-//
-// Relaxing the rule is a deliberate decision rather than an oversight. Mapping a
-// node's certificate to system:node:<name> means the node authorizer and the
-// NodeRestriction admission plugin now trust this authenticator's trust anchors.
+// Everything else, including system:masters, is left to userValidationRules.
+// Mapping a node's certificate to system:node:<name> is a legitimate use, which is
+// why there is no ban here.
 type HTTPSignatureClaimMappings struct {
 	// username is the mapped user name. The expression must produce a non-empty
 	// string.
@@ -1057,12 +1097,13 @@ type HTTPSignatureClaimExpression struct {
 	Expression string `json:"expression,omitempty"`
 }
 
-// HTTPSignatureCache bounds what this server remembers of a resolver's answers.
+// HTTPSignatureResolverCache bounds what this server remembers of a resolver's
+// answers.
 //
 // A key ID is chosen by the peer, so the number of distinct ones this server is
 // asked about is not bounded by anything in the cluster. Neither cache may be
 // allowed to grow with it.
-type HTTPSignatureCache struct {
+type HTTPSignatureResolverCache struct {
 	// maxKeys caps the entries in each of the two caches kept per resolver: keys
 	// it resolved, and key IDs it said it does not serve. Unset means 1024.
 	//

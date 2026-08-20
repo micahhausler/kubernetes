@@ -87,7 +87,7 @@ type keyCache struct {
 	negativeMaxAge time.Duration
 }
 
-func newKeyCache(resolver KeyResolver, c *apiserver.HTTPSignatureCache) *keyCache {
+func newKeyCache(resolver KeyResolver, c *apiserver.HTTPSignatureResolverCache) *keyCache {
 	maxKeys := defaultMaxKeys
 	maxAge := defaultCacheMaxAge
 	negativeMaxAge := defaultNegativeMaxAge

@@ -147,7 +147,7 @@ func authConfigFor(resolvers ...*resolvertesting.Resolver) string {
 	var b strings.Builder
 	b.WriteString("apiVersion: apiserver.config.k8s.io/v1alpha1\nkind: AuthenticationConfiguration\nhttpSignature:\n  authenticators:\n")
 	for i, r := range resolvers {
-		fmt.Fprintf(&b, "  - name: resolver-%d\n    endpoint: %s\n", i, r.Endpoint())
+		fmt.Fprintf(&b, "  - name: resolver-%d\n    resolver:\n      endpoint: %s\n", i, r.Endpoint())
 	}
 	return b.String()
 }
@@ -440,11 +440,13 @@ kind: AuthenticationConfiguration
 httpSignature:
   authenticators:
   - name: alice-resolver
-    endpoint: %s
-    keyIDPrefixes: [%s]
+    resolver:
+      endpoint: %s
+      keyIDPrefixes: [%s]
   - name: bob-resolver
-    endpoint: %s
-    keyIDPrefixes: [%s]
+    resolver:
+      endpoint: %s
+      keyIDPrefixes: [%s]
 `, aliceResolver.Endpoint(), aliceKeyID, bobResolver.Endpoint(), bobKeyID)
 
 	server, _ := startServer(t, authConfig)
@@ -493,8 +495,9 @@ kind: AuthenticationConfiguration
 httpSignature:
   authenticators:
   - name: session-resolver
-    endpoint: %s
-    relayedHeaders: [X-Session-Token]
+    resolver:
+      endpoint: %s
+      relayedHeaders: [X-Session-Token]
 `, r.Endpoint()))
 	grantPodReader(t, server)
 
@@ -872,8 +875,9 @@ kind: AuthenticationConfiguration
 httpSignature:
   authenticators:
   - name: session-resolver
-    endpoint: %s
-    relayedHeaders: [X-Session-Token]
+    resolver:
+      endpoint: %s
+      relayedHeaders: [X-Session-Token]
 `, r.Endpoint()))
 	grantPodReader(t, server)
 
@@ -983,8 +987,9 @@ kind: AuthenticationConfiguration
 httpSignature:
   authenticators:
   - name: resolver
-    endpoint: %s
-    nonceHandling: Ignore
+    resolver:
+      endpoint: %s
+      nonceHandling: Ignore
 `, r.Endpoint()))
 	grantPodReader(t, server)
 
@@ -1055,8 +1060,9 @@ kind: AuthenticationConfiguration
 httpSignature:
   authenticators:
   - name: resolver
-    endpoint: %s
-    nonceHandling: Consume
+    resolver:
+      endpoint: %s
+      nonceHandling: Consume
 `, version, r.Endpoint()))
 
 			clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
@@ -1166,16 +1172,16 @@ httpSignature:
     x509:
       certificateAuthority: |
 %s
-    claimMappings:
-      username:
-        expression: '"cert:" + cert.subject.commonName'
-      groups:
-        expression: cert.subject.organization
-      uid:
-        expression: cert.sha256Thumbprint
-      extra:
-      - key: example.org/workload-id
-        valueExpression: cert.uriSANs
+      claimMappings:
+        username:
+          expression: '"cert:" + cert.subject.commonName'
+        groups:
+          expression: cert.subject.organization
+        uid:
+          expression: cert.sha256Thumbprint
+        extra:
+        - key: example.org/workload-id
+          valueExpression: cert.uriSANs
 %s`, indent(caPEM), extra)
 }
 
@@ -1280,9 +1286,9 @@ func TestCertificateFromAnotherAuthorityIsRejected(t *testing.T) {
 func TestCertificateRulesRejectOverTheWire(t *testing.T) {
 	caPEM, certFile, keyFile, _ := issueCertificate(t, "builder", []string{"wrong-org"}, nil)
 	server, _ := startServer(t, certificateAuthConfig(t, caPEM, `
-    certificateValidationRules:
-    - expression: cert.subject.organization.exists(o, o == "`+signerGrp+`")
-      message: certificate must be issued to the signers organization
+      certificateValidationRules:
+      - expression: cert.subject.organization.exists(o, o == "`+signerGrp+`")
+        message: certificate must be issued to the signers organization
 `))
 	grantPodReader(t, server)
 
@@ -1379,16 +1385,17 @@ kind: AuthenticationConfiguration
 httpSignature:
   authenticators:
   - name: resolver
-    endpoint: %s
+    resolver:
+      endpoint: %s
   - name: workload-certificates
     x509:
       certificateAuthority: |
 %s
-    claimMappings:
-      username:
-        expression: '"cert:" + cert.subject.commonName'
-      groups:
-        expression: cert.subject.organization
+      claimMappings:
+        username:
+          expression: '"cert:" + cert.subject.commonName'
+        groups:
+          expression: cert.subject.organization
 `, r.Endpoint(), indent(caPEM)))
 	grantPodReader(t, server)
 

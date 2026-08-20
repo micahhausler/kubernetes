@@ -75,7 +75,7 @@ func TestGeneratedConfigIsAccepted(t *testing.T) {
 	// signature are present.
 	var resolvers, certs int
 	for _, a := range config.HTTPSignature.Authenticators {
-		if len(a.Endpoint) > 0 {
+		if a.Resolver != nil {
 			resolvers++
 		}
 		if a.X509 != nil {

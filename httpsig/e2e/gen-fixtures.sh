@@ -125,7 +125,8 @@ if [[ ! -f "$node/demo-ca.crt" ]]; then
     -keyout "$client/demo-ca.key" -out "$node/demo-ca.crt" -days 30 \
     -subj "/CN=httpsig-demo-ca" \
     -addext "basicConstraints=critical,CA:TRUE" \
-    -addext "keyUsage=critical,keyCertSign,digitalSignature" 2>/dev/null
+    -addext "keyUsage=critical,keyCertSign,digitalSignature" \
+    -addext "subjectKeyIdentifier=hash" 2>/dev/null
   chmod 600 "$client/demo-ca.key"
   echo "generated $node/demo-ca.crt and $client/demo-ca.key"
 fi
@@ -135,6 +136,11 @@ fi
 # The lifetime is short on purpose. A certificate's lifetime is the withdrawal
 # window in this design, because the server holds nothing per client to delete, and
 # the config states a rule refusing anything longer than a day.
+#
+# authorityKeyIdentifier is stated rather than left to openssl's default, because the
+# API server requires it: it names the trust anchor that issued the leaf, which is
+# what selects the authenticator that validates it. Recent openssl adds it here
+# anyway; saying so keeps the fixtures from depending on that.
 issue_leaf() {
   local name="$1" subject="$2" ca_crt="$3" ca_key="$4"
   [[ -f "$client/$name.crt" ]] && return 0
@@ -142,7 +148,7 @@ issue_leaf() {
     -keyout "$client/$name.key" -out "$client/$name.csr" -subj "$subject" 2>/dev/null
   openssl x509 -req -in "$client/$name.csr" -CA "$ca_crt" -CAkey "$ca_key" \
     -out "$client/$name.crt" -days 1 -set_serial "0x$(openssl rand -hex 8)" \
-    -extfile <(printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n') 2>/dev/null
+    -extfile <(printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n') 2>/dev/null
   rm -f "$client/$name.csr"
   chmod 600 "$client/$name.key"
   echo "generated $client/$name.crt"
@@ -177,7 +183,8 @@ if [[ ! -f "$client/rogue-ca.crt" ]]; then
     -keyout "$client/rogue-ca.key" -out "$client/rogue-ca.crt" -days 30 \
     -subj "/CN=httpsig-rogue-ca" \
     -addext "basicConstraints=critical,CA:TRUE" \
-    -addext "keyUsage=critical,keyCertSign,digitalSignature" 2>/dev/null
+    -addext "keyUsage=critical,keyCertSign,digitalSignature" \
+    -addext "subjectKeyIdentifier=hash" 2>/dev/null
   chmod 600 "$client/rogue-ca.key"
 fi
 issue_leaf rogue "/CN=cert-demo/O=httpsig-demo/O=httpsig-certificate" \
@@ -273,11 +280,19 @@ httpSignature:
   # Read what is absent here: no key, no public key, no identity, no ladder. That
   # absence is the point of the external key API.
   - name: demo-resolver
-    endpoint: unix:///httpsig-socket/resolver.sock
     # Verified against the created timestamp the signature carries, so a stale
     # request is refused. Replay is closed by the resolver recording nonces, not by
     # this; what this bounds is how long the resolver is asked to remember one.
     maxAge: 1m
+    resolver:
+      endpoint: unix:///httpsig-socket/resolver.sock
+    # Whoever can serve on that socket names the identity, so this is the cluster's
+    # only say over what it may claim. There is no default rule: without this the
+    # demo resolver could vend system:masters.
+    userValidationRules:
+    - expression: '!user.username.startsWith("system:") && !user.groups.exists(g, g.startsWith("system:"))'
+      message: 'this authenticator may not assert an identity under the system: prefix'
+
   - name: demo-certificates
     maxAge: 1m
     x509:
@@ -286,39 +301,40 @@ httpSignature:
       # nothing here issued it.
       certificateAuthority: |
 $(sed 's/^/        /' <"$node/demo-ca.crt")
-      certificateCache:
+      cache:
         # Short so the demo can be reasoned about. This is also the window in which
         # withdrawing a certificate has no effect, since the server holds nothing
         # per client to delete.
         ttl: 30s
-    # Run before the mappings, so a mapping never reads a certificate no rule has
-    # vetted. A certificate's lifetime is the withdrawal window, and this is the
-    # only lever the verifier has over it.
-    certificateValidationRules:
-    - expression: cert.notAfter - cert.notBefore <= duration('24h')
-      message: certificate lifetime must not exceed 24 hours
-    # No identity for this client appears anywhere in this file. It comes from the
-    # certificate, which is the point.
-    claimMappings:
-      username:
-        expression: cert.subject.commonName
-      groups:
-        expression: cert.subject.organization
-      uid:
-        # The same value the signature's keyid carries, so the identity names one
-        # exact certificate rather than anything its issuer could reuse.
-        expression: cert.sha256Thumbprint
-      extra:
-      - key: httpsig.example.com/issuer
-        valueExpression: cert.issuer.commonName
+      # Run before the mappings, so a mapping never reads a certificate no rule has
+      # vetted. A certificate's lifetime is the withdrawal window, and this is the
+      # only lever the verifier has over it.
+      certificateValidationRules:
+      - expression: cert.notAfter - cert.notBefore <= duration('24h')
+        message: certificate lifetime must not exceed 24 hours
+      # No identity for this client appears anywhere in this file. It comes from the
+      # certificate, which is the point.
+      claimMappings:
+        username:
+          expression: cert.subject.commonName
+        groups:
+          expression: cert.subject.organization
+        uid:
+          # The same value the signature's keyid carries, so the identity names one
+          # exact certificate rather than anything its issuer could reuse.
+          expression: cert.sha256Thumbprint
+        extra:
+        - key: httpsig.example.com/issuer
+          valueExpression: cert.issuer.commonName
     # The mapping above derives the groups from the certificate's subject, which
     # hands the choice of group to whoever can request one. Without this rule, a
     # requester naming system:masters in their organization would receive cluster
     # administrator.
     #
-    # There is no nonceHandling here, and it would be refused: recording nonces
-    # needs a store every API server shares, and this authenticator has no resolver
-    # to hold one. maxAge above is the whole replay window for a certificate.
+    # There is no nonceHandling to reach for here: that setting lives inside
+    # resolver, and recording nonces needs a store every API server shares, which
+    # this authenticator has no resolver to hold. maxAge above is the whole replay
+    # window for a certificate.
     userValidationRules:
     - expression: '!user.username.startsWith("system:") && !user.groups.exists(g, g.startsWith("system:"))'
       message: 'this authenticator may not assert an identity under the system: prefix'

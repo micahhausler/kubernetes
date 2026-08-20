@@ -187,26 +187,6 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}); err != nil {
 		return err
 	}
-	if err := s.AddGeneratedConversionFunc((*HTTPSignatureCache)(nil), (*apiserver.HTTPSignatureCache)(nil), func(a, b interface{}, scope conversion.Scope) error {
-		return Convert_v1_HTTPSignatureCache_To_apiserver_HTTPSignatureCache(a.(*HTTPSignatureCache), b.(*apiserver.HTTPSignatureCache), scope)
-	}); err != nil {
-		return err
-	}
-	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureCache)(nil), (*HTTPSignatureCache)(nil), func(a, b interface{}, scope conversion.Scope) error {
-		return Convert_apiserver_HTTPSignatureCache_To_v1_HTTPSignatureCache(a.(*apiserver.HTTPSignatureCache), b.(*HTTPSignatureCache), scope)
-	}); err != nil {
-		return err
-	}
-	if err := s.AddGeneratedConversionFunc((*HTTPSignatureCertificateCache)(nil), (*apiserver.HTTPSignatureCertificateCache)(nil), func(a, b interface{}, scope conversion.Scope) error {
-		return Convert_v1_HTTPSignatureCertificateCache_To_apiserver_HTTPSignatureCertificateCache(a.(*HTTPSignatureCertificateCache), b.(*apiserver.HTTPSignatureCertificateCache), scope)
-	}); err != nil {
-		return err
-	}
-	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureCertificateCache)(nil), (*HTTPSignatureCertificateCache)(nil), func(a, b interface{}, scope conversion.Scope) error {
-		return Convert_apiserver_HTTPSignatureCertificateCache_To_v1_HTTPSignatureCertificateCache(a.(*apiserver.HTTPSignatureCertificateCache), b.(*HTTPSignatureCertificateCache), scope)
-	}); err != nil {
-		return err
-	}
 	if err := s.AddGeneratedConversionFunc((*HTTPSignatureClaimExpression)(nil), (*apiserver.HTTPSignatureClaimExpression)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_v1_HTTPSignatureClaimExpression_To_apiserver_HTTPSignatureClaimExpression(a.(*HTTPSignatureClaimExpression), b.(*apiserver.HTTPSignatureClaimExpression), scope)
 	}); err != nil {
@@ -237,6 +217,26 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}); err != nil {
 		return err
 	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureResolver)(nil), (*apiserver.HTTPSignatureResolver)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1_HTTPSignatureResolver_To_apiserver_HTTPSignatureResolver(a.(*HTTPSignatureResolver), b.(*apiserver.HTTPSignatureResolver), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureResolver)(nil), (*HTTPSignatureResolver)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_apiserver_HTTPSignatureResolver_To_v1_HTTPSignatureResolver(a.(*apiserver.HTTPSignatureResolver), b.(*HTTPSignatureResolver), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureResolverCache)(nil), (*apiserver.HTTPSignatureResolverCache)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1_HTTPSignatureResolverCache_To_apiserver_HTTPSignatureResolverCache(a.(*HTTPSignatureResolverCache), b.(*apiserver.HTTPSignatureResolverCache), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureResolverCache)(nil), (*HTTPSignatureResolverCache)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_apiserver_HTTPSignatureResolverCache_To_v1_HTTPSignatureResolverCache(a.(*apiserver.HTTPSignatureResolverCache), b.(*HTTPSignatureResolverCache), scope)
+	}); err != nil {
+		return err
+	}
 	if err := s.AddGeneratedConversionFunc((*HTTPSignatureX509)(nil), (*apiserver.HTTPSignatureX509)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_v1_HTTPSignatureX509_To_apiserver_HTTPSignatureX509(a.(*HTTPSignatureX509), b.(*apiserver.HTTPSignatureX509), scope)
 	}); err != nil {
@@ -244,6 +244,16 @@ func RegisterConversions(s *runtime.Scheme) error {
 	}
 	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureX509)(nil), (*HTTPSignatureX509)(nil), func(a, b interface{}, scope conversion.Scope) error {
 		return Convert_apiserver_HTTPSignatureX509_To_v1_HTTPSignatureX509(a.(*apiserver.HTTPSignatureX509), b.(*HTTPSignatureX509), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*HTTPSignatureX509Cache)(nil), (*apiserver.HTTPSignatureX509Cache)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_v1_HTTPSignatureX509Cache_To_apiserver_HTTPSignatureX509Cache(a.(*HTTPSignatureX509Cache), b.(*apiserver.HTTPSignatureX509Cache), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddGeneratedConversionFunc((*apiserver.HTTPSignatureX509Cache)(nil), (*HTTPSignatureX509Cache)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return Convert_apiserver_HTTPSignatureX509Cache_To_v1_HTTPSignatureX509Cache(a.(*apiserver.HTTPSignatureX509Cache), b.(*HTTPSignatureX509Cache), scope)
 	}); err != nil {
 		return err
 	}
@@ -503,15 +513,7 @@ func autoConvert_v1_AuthenticationConfiguration_To_apiserver_AuthenticationConfi
 		out.JWT = nil
 	}
 	out.Anonymous = (*apiserver.AnonymousAuthConfig)(unsafe.Pointer(in.Anonymous))
-	if in.HTTPSignature != nil {
-		in, out := &in.HTTPSignature, &out.HTTPSignature
-		*out = new(apiserver.HTTPSignatureConfig)
-		if err := Convert_v1_HTTPSignatureConfig_To_apiserver_HTTPSignatureConfig(*in, *out, s); err != nil {
-			return err
-		}
-	} else {
-		out.HTTPSignature = nil
-	}
+	out.HTTPSignature = (*apiserver.HTTPSignatureConfig)(unsafe.Pointer(in.HTTPSignature))
 	return nil
 }
 
@@ -533,15 +535,7 @@ func autoConvert_apiserver_AuthenticationConfiguration_To_v1_AuthenticationConfi
 		out.JWT = nil
 	}
 	out.Anonymous = (*AnonymousAuthConfig)(unsafe.Pointer(in.Anonymous))
-	if in.HTTPSignature != nil {
-		in, out := &in.HTTPSignature, &out.HTTPSignature
-		*out = new(HTTPSignatureConfig)
-		if err := Convert_apiserver_HTTPSignatureConfig_To_v1_HTTPSignatureConfig(*in, *out, s); err != nil {
-			return err
-		}
-	} else {
-		out.HTTPSignature = nil
-	}
+	out.HTTPSignature = (*HTTPSignatureConfig)(unsafe.Pointer(in.HTTPSignature))
 	return nil
 }
 
@@ -751,18 +745,7 @@ func Convert_apiserver_ExtraMapping_To_v1_ExtraMapping(in *apiserver.ExtraMappin
 }
 
 func autoConvert_v1_HTTPSignatureAuthenticator_To_apiserver_HTTPSignatureAuthenticator(in *HTTPSignatureAuthenticator, out *apiserver.HTTPSignatureAuthenticator, s conversion.Scope) error {
-	out.Name = in.Name
-	out.Endpoint = in.Endpoint
-	out.X509 = (*apiserver.HTTPSignatureX509)(unsafe.Pointer(in.X509))
-	out.KeyIDPrefixes = *(*[]string)(unsafe.Pointer(&in.KeyIDPrefixes))
-	out.RelayedHeaders = *(*[]string)(unsafe.Pointer(&in.RelayedHeaders))
-	out.NonceHandling = apiserver.NonceHandling(in.NonceHandling)
-	out.Cache = (*apiserver.HTTPSignatureCache)(unsafe.Pointer(in.Cache))
-	out.MaxAge = (*metav1.Duration)(unsafe.Pointer(in.MaxAge))
-	out.Tolerance = (*metav1.Duration)(unsafe.Pointer(in.Tolerance))
-	out.CertificateValidationRules = *(*[]apiserver.CertificateValidationRule)(unsafe.Pointer(&in.CertificateValidationRules))
-	out.ClaimMappings = (*apiserver.HTTPSignatureClaimMappings)(unsafe.Pointer(in.ClaimMappings))
-	out.UserValidationRules = *(*[]apiserver.UserValidationRule)(unsafe.Pointer(&in.UserValidationRules))
+	*out = *(*apiserver.HTTPSignatureAuthenticator)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -772,64 +755,13 @@ func Convert_v1_HTTPSignatureAuthenticator_To_apiserver_HTTPSignatureAuthenticat
 }
 
 func autoConvert_apiserver_HTTPSignatureAuthenticator_To_v1_HTTPSignatureAuthenticator(in *apiserver.HTTPSignatureAuthenticator, out *HTTPSignatureAuthenticator, s conversion.Scope) error {
-	out.Name = in.Name
-	out.Endpoint = in.Endpoint
-	out.KeyIDPrefixes = *(*[]string)(unsafe.Pointer(&in.KeyIDPrefixes))
-	out.RelayedHeaders = *(*[]string)(unsafe.Pointer(&in.RelayedHeaders))
-	out.NonceHandling = NonceHandling(in.NonceHandling)
-	out.Cache = (*HTTPSignatureCache)(unsafe.Pointer(in.Cache))
-	out.X509 = (*HTTPSignatureX509)(unsafe.Pointer(in.X509))
-	out.MaxAge = (*metav1.Duration)(unsafe.Pointer(in.MaxAge))
-	out.Tolerance = (*metav1.Duration)(unsafe.Pointer(in.Tolerance))
-	out.CertificateValidationRules = *(*[]CertificateValidationRule)(unsafe.Pointer(&in.CertificateValidationRules))
-	out.ClaimMappings = (*HTTPSignatureClaimMappings)(unsafe.Pointer(in.ClaimMappings))
-	out.UserValidationRules = *(*[]UserValidationRule)(unsafe.Pointer(&in.UserValidationRules))
+	*out = *(*HTTPSignatureAuthenticator)(unsafe.Pointer(in))
 	return nil
 }
 
 // Convert_apiserver_HTTPSignatureAuthenticator_To_v1_HTTPSignatureAuthenticator is an autogenerated conversion function.
 func Convert_apiserver_HTTPSignatureAuthenticator_To_v1_HTTPSignatureAuthenticator(in *apiserver.HTTPSignatureAuthenticator, out *HTTPSignatureAuthenticator, s conversion.Scope) error {
 	return autoConvert_apiserver_HTTPSignatureAuthenticator_To_v1_HTTPSignatureAuthenticator(in, out, s)
-}
-
-func autoConvert_v1_HTTPSignatureCache_To_apiserver_HTTPSignatureCache(in *HTTPSignatureCache, out *apiserver.HTTPSignatureCache, s conversion.Scope) error {
-	*out = *(*apiserver.HTTPSignatureCache)(unsafe.Pointer(in))
-	return nil
-}
-
-// Convert_v1_HTTPSignatureCache_To_apiserver_HTTPSignatureCache is an autogenerated conversion function.
-func Convert_v1_HTTPSignatureCache_To_apiserver_HTTPSignatureCache(in *HTTPSignatureCache, out *apiserver.HTTPSignatureCache, s conversion.Scope) error {
-	return autoConvert_v1_HTTPSignatureCache_To_apiserver_HTTPSignatureCache(in, out, s)
-}
-
-func autoConvert_apiserver_HTTPSignatureCache_To_v1_HTTPSignatureCache(in *apiserver.HTTPSignatureCache, out *HTTPSignatureCache, s conversion.Scope) error {
-	*out = *(*HTTPSignatureCache)(unsafe.Pointer(in))
-	return nil
-}
-
-// Convert_apiserver_HTTPSignatureCache_To_v1_HTTPSignatureCache is an autogenerated conversion function.
-func Convert_apiserver_HTTPSignatureCache_To_v1_HTTPSignatureCache(in *apiserver.HTTPSignatureCache, out *HTTPSignatureCache, s conversion.Scope) error {
-	return autoConvert_apiserver_HTTPSignatureCache_To_v1_HTTPSignatureCache(in, out, s)
-}
-
-func autoConvert_v1_HTTPSignatureCertificateCache_To_apiserver_HTTPSignatureCertificateCache(in *HTTPSignatureCertificateCache, out *apiserver.HTTPSignatureCertificateCache, s conversion.Scope) error {
-	*out = *(*apiserver.HTTPSignatureCertificateCache)(unsafe.Pointer(in))
-	return nil
-}
-
-// Convert_v1_HTTPSignatureCertificateCache_To_apiserver_HTTPSignatureCertificateCache is an autogenerated conversion function.
-func Convert_v1_HTTPSignatureCertificateCache_To_apiserver_HTTPSignatureCertificateCache(in *HTTPSignatureCertificateCache, out *apiserver.HTTPSignatureCertificateCache, s conversion.Scope) error {
-	return autoConvert_v1_HTTPSignatureCertificateCache_To_apiserver_HTTPSignatureCertificateCache(in, out, s)
-}
-
-func autoConvert_apiserver_HTTPSignatureCertificateCache_To_v1_HTTPSignatureCertificateCache(in *apiserver.HTTPSignatureCertificateCache, out *HTTPSignatureCertificateCache, s conversion.Scope) error {
-	*out = *(*HTTPSignatureCertificateCache)(unsafe.Pointer(in))
-	return nil
-}
-
-// Convert_apiserver_HTTPSignatureCertificateCache_To_v1_HTTPSignatureCertificateCache is an autogenerated conversion function.
-func Convert_apiserver_HTTPSignatureCertificateCache_To_v1_HTTPSignatureCertificateCache(in *apiserver.HTTPSignatureCertificateCache, out *HTTPSignatureCertificateCache, s conversion.Scope) error {
-	return autoConvert_apiserver_HTTPSignatureCertificateCache_To_v1_HTTPSignatureCertificateCache(in, out, s)
 }
 
 func autoConvert_v1_HTTPSignatureClaimExpression_To_apiserver_HTTPSignatureClaimExpression(in *HTTPSignatureClaimExpression, out *apiserver.HTTPSignatureClaimExpression, s conversion.Scope) error {
@@ -873,19 +805,7 @@ func Convert_apiserver_HTTPSignatureClaimMappings_To_v1_HTTPSignatureClaimMappin
 }
 
 func autoConvert_v1_HTTPSignatureConfig_To_apiserver_HTTPSignatureConfig(in *HTTPSignatureConfig, out *apiserver.HTTPSignatureConfig, s conversion.Scope) error {
-	out.Authority = in.Authority
-	out.Scheme = in.Scheme
-	if in.Authenticators != nil {
-		in, out := &in.Authenticators, &out.Authenticators
-		*out = make([]apiserver.HTTPSignatureAuthenticator, len(*in))
-		for i := range *in {
-			if err := Convert_v1_HTTPSignatureAuthenticator_To_apiserver_HTTPSignatureAuthenticator(&(*in)[i], &(*out)[i], s); err != nil {
-				return err
-			}
-		}
-	} else {
-		out.Authenticators = nil
-	}
+	*out = *(*apiserver.HTTPSignatureConfig)(unsafe.Pointer(in))
 	return nil
 }
 
@@ -895,25 +815,53 @@ func Convert_v1_HTTPSignatureConfig_To_apiserver_HTTPSignatureConfig(in *HTTPSig
 }
 
 func autoConvert_apiserver_HTTPSignatureConfig_To_v1_HTTPSignatureConfig(in *apiserver.HTTPSignatureConfig, out *HTTPSignatureConfig, s conversion.Scope) error {
-	out.Authority = in.Authority
-	out.Scheme = in.Scheme
-	if in.Authenticators != nil {
-		in, out := &in.Authenticators, &out.Authenticators
-		*out = make([]HTTPSignatureAuthenticator, len(*in))
-		for i := range *in {
-			if err := Convert_apiserver_HTTPSignatureAuthenticator_To_v1_HTTPSignatureAuthenticator(&(*in)[i], &(*out)[i], s); err != nil {
-				return err
-			}
-		}
-	} else {
-		out.Authenticators = nil
-	}
+	*out = *(*HTTPSignatureConfig)(unsafe.Pointer(in))
 	return nil
 }
 
 // Convert_apiserver_HTTPSignatureConfig_To_v1_HTTPSignatureConfig is an autogenerated conversion function.
 func Convert_apiserver_HTTPSignatureConfig_To_v1_HTTPSignatureConfig(in *apiserver.HTTPSignatureConfig, out *HTTPSignatureConfig, s conversion.Scope) error {
 	return autoConvert_apiserver_HTTPSignatureConfig_To_v1_HTTPSignatureConfig(in, out, s)
+}
+
+func autoConvert_v1_HTTPSignatureResolver_To_apiserver_HTTPSignatureResolver(in *HTTPSignatureResolver, out *apiserver.HTTPSignatureResolver, s conversion.Scope) error {
+	*out = *(*apiserver.HTTPSignatureResolver)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1_HTTPSignatureResolver_To_apiserver_HTTPSignatureResolver is an autogenerated conversion function.
+func Convert_v1_HTTPSignatureResolver_To_apiserver_HTTPSignatureResolver(in *HTTPSignatureResolver, out *apiserver.HTTPSignatureResolver, s conversion.Scope) error {
+	return autoConvert_v1_HTTPSignatureResolver_To_apiserver_HTTPSignatureResolver(in, out, s)
+}
+
+func autoConvert_apiserver_HTTPSignatureResolver_To_v1_HTTPSignatureResolver(in *apiserver.HTTPSignatureResolver, out *HTTPSignatureResolver, s conversion.Scope) error {
+	*out = *(*HTTPSignatureResolver)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_apiserver_HTTPSignatureResolver_To_v1_HTTPSignatureResolver is an autogenerated conversion function.
+func Convert_apiserver_HTTPSignatureResolver_To_v1_HTTPSignatureResolver(in *apiserver.HTTPSignatureResolver, out *HTTPSignatureResolver, s conversion.Scope) error {
+	return autoConvert_apiserver_HTTPSignatureResolver_To_v1_HTTPSignatureResolver(in, out, s)
+}
+
+func autoConvert_v1_HTTPSignatureResolverCache_To_apiserver_HTTPSignatureResolverCache(in *HTTPSignatureResolverCache, out *apiserver.HTTPSignatureResolverCache, s conversion.Scope) error {
+	*out = *(*apiserver.HTTPSignatureResolverCache)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1_HTTPSignatureResolverCache_To_apiserver_HTTPSignatureResolverCache is an autogenerated conversion function.
+func Convert_v1_HTTPSignatureResolverCache_To_apiserver_HTTPSignatureResolverCache(in *HTTPSignatureResolverCache, out *apiserver.HTTPSignatureResolverCache, s conversion.Scope) error {
+	return autoConvert_v1_HTTPSignatureResolverCache_To_apiserver_HTTPSignatureResolverCache(in, out, s)
+}
+
+func autoConvert_apiserver_HTTPSignatureResolverCache_To_v1_HTTPSignatureResolverCache(in *apiserver.HTTPSignatureResolverCache, out *HTTPSignatureResolverCache, s conversion.Scope) error {
+	*out = *(*HTTPSignatureResolverCache)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_apiserver_HTTPSignatureResolverCache_To_v1_HTTPSignatureResolverCache is an autogenerated conversion function.
+func Convert_apiserver_HTTPSignatureResolverCache_To_v1_HTTPSignatureResolverCache(in *apiserver.HTTPSignatureResolverCache, out *HTTPSignatureResolverCache, s conversion.Scope) error {
+	return autoConvert_apiserver_HTTPSignatureResolverCache_To_v1_HTTPSignatureResolverCache(in, out, s)
 }
 
 func autoConvert_v1_HTTPSignatureX509_To_apiserver_HTTPSignatureX509(in *HTTPSignatureX509, out *apiserver.HTTPSignatureX509, s conversion.Scope) error {
@@ -934,6 +882,26 @@ func autoConvert_apiserver_HTTPSignatureX509_To_v1_HTTPSignatureX509(in *apiserv
 // Convert_apiserver_HTTPSignatureX509_To_v1_HTTPSignatureX509 is an autogenerated conversion function.
 func Convert_apiserver_HTTPSignatureX509_To_v1_HTTPSignatureX509(in *apiserver.HTTPSignatureX509, out *HTTPSignatureX509, s conversion.Scope) error {
 	return autoConvert_apiserver_HTTPSignatureX509_To_v1_HTTPSignatureX509(in, out, s)
+}
+
+func autoConvert_v1_HTTPSignatureX509Cache_To_apiserver_HTTPSignatureX509Cache(in *HTTPSignatureX509Cache, out *apiserver.HTTPSignatureX509Cache, s conversion.Scope) error {
+	*out = *(*apiserver.HTTPSignatureX509Cache)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_v1_HTTPSignatureX509Cache_To_apiserver_HTTPSignatureX509Cache is an autogenerated conversion function.
+func Convert_v1_HTTPSignatureX509Cache_To_apiserver_HTTPSignatureX509Cache(in *HTTPSignatureX509Cache, out *apiserver.HTTPSignatureX509Cache, s conversion.Scope) error {
+	return autoConvert_v1_HTTPSignatureX509Cache_To_apiserver_HTTPSignatureX509Cache(in, out, s)
+}
+
+func autoConvert_apiserver_HTTPSignatureX509Cache_To_v1_HTTPSignatureX509Cache(in *apiserver.HTTPSignatureX509Cache, out *HTTPSignatureX509Cache, s conversion.Scope) error {
+	*out = *(*HTTPSignatureX509Cache)(unsafe.Pointer(in))
+	return nil
+}
+
+// Convert_apiserver_HTTPSignatureX509Cache_To_v1_HTTPSignatureX509Cache is an autogenerated conversion function.
+func Convert_apiserver_HTTPSignatureX509Cache_To_v1_HTTPSignatureX509Cache(in *apiserver.HTTPSignatureX509Cache, out *HTTPSignatureX509Cache, s conversion.Scope) error {
+	return autoConvert_apiserver_HTTPSignatureX509Cache_To_v1_HTTPSignatureX509Cache(in, out, s)
 }
 
 func autoConvert_v1_IdentityConfiguration_To_apiserver_IdentityConfiguration(in *IdentityConfiguration, out *apiserver.IdentityConfiguration, s conversion.Scope) error {

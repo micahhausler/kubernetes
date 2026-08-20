@@ -140,7 +140,8 @@ kind: AuthenticationConfiguration
 httpSignature:
   authenticators:
   - name: resolver
-    endpoint: %s
+    resolver:
+      endpoint: %s
 `, endpoint))
 	grantPodReader(t, server)
 
@@ -202,7 +203,8 @@ kind: AuthenticationConfiguration
 httpSignature:
   authenticators:
   - name: resolver
-    endpoint: %s
+    resolver:
+      endpoint: %s
 `, endpoint))
 
 	clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
@@ -280,7 +282,8 @@ kind: AuthenticationConfiguration
 httpSignature:
   authenticators:
   - name: resolver
-    endpoint: unix://%s
+    resolver:
+      endpoint: unix://%s
 `, socket))
 
 	clientConfig := signingClientConfig(t, server, aliceUser, &clientcmdapi.HTTPSignatureConfig{
@@ -364,7 +367,8 @@ kind: AuthenticationConfiguration
 httpSignature:
   authenticators:
   - name: resolver
-    endpoint: %s
+    resolver:
+      endpoint: %s
 `, endpoint))
 
 	stageJSON := fmt.Sprintf(`{"from":%q,"scope":{"date":%q,"cluster":%q}}`, stage.From, stage.Scope["date"], stage.Scope["cluster"])

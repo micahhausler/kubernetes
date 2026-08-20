@@ -48,38 +48,41 @@ func CompileCertificateAuthenticator(compiler authenticationcel.Compiler, c apis
 	if compiler == nil {
 		compiler = authenticationcel.NewDefaultCompiler()
 	}
+	if c.X509 == nil {
+		return mapper, fmt.Errorf("x509 is required")
+	}
 
-	if len(c.CertificateValidationRules) > 0 {
-		compiled := make([]authenticationcel.CompilationResult, 0, len(c.CertificateValidationRules))
-		for i, rule := range c.CertificateValidationRules {
+	if len(c.X509.CertificateValidationRules) > 0 {
+		compiled := make([]authenticationcel.CompilationResult, 0, len(c.X509.CertificateValidationRules))
+		for i, rule := range c.X509.CertificateValidationRules {
 			result, err := compiler.CompileCertificateExpression(&authenticationcel.CertificateValidationCondition{
 				Expression: rule.Expression,
 				Message:    rule.Message,
 			})
 			if err != nil {
-				return mapper, fmt.Errorf("certificateValidationRules[%d].expression: %w", i, err)
+				return mapper, fmt.Errorf("x509.certificateValidationRules[%d].expression: %w", i, err)
 			}
 			compiled = append(compiled, result)
 		}
 		mapper.CertificateValidationRules = authenticationcel.NewCertificateMapper(compiled)
 	}
 
-	if c.ClaimMappings == nil {
-		return mapper, fmt.Errorf("claimMappings is required")
+	if c.X509.ClaimMappings == nil {
+		return mapper, fmt.Errorf("x509.claimMappings is required")
 	}
-	m := c.ClaimMappings
+	m := c.X509.ClaimMappings
 
 	if m.Username.Expression == "" {
-		return mapper, fmt.Errorf("claimMappings.username.expression is required")
+		return mapper, fmt.Errorf("x509.claimMappings.username.expression is required")
 	}
 	for _, single := range []struct {
 		path string
 		expr string
 		into *authenticationcel.CertificateMapper
 	}{
-		{"claimMappings.username.expression", m.Username.Expression, &mapper.Username},
-		{"claimMappings.groups.expression", m.Groups.Expression, &mapper.Groups},
-		{"claimMappings.uid.expression", m.UID.Expression, &mapper.UID},
+		{"x509.claimMappings.username.expression", m.Username.Expression, &mapper.Username},
+		{"x509.claimMappings.groups.expression", m.Groups.Expression, &mapper.Groups},
+		{"x509.claimMappings.uid.expression", m.UID.Expression, &mapper.UID},
 	} {
 		if single.expr == "" {
 			continue
@@ -99,27 +102,18 @@ func CompileCertificateAuthenticator(compiler authenticationcel.Compiler, c apis
 				Expression: extra.ValueExpression,
 			})
 			if err != nil {
-				return mapper, fmt.Errorf("claimMappings.extra[%d].valueExpression: %w", i, err)
+				return mapper, fmt.Errorf("x509.claimMappings.extra[%d].valueExpression: %w", i, err)
 			}
 			compiled = append(compiled, result)
 		}
 		mapper.Extra = authenticationcel.NewCertificateMapper(compiled)
 	}
 
-	if len(c.UserValidationRules) > 0 {
-		compiled := make([]authenticationcel.CompilationResult, 0, len(c.UserValidationRules))
-		for i, rule := range c.UserValidationRules {
-			result, err := compiler.CompileUserExpression(&authenticationcel.UserValidationCondition{
-				Expression: rule.Expression,
-				Message:    rule.Message,
-			})
-			if err != nil {
-				return mapper, fmt.Errorf("userValidationRules[%d].expression: %w", i, err)
-			}
-			compiled = append(compiled, result)
-		}
-		mapper.UserValidationRules = authenticationcel.NewUserMapper(compiled)
+	userRules, err := CompileUserValidationRules(compiler, c.UserValidationRules)
+	if err != nil {
+		return mapper, err
 	}
+	mapper.UserValidationRules = userRules
 	return mapper, nil
 }
 
@@ -189,21 +183,51 @@ func evaluateUserRules(ctx context.Context, rules authenticationcel.UserMapper, 
 // mapping such as 'cert.subject.organization' derives the value from the
 // certificate, which puts the choice in the hands of whoever can request one.
 // Reviewing expression text would catch a literal and miss that.
-func checkReservedIdentity(info *user.DefaultInfo) error {
+// source names what produced the identity, so the error points at the thing to
+// change: a mapping expression for a certificate, a resolver's response otherwise.
+func checkReservedIdentity(info *user.DefaultInfo, source string) error {
 	if info.Name == user.Anonymous {
-		return fmt.Errorf("claimMappings produced the username %q, which the anonymous authenticator asserts about a request that carried no credential", user.Anonymous)
+		return fmt.Errorf("%s produced the username %q, which the anonymous authenticator asserts about a request that carried no credential", source, user.Anonymous)
 	}
 	for _, group := range info.Groups {
 		switch group {
 		case user.AllAuthenticated, user.AllUnauthenticated:
-			return fmt.Errorf("claimMappings produced the group %q, which the server adds according to whether authentication succeeded and an authenticator may not claim", group)
+			return fmt.Errorf("%s produced the group %q, which the server adds according to whether authentication succeeded and an authenticator may not claim", source, group)
 		}
 	}
 	return nil
 }
 
+// CompileUserValidationRules compiles the rules an identity must satisfy, whichever
+// backend produced it. The expressions read a user rather than a certificate, so
+// there is one copy of this rather than one per backend.
+//
+// Exported for the same reason as CompileCertificateAuthenticator: configuration
+// validation rejects an unusable expression at server start using the code the
+// authenticator runs, rather than a second copy of the same rules.
+func CompileUserValidationRules(compiler authenticationcel.Compiler, rules []apiserver.UserValidationRule) (authenticationcel.UserMapper, error) {
+	if len(rules) == 0 {
+		return nil, nil
+	}
+	if compiler == nil {
+		compiler = authenticationcel.NewDefaultCompiler()
+	}
+	compiled := make([]authenticationcel.CompilationResult, 0, len(rules))
+	for i, rule := range rules {
+		result, err := compiler.CompileUserExpression(&authenticationcel.UserValidationCondition{
+			Expression: rule.Expression,
+			Message:    rule.Message,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("userValidationRules[%d].expression: %w", i, err)
+		}
+		compiled = append(compiled, result)
+	}
+	return authenticationcel.NewUserMapper(compiled), nil
+}
+
 // mapIdentity turns a certificate into the identity a request authenticates as.
-func (r *certificateResolver) mapIdentity(ctx context.Context, cert traits.Mapper) (*user.DefaultInfo, error) {
+func (r *x509Backend) mapIdentity(ctx context.Context, cert traits.Mapper) (*user.DefaultInfo, error) {
 	info := &user.DefaultInfo{}
 
 	name, err := evalString(ctx, r.mapper.Username, cert, "claimMappings.username")

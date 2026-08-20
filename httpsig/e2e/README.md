@@ -348,7 +348,7 @@ sign for. `httpsig-demo derive` is already the broker for that; what is missing 
 returning the rung and its stage from the credential subcommand.
 
 Two more, now that a resolver is in the picture. A second resolver with
-`keyIDPrefixes` would show routing by key ID and prove each is asked only about its
-own keys. And `relayedHeaders` with the resolver's `requiredHeaders` would show
+`resolver.keyIDPrefixes` would show routing by key ID and prove each is asked only about its
+own keys. And `resolver.relayedHeaders` with the resolver's `requiredHeaders` would show
 identity chosen by a session token rather than by a key ID, which is the deployment
 shape where the key ID names a key and the token names a session.

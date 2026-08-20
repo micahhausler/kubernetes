@@ -22,6 +22,16 @@ httpSignature:
   # authority: kubernetes.example.com
   # scheme: https
 
+  # Added to every time comparison, to allow for a signer's clock differing from
+  # this server's, and widens the accepted window by the same amount. Omit it
+  # unless skew is a demonstrated problem.
+  #
+  # One value for the server, not one per authenticator: a verifier cannot measure a
+  # client's clock, so this is a risk budget justified by this server's own time
+  # synchronisation, and that is one fact with one answer.
+  #
+  # maxClockSkew: 5s
+
   authenticators:
 
   # Resolution by resolver process. No key and no identity appears in this file: the
@@ -33,52 +43,65 @@ httpSignature:
   # cryptography and holds no key for longer than the cache below allows; the
   # resolver holds key material and never sees a request.
   - name: corp-resolver
-    # A Unix domain socket, or unix://@name for a Linux abstract socket. The
-    # connection carries no TLS and this server does not authenticate the resolver,
-    # so access to the socket is the whole trust boundary: whoever can serve on it
-    # can vend an identity to this cluster.
-    endpoint: unix:///var/run/httpsig/resolver.sock
     # How old a signature may be, measured from its created parameter. With a
     # resolver recording nonces this is not the replay window; it bounds how stale a
     # request may be, and so how long the resolver is asked to remember a nonce.
     maxAge: 1m
-    # Added to time comparisons for clock skew, and widens the accepted window by the
-    # same amount. Omit it unless skew is a demonstrated problem.
-    # tolerance: 5s
-    # Only keyIDs whose first segment matches reach this resolver. Omitting this
-    # means it is asked about every keyID, which for a keyID nobody serves costs one
-    # call driven by a caller who has authenticated nothing. At most one
-    # authenticator may omit it.
+
+    # Everything that only means something when a resolver is answering. Anything in
+    # here is untypable on a certificate authenticator, so there is no way to state a
+    # resolver setting and have it quietly ignored.
+    resolver:
+      # A Unix domain socket, or unix://@name for a Linux abstract socket. The
+      # connection carries no TLS and this server does not authenticate the resolver,
+      # so access to the socket is the whole trust boundary: whoever can serve on it
+      # can vend an identity to this cluster.
+      endpoint: unix:///var/run/httpsig/resolver.sock
+      # Only keyIDs whose first segment matches reach this resolver. Omitting this
+      # means it is asked about every keyID, which for a keyID nobody serves costs one
+      # call driven by a caller who has authenticated nothing. At most one
+      # authenticator may omit it.
+      #
+      # A keyID beginning "x509-sha256:" never reaches a resolver whatever this says:
+      # that form is reserved for signatures whose key a certificate asserts, so which
+      # authenticator answers such a signature does not depend on list order.
+      keyIDPrefixes: [corp]
+      # Header values sent to the resolver with a lookup, for a resolver that decides
+      # identity from a rotating session token rather than from a keyID. Nothing else
+      # about the request is sent. A named header present but not covered by the
+      # signature rejects the request before any lookup, so an intermediary cannot
+      # inject one.
+      # relayedHeaders: [X-Session-Token]
+      # Whether the resolver is asked to record each accepted signature's nonce.
+      # Consume is the default. Ignore turns replay protection off and makes the replay
+      # window maxAge plus maxClockSkew, during which a captured request can be replayed
+      # against every API server without limit; it exists for a resolver with no nonce
+      # store, so that the absence is stated here rather than faked by a resolver that
+      # always answers yes.
+      # nonceHandling: Consume
+      cache:
+        # How long a resolved key is reused, capping what the resolver asks for. A
+        # cached key outlives its revocation, so this is the revocation window.
+        maxAge: 5m
+        # How long this server remembers that a resolver does not serve a keyID. A
+        # resolver cannot state this itself, because not-found is a status rather than
+        # an answer with fields.
+        negativeMaxAge: 10s
+        # Entries in each of the two caches kept per resolver, resolved keys and
+        # unserved keyIDs. The two are separate so a flood of unknown keyIDs cannot
+        # evict working keys.
+        maxKeys: 1024
+
+    # Whoever can serve on the socket above chooses the identity outright, so this
+    # is the cluster's only say over what the resolver may claim. Without it the
+    # resolver can vend system:masters.
     #
-    # A keyID beginning "x509-sha256:" never reaches a resolver whatever this says:
-    # that form is reserved for signatures whose key a certificate asserts, so which
-    # authenticator answers such a signature does not depend on list order.
-    keyIDPrefixes: [corp]
-    # Header values sent to the resolver with a lookup, for a resolver that decides
-    # identity from a rotating session token rather than from a keyID. Nothing else
-    # about the request is sent. A named header present but not covered by the
-    # signature rejects the request before any lookup, so an intermediary cannot
-    # inject one.
-    # relayedHeaders: [X-Session-Token]
-    # Whether the resolver is asked to record each accepted signature's nonce.
-    # Consume is the default. Ignore turns replay protection off and makes the replay
-    # window maxAge plus tolerance, during which a captured request can be replayed
-    # against every API server without limit; it exists for a resolver with no nonce
-    # store, so that the absence is stated here rather than faked by a resolver that
-    # always answers yes.
-    # nonceHandling: Consume
-    cache:
-      # How long a resolved key is reused, capping what the resolver asks for. A
-      # cached key outlives its revocation, so this is the revocation window.
-      maxAge: 5m
-      # How long this server remembers that a resolver does not serve a keyID. A
-      # resolver cannot state this itself, because not-found is a status rather than
-      # an answer with fields.
-      negativeMaxAge: 10s
-      # Entries in each of the two caches kept per resolver, resolved keys and
-      # unserved keyIDs. The two are separate so a flood of unknown keyIDs cannot
-      # evict working keys.
-      maxKeys: 1024
+    # The same field and the same rule appear on the certificate authenticator
+    # below. Both produce an identity nobody wrote down in this file, and the
+    # expressions read a user either way.
+    userValidationRules:
+    - expression: '!user.username.startsWith("system:") && !user.groups.exists(g, g.startsWith("system:"))'
+      message: 'this authenticator may not assert an identity under the system: prefix'
 
   # Resolution by certificate. The server holds the authority below and nothing per
   # client: the identity comes from the certificate the request carries. Adding a
@@ -86,9 +109,9 @@ httpSignature:
   # window, because there is no per-client state here to delete.
   #
   # Unlike the resolver above, nothing here records nonces: there is no store every
-  # API server shares. maxAge plus tolerance is therefore the whole replay window for
-  # a certificate, and nonceHandling is refused on this authenticator rather than
-  # accepted and ignored.
+  # API server shares. maxAge plus maxClockSkew is therefore the whole replay window for
+  # a certificate, and there is no nonceHandling field to reach for, because that
+  # setting lives inside resolver.
   #
   # This is mutual TLS with the handshake replaced by a message signature. The same
   # authority, the same issuance, and the same subject conventions apply; only the
@@ -125,7 +148,8 @@ httpSignature:
         Y7b7iGV2Xv84jcG9W8BZ7R+g3jroRvjf/QIhAI/ch/8OQT1ZYdKjFPLvR8xfHxy0
         BWl9QP4k28JU+IWm
         -----END CERTIFICATE-----
-      certificateCache:
+
+      cache:
         # How long a successful validation is trusted, which is also the window in
         # which withdrawing a certificate has no effect. Clamped internally to the
         # remaining life of every certificate in the validated chain, so this can
@@ -135,38 +159,38 @@ httpSignature:
         # success, so occupying one requires a certificate this authority issued.
         maxEntries: 1024
 
-    # Run before claimMappings, so a mapping never reads a certificate no rule has
-    # vetted.
-    certificateValidationRules:
-    # A certificate's lifetime is the withdrawal window, and this is the only lever
-    # the verifier has over it. There is no dedicated field for this because
-    # subtracting the validity bounds is the general form.
-    - expression: cert.notAfter - cert.notBefore <= duration('24h')
-      message: 'certificate lifetime must not exceed 24 hours'
+      # Run before claimMappings, so a mapping never reads a certificate no rule has
+      # vetted.
+      certificateValidationRules:
+      # A certificate's lifetime is the withdrawal window, and this is the only lever
+      # the verifier has over it. There is no dedicated field for this because
+      # subtracting the validity bounds is the general form.
+      - expression: cert.notAfter - cert.notBefore <= duration('24h')
+        message: 'certificate lifetime must not exceed 24 hours'
 
-    # Where the identity comes from. Available on the cert variable: subject and
-    # issuer, each with commonName, organization and organizationalUnit;
-    # serialNumber; notBefore and notAfter; dnsSANs, uriSANs, emailSANs and ipSANs;
-    # sha256Thumbprint; and extendedKeyUsages.
-    #
-    # Test a multi-valued attribute with exists() and never by position. A
-    # multi-valued name attribute is an ASN.1 SET, canonically ordered by encoding,
-    # so the order the issuer supplied is not the order read back.
-    claimMappings:
-      # A URI SAN is where workload identity schemes put their identifier, which
-      # makes it the field that interoperates. A literal prefix keeps these names
-      # from colliding with those another authenticator issues.
-      username:
-        expression: '"spiffe:" + cert.uriSANs[0]'
-      groups:
-        expression: cert.subject.organization
-      # The digest the signature's keyid carries, so the identity names one exact
-      # certificate rather than anything its issuer could reuse.
-      uid:
-        expression: cert.sha256Thumbprint
-      extra:
-      - key: httpsig.example.com/issuer
-        valueExpression: cert.issuer.commonName
+      # Where the identity comes from. Available on the cert variable: subject and
+      # issuer, each with commonName, organization and organizationalUnit;
+      # serialNumber; notBefore and notAfter; dnsSANs, uriSANs, emailSANs and ipSANs;
+      # sha256Thumbprint; and extendedKeyUsages.
+      #
+      # Test a multi-valued attribute with exists() and never by position. A
+      # multi-valued name attribute is an ASN.1 SET, canonically ordered by encoding,
+      # so the order the issuer supplied is not the order read back.
+      claimMappings:
+        # A URI SAN is where workload identity schemes put their identifier, which
+        # makes it the field that interoperates. A literal prefix keeps these names
+        # from colliding with those another authenticator issues.
+        username:
+          expression: '"spiffe:" + cert.uriSANs[0]'
+        groups:
+          expression: cert.subject.organization
+        # The digest the signature's keyid carries, so the identity names one exact
+        # certificate rather than anything its issuer could reuse.
+        uid:
+          expression: cert.sha256Thumbprint
+        extra:
+        - key: httpsig.example.com/issuer
+          valueExpression: cert.issuer.commonName
 
     # What an assertion claims is a claim, not a conclusion. These rules are the
     # cluster's only say over what the authority above may mint.

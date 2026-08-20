@@ -442,8 +442,9 @@ type WebhookMatchCondition struct {
 // HTTPSignatureConfig provides the configuration for authenticating requests by
 // HTTP message signature (RFC 9421).
 //
-// Authority and Scheme sit here rather than on each authenticator because they
-// describe how clients reach this one server. They are also consumed before any
+// What sits here rather than on each authenticator is this server's description of
+// itself as clients experience it; what sits on an authenticator is trust policy
+// for one backend. Authority and Scheme are additionally consumed before any
 // authenticator has been selected, when the request's signatures are parsed, so
 // they could not be per-authenticator without parsing every signature once per
 // authenticator.
@@ -456,31 +457,81 @@ type HTTPSignatureConfig struct {
 	Authority string
 	Scheme    string
 
-	// Authenticators are attempted in the order given. Which one handles a
-	// signature is decided by the signature's keyid: a keyid in the certificate
-	// form selects the certificate authenticators, which are tried until one's
-	// trust anchors validate the presented certificate, and any other keyid
+	// MaxClockSkew is added to every time comparison, to allow for the signer's
+	// clock differing from this server's. Unset means none.
+	//
+	// A verifier cannot measure a client's clock, so this is a risk budget whose
+	// justification is this server's own time synchronisation. That is one fact
+	// with one answer, which is why it is not per authenticator.
+	MaxClockSkew *metav1.Duration
+
+	// Authenticators are attempted in the order given. Which ones handle a
+	// signature is decided before any work is done for it: a keyid in the
+	// certificate form selects the single authenticator holding the trust anchor
+	// the presented certificate's authorityKeyIdentifier names, and any other keyid
 	// selects the resolver authenticators whose key ID prefixes admit it.
 	Authenticators []HTTPSignatureAuthenticator
 }
 
 // HTTPSignatureAuthenticator is one way of resolving a signature's keyid to a
-// verification key and an identity. Exactly one of Endpoint or X509 is set.
+// verification key and an identity. Exactly one of Resolver or X509 is set.
 //
-// Neither states an identity in configuration. Endpoint names a resolver, which
+// Neither states an identity in configuration. Resolver names a process, which
 // answers for a key ID with the key that verifies signatures bearing it and the
 // identity it authenticates as, and which records the nonces those signatures
 // carry. X509 takes both key and identity from a certificate the request
 // carries, which the configured trust anchors have to validate.
 //
-// Either way the identity is a claim rather than a conclusion: this server
-// validates it on arrival and rejects a name or group under the "system:"
-// prefix.
+// Either way the identity is a claim rather than a conclusion: this server refuses
+// the three names it asserts itself, and UserValidationRules is where a cluster
+// states what else an authenticator may not claim.
+//
+// A field that means something to only one of the two lives in that one's
+// struct. Only what applies to both is stated here.
 type HTTPSignatureAuthenticator struct {
 	// Name identifies this authenticator in errors and metrics. Required to be
 	// unique. It never appears on the wire.
 	Name string
 
+	// Resolver takes the verification key and the identity from a process this
+	// server calls over a Unix domain socket.
+	Resolver *HTTPSignatureResolver
+
+	// X509 takes the verification key and the identity from a certificate the
+	// request carries in the Signature-Certificate header, validated against this
+	// authenticator's trust anchors.
+	X509 *HTTPSignatureX509
+
+	// MaxAge bounds how old a signature may be, measured from its created
+	// parameter. Unset means five minutes.
+	//
+	// With Resolver and the default nonce handling, replay is closed by the
+	// resolver recording nonces rather than by this, and what this bounds is how
+	// stale a request may be, and so how long a resolver has to remember a nonce.
+	//
+	// With X509, or with NonceHandling Ignore, nothing records nonces and this
+	// plus MaxClockSkew is the entire replay window: a captured request can be
+	// replayed within it against every API server without limit.
+	MaxAge *metav1.Duration
+
+	// UserValidationRules are applied to the identity before authentication
+	// completes, whichever backend produced it, and all must pass. They are the
+	// cluster's say over what an authenticator may claim, which matters because
+	// neither backend states an identity in configuration.
+	//
+	// There is no default rule. An authenticator with none stated may assert any
+	// name outside the three the server reserves for itself.
+	UserValidationRules []UserValidationRule
+}
+
+// HTTPSignatureResolver resolves a signature's verification key and identity
+// through a process this server calls over a Unix domain socket.
+//
+// The resolver answers what configuration cannot: which key verifies signatures
+// bearing a key ID, who that key authenticates as, and whether a nonce has
+// already been used for that key. The last of those closes replay across every
+// API server in the cluster, which no certificate can do.
+type HTTPSignatureResolver struct {
 	// Endpoint is the resolver's Unix domain socket, as unix:///path/to/socket,
 	// or unix://@name for a Linux abstract socket.
 	//
@@ -490,7 +541,6 @@ type HTTPSignatureAuthenticator struct {
 
 	// KeyIDPrefixes narrows which key IDs this resolver is asked about, matched
 	// against the segment before a key ID's first "/". Unset means every key ID.
-	// Valid only with Endpoint.
 	//
 	// Resolvers are consulted in order, so a key ID no resolver serves costs one
 	// call per resolver whose prefixes admit it, driven by a caller who has
@@ -498,8 +548,7 @@ type HTTPSignatureAuthenticator struct {
 	KeyIDPrefixes []string
 
 	// RelayedHeaders names request headers whose values are sent to this resolver
-	// with a key lookup. Nothing else about the request is sent. Valid only with
-	// Endpoint.
+	// with a key lookup. Nothing else about the request is sent.
 	//
 	// A named header present but not covered by the signature rejects the request
 	// before any lookup. Covered is not verified: at lookup time the value is
@@ -511,56 +560,12 @@ type HTTPSignatureAuthenticator struct {
 	// each accepted signature carries. The zero value means Consume, so replay
 	// protection is on unless it is turned off in so many words.
 	//
-	// Ignore makes the replay window MaxAge plus Tolerance, during which a captured
-	// request can be replayed against every API server without limit.
-	//
-	// Valid only with Endpoint. A nonce record needs somewhere to live that every
-	// API server shares, and X509 has no resolver to hold one.
+	// Ignore makes the replay window MaxAge plus MaxClockSkew, during which a
+	// captured request can be replayed against every API server without limit.
 	NonceHandling NonceHandling
 
-	// Cache bounds what this server remembers of this resolver's answers. Valid
-	// only with Endpoint. The certificate equivalent is X509.CertificateCache,
-	// which is separate because it is keyed on a certificate rather than a key ID
-	// and is bounded by the validated chain's remaining life.
-	Cache *HTTPSignatureCache
-
-	// X509 resolves the key and the identity from a certificate the request
-	// carries in the Signature-Certificate header, validated against this
-	// authenticator's trust anchors.
-	X509 *HTTPSignatureX509
-
-	// MaxAge bounds how old a signature may be, measured from its created
-	// parameter. Unset means five minutes.
-	//
-	// With Endpoint and the default nonce handling, replay is closed by the
-	// resolver recording nonces rather than by this, and what this bounds is how
-	// stale a request may be, and so how long a resolver has to remember a nonce.
-	//
-	// With X509, or with NonceHandling Ignore, nothing records nonces and this
-	// plus Tolerance is the entire replay window: a captured request can be
-	// replayed within it against every API server without limit.
-	MaxAge *metav1.Duration
-
-	// Tolerance is added to time comparisons to allow for clock skew between
-	// the signer and this server. Unset means no tolerance.
-	Tolerance *metav1.Duration
-
-	// CertificateValidationRules constrain which certificates this
-	// authenticator accepts, beyond chaining to its trust anchors. They run
-	// before ClaimMappings, so a mapping expression never sees a certificate no
-	// rule has vetted. Valid only with X509.
-	CertificateValidationRules []CertificateValidationRule
-
-	// ClaimMappings derives the user attributes from the certificate. Required
-	// with X509 and invalid with Endpoint, whose resolver states the identity
-	// with each answer.
-	ClaimMappings *HTTPSignatureClaimMappings
-
-	// UserValidationRules are applied to the mapped identity, and all must pass.
-	// They are the cluster's say over what an assertion may claim, which matters
-	// because the identity comes from a certificate rather than from this file.
-	// Valid only with X509.
-	UserValidationRules []UserValidationRule
+	// Cache bounds what this server remembers of this resolver's answers.
+	Cache *HTTPSignatureResolverCache
 }
 
 // HTTPSignatureX509 resolves a signature's key and identity from an X.509
@@ -589,23 +594,34 @@ type HTTPSignatureX509 struct {
 	// in to.
 	CertificateAuthority string
 
-	// CertificateCache holds the results of successful certificate validation,
-	// so a client's second request does not repeat the chain build and the CEL
-	// evaluation its first one paid for.
-	CertificateCache *HTTPSignatureCertificateCache
+	// CertificateValidationRules constrain which certificates this
+	// authenticator accepts, beyond chaining to its trust anchors. They run
+	// before ClaimMappings, so a mapping expression never sees a certificate no
+	// rule has vetted.
+	CertificateValidationRules []CertificateValidationRule
+
+	// ClaimMappings derives the user attributes from the certificate. Required,
+	// because the identity comes from the certificate rather than from
+	// configuration.
+	ClaimMappings *HTTPSignatureClaimMappings
+
+	// Cache holds the results of successful certificate validation, so a client's
+	// second request does not repeat the chain build and the CEL evaluation its
+	// first one paid for.
+	Cache *HTTPSignatureX509Cache
 }
 
-// HTTPSignatureCertificateCache bounds the memoization of certificate
-// validation. Only successful validations are cached. A negative cache would be
-// keyed on bytes a peer chooses, which is unbounded cardinality for anyone who
-// can send a request, and it would buy nothing: an untrusted certificate is
-// rejected by one chain build.
+// HTTPSignatureX509Cache bounds the memoization of certificate validation. Only
+// successful validations are cached. A negative cache would be keyed on bytes a
+// peer chooses, which is unbounded cardinality for anyone who can send a
+// request, and it would buy nothing: an untrusted certificate is rejected by one
+// chain build.
 //
 // Caching the mapped identity, rather than only the key, is sound because the
 // mapping is a pure function of the certificate. The CEL environment declares no
 // clock and no request-scoped variable, so no expression can produce a different
 // answer for the same certificate at a different time.
-type HTTPSignatureCertificateCache struct {
+type HTTPSignatureX509Cache struct {
 	// MaxEntries caps how many validated certificates are remembered. Unset
 	// means 1024. Eviction costs the evicted client one revalidation.
 	MaxEntries *int32
@@ -671,10 +687,10 @@ type HTTPSignatureClaimExpression struct {
 	Expression string
 }
 
-// HTTPSignatureCache bounds what this server remembers of a resolver's answers.
-// A key ID is chosen by the peer, so neither cache may grow with the number of
-// distinct ones.
-type HTTPSignatureCache struct {
+// HTTPSignatureResolverCache bounds what this server remembers of a resolver's
+// answers. A key ID is chosen by the peer, so neither cache may grow with the
+// number of distinct ones.
+type HTTPSignatureResolverCache struct {
 	// MaxKeys caps the entries in each of the two caches kept per resolver: keys
 	// it resolved, and key IDs it said it does not serve. Unset means 1024. The
 	// two are separate so a flood of unknown key IDs cannot evict working keys.

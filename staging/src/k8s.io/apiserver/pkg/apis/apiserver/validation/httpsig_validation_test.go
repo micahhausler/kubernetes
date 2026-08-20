@@ -38,7 +38,7 @@ import (
 func validHTTPSignatureConfig() *apiserver.HTTPSignatureConfig {
 	return config(apiserver.HTTPSignatureAuthenticator{
 		Name:     "resolver",
-		Endpoint: "unix:///var/run/httpsig-resolver.sock",
+		Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///var/run/httpsig-resolver.sock"},
 	})
 }
 
@@ -78,13 +78,59 @@ func testCAPEM(t *testing.T) string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
 }
 
+// caPEMForKey builds a certificate authority certificate for a given key, so two
+// can be produced that differ in their bytes and agree in their
+// subjectKeyIdentifier, which Go derives from the public key.
+func caPEMForKey(t *testing.T, key *ecdsa.PrivateKey, commonName string, serial int64) string {
+	t.Helper()
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		Subject:               pkix.Name{CommonName: commonName},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// leafPEM builds a certificate that is not a certificate authority, which is how a
+// certificate with no subjectKeyIdentifier is produced: Go generates one only for a
+// CA template.
+func leafPEM(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "not-an-authority"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
 func TestValidateHTTPSignature(t *testing.T) {
 	caPEM := testCAPEM(t)
 	validX509 := func() apiserver.HTTPSignatureAuthenticator {
 		return apiserver.HTTPSignatureAuthenticator{
-			Name:          "certs",
-			X509:          &apiserver.HTTPSignatureX509{CertificateAuthority: caPEM},
-			ClaimMappings: &apiserver.HTTPSignatureClaimMappings{Username: apiserver.HTTPSignatureClaimExpression{Expression: "cert.subject.commonName"}},
+			Name: "certs",
+			X509: &apiserver.HTTPSignatureX509{
+				CertificateAuthority: caPEM,
+				ClaimMappings:        &apiserver.HTTPSignatureClaimMappings{Username: apiserver.HTTPSignatureClaimExpression{Expression: "cert.subject.commonName"}},
+			},
 		}
 	}
 
@@ -112,29 +158,29 @@ func TestValidateHTTPSignature(t *testing.T) {
 			wantErr: "HTTPSignatureAuthentication feature gate is disabled",
 		},
 		{
-			name:    "neither endpoint nor x509",
+			name:    "neither resolver nor x509",
 			config:  config(apiserver.HTTPSignatureAuthenticator{}),
 			gate:    true,
-			wantErr: "one of endpoint or x509 is required",
+			wantErr: "one of resolver or x509 is required",
 		},
 		{
-			name:    "endpoint must be a unix socket",
-			config:  config(apiserver.HTTPSignatureAuthenticator{Endpoint: "https://resolver.example.com"}),
+			name:    "resolver endpoint must be a unix socket",
+			config:  config(apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "https://resolver.example.com"}}),
 			gate:    true,
 			wantErr: "unsupported scheme",
 		},
 		{
 			name: "abstract socket is accepted",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///@httpsig-resolver"},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///@httpsig-resolver"}},
 			),
 			gate: true,
 		},
 		{
 			name: "duplicate endpoints",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"one"}},
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"two"}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"one"}}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"two"}}},
 			),
 			gate:    true,
 			wantErr: "Duplicate value",
@@ -142,25 +188,25 @@ func TestValidateHTTPSignature(t *testing.T) {
 		{
 			name: "two catch-all resolvers fan out",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock"},
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///b.sock"},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock"}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///b.sock"}},
 			),
 			gate:    true,
-			wantErr: "at most one authenticator may omit keyIDPrefixes",
+			wantErr: "at most one authenticator may omit resolver.keyIDPrefixes",
 		},
 		{
 			name: "one catch-all alongside a prefixed resolver is fine",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"corp"}},
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///b.sock"},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"corp"}}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///b.sock"}},
 			),
 			gate: true,
 		},
 		{
 			name: "duplicate prefix across resolvers",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"corp"}},
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///b.sock", KeyIDPrefixes: []string{"corp"}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"corp"}}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///b.sock", KeyIDPrefixes: []string{"corp"}}},
 			),
 			gate:    true,
 			wantErr: "Duplicate value",
@@ -168,7 +214,7 @@ func TestValidateHTTPSignature(t *testing.T) {
 		{
 			name: "prefix with a slash can never match",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"corp/cell-a"}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"corp/cell-a"}}},
 			),
 			gate:    true,
 			wantErr: "can never match",
@@ -176,7 +222,7 @@ func TestValidateHTTPSignature(t *testing.T) {
 		{
 			name: "empty prefix",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{""}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{""}}},
 			),
 			gate:    true,
 			wantErr: "omit keyIDPrefixes",
@@ -191,8 +237,8 @@ func TestValidateHTTPSignature(t *testing.T) {
 				Scheme:    "https",
 				Authority: "api.example.com",
 				Authenticators: []apiserver.HTTPSignatureAuthenticator{
-					{Name: "a", Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"one"}},
-					{Name: "b", Endpoint: "unix:///b.sock", KeyIDPrefixes: []string{"two"}},
+					{Name: "a", Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"one"}}},
+					{Name: "b", Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///b.sock", KeyIDPrefixes: []string{"two"}}},
 				},
 			},
 			gate: true,
@@ -201,7 +247,7 @@ func TestValidateHTTPSignature(t *testing.T) {
 			name: "bad scheme",
 			config: &apiserver.HTTPSignatureConfig{
 				Scheme:         "ftp",
-				Authenticators: []apiserver.HTTPSignatureAuthenticator{{Name: "a", Endpoint: "unix:///a.sock"}},
+				Authenticators: []apiserver.HTTPSignatureAuthenticator{{Name: "a", Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock"}}},
 			},
 			gate:    true,
 			wantErr: "must be http or https",
@@ -214,15 +260,15 @@ func TestValidateHTTPSignature(t *testing.T) {
 		},
 		{
 			name:    "unnamed authenticator",
-			config:  &apiserver.HTTPSignatureConfig{Authenticators: []apiserver.HTTPSignatureAuthenticator{{Endpoint: "unix:///a.sock"}}},
+			config:  &apiserver.HTTPSignatureConfig{Authenticators: []apiserver.HTTPSignatureAuthenticator{{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock"}}}},
 			gate:    true,
 			wantErr: "a name is required",
 		},
 		{
 			name: "duplicate authenticator names",
 			config: &apiserver.HTTPSignatureConfig{Authenticators: []apiserver.HTTPSignatureAuthenticator{
-				{Name: "same", Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"one"}},
-				{Name: "same", Endpoint: "unix:///b.sock", KeyIDPrefixes: []string{"two"}},
+				{Name: "same", Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", KeyIDPrefixes: []string{"one"}}},
+				{Name: "same", Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///b.sock", KeyIDPrefixes: []string{"two"}}},
 			}},
 			gate:    true,
 			wantErr: "Duplicate value",
@@ -236,24 +282,74 @@ func TestValidateHTTPSignature(t *testing.T) {
 			// The two ways of resolving a keyid are alternatives, not layers. One
 			// configuration naming both would leave which of them answered a
 			// signature depending on nothing stated in the file.
-			name: "endpoint and x509 together",
+			name: "resolver and x509 together",
 			config: func() *apiserver.HTTPSignatureConfig {
 				a := validX509()
-				a.Endpoint = "unix:///a.sock"
+				a.Resolver = &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock"}
 				return config(a)
 			}(),
 			gate:    true,
-			wantErr: "endpoint and x509 are mutually exclusive",
+			wantErr: "resolver and x509 are mutually exclusive",
 		},
 		{
 			name: "x509 without claimMappings",
 			config: func() *apiserver.HTTPSignatureConfig {
 				a := validX509()
-				a.ClaimMappings = nil
+				a.X509.ClaimMappings = nil
 				return config(a)
 			}(),
 			gate:    true,
-			wantErr: "claimMappings is required with x509",
+			wantErr: "claimMappings is required",
+		},
+		{
+			// The subjectKeyIdentifier is what a presented certificate's
+			// authorityKeyIdentifier names, so an anchor without one can never be
+			// selected and any certificate it issued would be refused as having an
+			// unknown issuer.
+			name: "trust anchor without a subjectKeyIdentifier",
+			config: func() *apiserver.HTTPSignatureConfig {
+				a := validX509()
+				a.X509.CertificateAuthority = leafPEM(t)
+				return config(a)
+			}(),
+			gate:    true,
+			wantErr: "has no subjectKeyIdentifier extension",
+		},
+		{
+			// Two certificates for one authority key. A presented certificate names
+			// its issuer by key identifier, so both authenticators would be selected
+			// by the same certificate.
+			name: "two authenticators sharing an authority key",
+			config: func() *apiserver.HTTPSignatureConfig {
+				key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+				if err != nil {
+					t.Fatal(err)
+				}
+				first, second := validX509(), validX509()
+				first.Name = "first"
+				first.X509.CertificateAuthority = caPEMForKey(t, key, "shared-key-ca", 1)
+				second.Name = "second"
+				second.X509.CertificateAuthority = caPEMForKey(t, key, "shared-key-ca-reissued", 2)
+				return config(first, second)
+			}(),
+			gate:    true,
+			wantErr: "same subjectKeyIdentifier as one used by authenticator",
+		},
+		{
+			// One authenticator holding both, which is what a certificate authority
+			// that reissued without rotating its key looks like mid-rollover. One
+			// trust decision, so not a conflict.
+			name: "one authenticator holding two certificates for one authority key",
+			config: func() *apiserver.HTTPSignatureConfig {
+				key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+				if err != nil {
+					t.Fatal(err)
+				}
+				a := validX509()
+				a.X509.CertificateAuthority = caPEMForKey(t, key, "rolling-ca", 1) + caPEMForKey(t, key, "rolling-ca-reissued", 2)
+				return config(a)
+			}(),
+			gate: true,
 		},
 		{
 			name: "x509 without trust anchors",
@@ -265,66 +361,33 @@ func TestValidateHTTPSignature(t *testing.T) {
 			gate:    true,
 			wantErr: "trust anchors are required",
 		},
+		// There is no case here for a resolver field on an x509 authenticator, or
+		// for x509's claimMappings on a resolver. nonceHandling, keyIDPrefixes,
+		// relayedHeaders and cache live in resolver; certificateValidationRules and
+		// claimMappings live in x509. Neither can be written in the other's place,
+		// so there is nothing left for validation to catch and nothing to assert.
+		// What used to be six rejections is now six compile errors.
 		{
-			// Nothing records nonces for a certificate authenticator, so accepting
-			// this field and ignoring it would tell an operator replay protection
-			// was configured when it was not.
-			name: "x509 with nonceHandling",
-			config: func() *apiserver.HTTPSignatureConfig {
-				a := validX509()
-				a.NonceHandling = apiserver.NonceHandlingConsume
-				return config(a)
-			}(),
-			gate:    true,
-			wantErr: "nonceHandling requires endpoint",
-		},
-		{
-			name: "x509 with keyIDPrefixes",
-			config: func() *apiserver.HTTPSignatureConfig {
-				a := validX509()
-				a.KeyIDPrefixes = []string{"corp"}
-				return config(a)
-			}(),
-			gate:    true,
-			wantErr: "keyIDPrefixes narrows which keyIDs a resolver is asked about",
-		},
-		{
-			name: "x509 with relayedHeaders",
-			config: func() *apiserver.HTTPSignatureConfig {
-				a := validX509()
-				a.RelayedHeaders = []string{"X-Session-Token"}
-				return config(a)
-			}(),
-			gate:    true,
-			wantErr: "relayedHeaders sends header values to a resolver",
-		},
-		{
-			name: "x509 with a resolver cache",
-			config: func() *apiserver.HTTPSignatureConfig {
-				a := validX509()
-				a.Cache = &apiserver.HTTPSignatureCache{}
-				return config(a)
-			}(),
-			gate:    true,
-			wantErr: "requires endpoint",
-		},
-		{
-			name: "endpoint with claimMappings",
+			// Accepted on either backend. Both produce an identity the cluster has
+			// not written down, and the expressions read a user rather than a
+			// certificate, so one rule set covers both.
+			name: "resolver with userValidationRules",
 			config: config(apiserver.HTTPSignatureAuthenticator{
-				Endpoint:      "unix:///a.sock",
-				ClaimMappings: &apiserver.HTTPSignatureClaimMappings{Username: apiserver.HTTPSignatureClaimExpression{Expression: "cert.subject.commonName"}},
+				Resolver:            &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock"},
+				UserValidationRules: []apiserver.UserValidationRule{{Expression: `!user.username.startsWith("system:")`}},
+			}),
+			gate: true,
+		},
+		{
+			// Compiled with the code the authenticator runs, so an expression that
+			// validates here cannot fail to compile there.
+			name: "resolver with an uncompilable userValidationRule",
+			config: config(apiserver.HTTPSignatureAuthenticator{
+				Resolver:            &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock"},
+				UserValidationRules: []apiserver.UserValidationRule{{Expression: "user.noSuchField"}},
 			}),
 			gate:    true,
-			wantErr: "claimMappings derives an identity from a certificate and requires x509",
-		},
-		{
-			name: "endpoint with userValidationRules",
-			config: config(apiserver.HTTPSignatureAuthenticator{
-				Endpoint:            "unix:///a.sock",
-				UserValidationRules: []apiserver.UserValidationRule{{Expression: "true"}},
-			}),
-			gate:    true,
-			wantErr: "userValidationRules constrains an identity a certificate claimed",
+			wantErr: "userValidationRules[0].expression",
 		},
 		{
 			// An x509 authenticator alongside resolvers is the case the whole
@@ -332,30 +395,40 @@ func TestValidateHTTPSignature(t *testing.T) {
 			name: "x509 alongside a catch-all resolver",
 			config: config(
 				validX509(),
-				apiserver.HTTPSignatureAuthenticator{Name: "resolver", Endpoint: "unix:///a.sock"},
+				apiserver.HTTPSignatureAuthenticator{Name: "resolver", Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock"}},
 			),
 			gate: true,
 		},
 		{
 			name: "zero maxAge",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", MaxAge: &metav1.Duration{}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock"}, MaxAge: &metav1.Duration{}},
 			),
 			gate:    true,
 			wantErr: "must be positive",
 		},
 		{
-			name: "negative tolerance",
-			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", Tolerance: &metav1.Duration{Duration: -time.Second}},
-			),
+			// One value per server, so it is set once rather than per authenticator.
+			name: "negative maxClockSkew",
+			config: &apiserver.HTTPSignatureConfig{
+				MaxClockSkew:   &metav1.Duration{Duration: -time.Second},
+				Authenticators: []apiserver.HTTPSignatureAuthenticator{{Name: "a", Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock"}}},
+			},
 			gate:    true,
 			wantErr: "must not be negative",
 		},
 		{
+			name: "maxClockSkew",
+			config: &apiserver.HTTPSignatureConfig{
+				MaxClockSkew:   &metav1.Duration{Duration: 5 * time.Second},
+				Authenticators: []apiserver.HTTPSignatureAuthenticator{{Name: "a", Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock"}}},
+			},
+			gate: true,
+		},
+		{
 			name: "reserved relayed header",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"Authorization"}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"Authorization"}}},
 			),
 			gate:    true,
 			wantErr: "route around that path",
@@ -363,7 +436,7 @@ func TestValidateHTTPSignature(t *testing.T) {
 		{
 			name: "reserved impersonation prefix",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"Impersonate-Extra-Scopes"}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"Impersonate-Extra-Scopes"}}},
 			),
 			gate:    true,
 			wantErr: "route around that path",
@@ -371,7 +444,7 @@ func TestValidateHTTPSignature(t *testing.T) {
 		{
 			name: "duplicate relayed header differing only in case",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"X-Token", "x-token"}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"X-Token", "x-token"}}},
 			),
 			gate:    true,
 			wantErr: "Duplicate value",
@@ -379,7 +452,7 @@ func TestValidateHTTPSignature(t *testing.T) {
 		{
 			name: "invalid relayed header name",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"X Token"}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"X Token"}}},
 			),
 			gate:    true,
 			wantErr: "not a valid HTTP header field name",
@@ -387,14 +460,14 @@ func TestValidateHTTPSignature(t *testing.T) {
 		{
 			name: "valid relayed header",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"X-Session-Token"}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", RelayedHeaders: []string{"X-Session-Token"}}},
 			),
 			gate: true,
 		},
 		{
 			name: "zero cache maxKeys",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", Cache: &apiserver.HTTPSignatureCache{MaxKeys: int32Ptr(0)}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", Cache: &apiserver.HTTPSignatureResolverCache{MaxKeys: int32Ptr(0)}}},
 			),
 			gate:    true,
 			wantErr: "must be positive",
@@ -402,7 +475,7 @@ func TestValidateHTTPSignature(t *testing.T) {
 		{
 			name: "negative cache maxAge",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", Cache: &apiserver.HTTPSignatureCache{MaxAge: &metav1.Duration{Duration: -time.Second}}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", Cache: &apiserver.HTTPSignatureResolverCache{MaxAge: &metav1.Duration{Duration: -time.Second}}}},
 			),
 			gate:    true,
 			wantErr: "must not be negative",
@@ -410,21 +483,21 @@ func TestValidateHTTPSignature(t *testing.T) {
 		{
 			name: "zero cache maxAge disables caching and is allowed",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", Cache: &apiserver.HTTPSignatureCache{MaxAge: &metav1.Duration{}}},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", Cache: &apiserver.HTTPSignatureResolverCache{MaxAge: &metav1.Duration{}}}},
 			),
 			gate: true,
 		},
 		{
 			name: "nonceHandling Consume",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", NonceHandling: apiserver.NonceHandlingConsume},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", NonceHandling: apiserver.NonceHandlingConsume}},
 			),
 			gate: true,
 		},
 		{
 			name: "nonceHandling Ignore",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", NonceHandling: apiserver.NonceHandlingIgnore},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", NonceHandling: apiserver.NonceHandlingIgnore}},
 			),
 			gate: true,
 		},
@@ -434,7 +507,7 @@ func TestValidateHTTPSignature(t *testing.T) {
 			// to the resolver to find out why.
 			name: "nonceHandling typo",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", NonceHandling: "ignore"},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", NonceHandling: "ignore"}},
 			),
 			gate:    true,
 			wantErr: "Unsupported value",
@@ -442,7 +515,7 @@ func TestValidateHTTPSignature(t *testing.T) {
 		{
 			name: "nonceHandling nonsense",
 			config: config(
-				apiserver.HTTPSignatureAuthenticator{Endpoint: "unix:///a.sock", NonceHandling: "Disabled"},
+				apiserver.HTTPSignatureAuthenticator{Resolver: &apiserver.HTTPSignatureResolver{Endpoint: "unix:///a.sock", NonceHandling: "Disabled"}},
 			),
 			gate:    true,
 			wantErr: "Unsupported value",
@@ -474,9 +547,11 @@ func manyResolvers(n int) *apiserver.HTTPSignatureConfig {
 	for i := 0; i < n; i++ {
 		id := strconv.Itoa(i)
 		out = append(out, apiserver.HTTPSignatureAuthenticator{
-			Name:          "resolver-" + id,
-			Endpoint:      "unix:///resolver-" + id + ".sock",
-			KeyIDPrefixes: []string{"prefix-" + id},
+			Name: "resolver-" + id,
+			Resolver: &apiserver.HTTPSignatureResolver{
+				Endpoint:      "unix:///resolver-" + id + ".sock",
+				KeyIDPrefixes: []string{"prefix-" + id},
+			},
 		})
 	}
 	return &apiserver.HTTPSignatureConfig{Authenticators: out}

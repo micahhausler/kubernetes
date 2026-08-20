@@ -28,7 +28,7 @@ deployment needs shared storage with an atomic compare-and-set, which is what th
 contract requires and which this implementation satisfies only by being alone.
 
 **If you are writing a resolver with no nonce store, do not implement `ConsumeNonce`
-as a stub that returns accepted.** Set `nonceHandling: Ignore` on the API server's
+as a stub that returns accepted.** Set `resolver.nonceHandling: Ignore` on the API server's
 `httpSignature` entry instead. kube-apiserver then skips the call, so it costs nothing,
 and the configuration says replay protection is off where an operator will see it. A
 stub that always accepts hides that in your source, and it lies about an RPC whose
@@ -193,8 +193,8 @@ not both be accepted. Records are held per key, so the same nonce value under tw
 two different facts and one client's traffic cannot reject another's.
 
 kube-apiserver states when each nonce may be forgotten, as `created` plus the effective
-maximum signature age plus its clock tolerance. Records past that are swept when the
-store comes under pressure.
+maximum signature age plus its configured `maxClockSkew`. Records past that are swept
+when the store comes under pressure.
 
 A full store **refuses** rather than evicting. Evicting the oldest record would permit
 the replay it was preventing, so under load this fails closed and shows up as rejected

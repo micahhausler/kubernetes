@@ -313,26 +313,28 @@ func compile(name, keyID string, k *ResolvedKey) (*verifierKey, error) {
 
 // validateResolvedUser checks an identity a resolver claimed.
 //
-// The "system:" prefix is reserved for identities Kubernetes issues. A resolver
-// that could claim one would let whoever holds the resolver's socket mint an
-// identity the cluster's own authorization rules are written around, which is a
-// larger grant than vending a key.
+// Only what is cheap and unconditional lives here, because this runs at lookup
+// time, before the signature has verified, and so is reachable by a caller who has
+// authenticated nothing. An empty name is a malformed answer, and the three
+// reserved names are ones the server asserts itself. The cluster's policy over what
+// a resolver may claim is userValidationRules, evaluated after verification.
+//
+// There used to be a ban on the "system:" prefix here, and it is gone. It was one
+// hardcoded rule on this path while the certificate path expressed the same
+// invariant as a configurable rule, so the same concern had two mechanisms and the
+// configurable one was rejected on the side that used the hardcoded one. A resolver
+// claiming a "system:" name is now refused by a rule an operator writes, the same
+// rule and the same wording either way.
 func validateResolvedUser(u *user.DefaultInfo) error {
 	if u.Name == "" {
 		return errors.New("response carries no username")
-	}
-	if strings.HasPrefix(u.Name, "system:") {
-		return fmt.Errorf("response username %q begins with system:, which is reserved for identities Kubernetes issues", u.Name)
 	}
 	for _, group := range u.Groups {
 		if group == "" {
 			return errors.New("response carries an empty group name")
 		}
-		if strings.HasPrefix(group, "system:") {
-			return fmt.Errorf("response group %q begins with system:, which is reserved for groups Kubernetes issues", group)
-		}
 	}
-	return nil
+	return checkReservedIdentity(u, "the resolver's answer")
 }
 
 // parsePublicKey reads a public key in PKIX, ASN.1 DER form. PEM is deliberately

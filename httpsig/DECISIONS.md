@@ -378,8 +378,8 @@ correct. No existing Kubernetes authentication mode cares about the client clock
 significant drift will fail authentication with this mode and succeed with a bearer token.
 
 The requester scoped clock skew out of this work, so nothing here tries to solve it: the verifier
-has a `tolerance` setting and that is all. It stays written down because it is a behavior change to
-state in the KEP's risks rather than something to discover in beta.
+has a `maxClockSkew` setting and that is all. It stays written down because it is a behavior change
+to state in the KEP's risks rather than something to discover in beta.
 
 ### D7: the round tripper depends on a signer, not on a key
 
@@ -836,7 +836,7 @@ not caching derived keys, and it makes it here. What is deliberately not copied 
 size.
 
 **Ordered resolution with an optional prefix selector.** Resolvers are consulted in configuration
-order; one that does not serve a key ID is asked before the next is tried. `keyIDPrefixes` narrows which
+order; one that does not serve a key ID is asked before the next is tried. `resolver.keyIDPrefixes` narrows which
 key IDs reach an entry, turning an unknown key ID's cost from one call per resolver into one call or
 none. Validation rejects two entries claiming one prefix, because which resolver serves a key ID would
 then depend on list order and a key moved between resolvers would change identity silently. It also
@@ -973,22 +973,26 @@ schedule and nonce records shared across every API server, and costs a process t
 has to be reachable for anything to authenticate. A certificate costs nothing at
 request time and holds nothing per client, and gives up both: a certificate's
 lifetime is the withdrawal window, and there is no shared place to record a nonce, so
-`maxAge` plus `tolerance` is the replay window. That asymmetry is stated in the API
-rather than left to be discovered, which is why `nonceHandling` is refused on an x509
-authenticator instead of accepted and ignored.
+`maxAge` plus `maxClockSkew` is the replay window. That asymmetry is stated in the API
+rather than left to be discovered, which is why `nonceHandling` sits inside `resolver`
+rather than on the authenticator: on a certificate authenticator there is no such
+field to set (D16).
 
 **Key resolution is an interface**, which is what lets these be peers. A resolver
 takes a signature and returns a verifier plus a way to name the signer. The socket
 resolver and the certificate bundle are two implementations of it, and everything
 around them, the coverage rules, the digest check, the age window, is shared.
 
-One rule keeps the choice from depending on configuration order. A keyid beginning
+Two rules keep the choice from depending on configuration order. A keyid beginning
 `x509-sha256:` never reaches a socket resolver, whatever key ID prefixes it was
 configured with. Without that, a resolver configured with no prefixes is asked about
 every keyid including a certificate's, and a resolver willing to answer for one could
 take over an identity the certificate authority is supposed to name. The reservation
 used to be enforced against entries in the static key list; it lives in the resolver
 now, because a resolver's key IDs are not in the file to be checked.
+
+And a certificate selects exactly one authenticator, by the trust anchor its
+`authorityKeyIdentifier` names (D17).
 
 #### The keyid is the binding, not header coverage
 
@@ -1036,8 +1040,9 @@ intermediates come from configuration, so the chain build is against a fixed poo
 
 The prerequisite section observed that the JWT authenticator maps before it
 validates, and compensates with an AST walk for `email_verified`. This authenticator
-validates first, so it needs no such patch. `certificateValidationRules` run against
-the certificate, then `claimMappings` produce an identity, then `userValidationRules`
+validates first, so it needs no such patch. `x509.certificateValidationRules` run
+against the certificate, then `x509.claimMappings` produce an identity, then
+`userValidationRules`
 run against that identity. What an assertion claims is a claim, not a conclusion, and
 the user rules are the cluster's only say over what a certificate authority may mint.
 
@@ -1186,7 +1191,7 @@ on another's identity.
 
 #### A mapping can hand identity selection to the certificate holder
 
-`claimMappings` derives from the certificate, so `groups: cert.subject.organization`
+`x509.claimMappings` derives from the certificate, so `groups: cert.subject.organization`
 gives whoever can request a certificate the choice of group. With a general-purpose
 authority in the bundle, a requester naming `system:masters` in their organization
 would receive cluster administrator.
@@ -1224,6 +1229,288 @@ Revocation. The server holds no per-client state, which is the point, so there i
 nothing to delete. The certificate's lifetime is the window, narrowed by the cache
 TTL and by whatever lifetime rule a deployment writes. For pods, kube-apiserver caps
 issuance at 24 hours.
+
+### D16: each backend's settings live in that backend's struct
+
+D15 made the two ways of resolving a signature peers, but the API kept them in one
+flat struct: thirteen fields on `HTTPSignatureAuthenticator`, of which three applied
+to both and ten to exactly one. Nine validation rules existed to police that, and
+each one carried a paragraph explaining why a field an operator had written down was
+not running.
+
+The shape now is `resolver` and `x509` as peer sub-structs, with only `name`,
+`maxAge`, `maxClockSkew` and `userValidationRules` left on the parent. Six of those nine
+rules are gone, because `nonceHandling`, `keyIDPrefixes`, `relayedHeaders` and
+`cache` cannot be written on a certificate authenticator and `claimMappings` and
+`certificateValidationRules` cannot be written on a resolver. What used to produce a
+validation error now fails to compile, and the test cases that asserted those errors
+were deleted rather than rewritten.
+
+Two of the nine survive, and they are not redundant with the sub-structs: two optional
+pointer fields cannot express exactly-one, so naming both backends or neither is still
+caught by a rule rather than by the compiler. What became structural is configuring a
+field for the wrong backend, not selecting the backend.
+
+Two smaller things fell out. `cache` and `certificateCache` were named apart only
+because they shared one namespace; in their own structs both are `cache`, and the
+paragraph explaining why they were distinct fields went with the rename. And the
+runtime's exclusivity check, which existed because the struct permitted a combination
+validation happened to catch, is now a two-arm nil switch.
+
+**How the no-behaviour-change claim is checked, and how it was not.** It rests on two
+tests written after the fact rather than on reading the diff: one decodes the reference
+shape and asserts where every field landed, the other asserts that a field left in its
+former place is a named error rather than a silent zero, which is what strict decoding
+buys and why no conversion is needed for configurations written against the previous
+shape.
+
+Neither existed when the claim was first made, and the gap they cover is exactly the one
+that bit: the Go tests were updated with the types and compiled clean, while the
+integration suite builds its configuration as YAML text and went on writing `endpoint`
+at the authenticator level. Twenty-five tests failed at server start, and it took
+fourteen minutes of a run to find out, because nothing checked a field's place in a
+document.
+
+**`maxAge` stays on the parent**, though its role differs sharply: with a resolver
+recording nonces it is a second line of defence, and with a certificate it is the
+entire replay bound. That is one field with one meaning and a consequence that
+depends on what is resolving, which is documentation rather than structure. The
+tempting sort is by whether a backend can narrow it — a resolver can, a certificate
+has nothing to narrow with — but that sorts by backend and would split `maxAge` into
+two fields that mean the same thing.
+
+**Rejected: `keyIDPrefixes` common to both.** It looks like the general question "which
+authenticator handles this keyid", and both backends do answer exactly that, through
+one `handles` method. But an x509 keyid is `x509-sha256:` followed by a digest of the
+certificate, so it carries no operator-chosen namespace for a prefix to match, and
+two certificate authenticators see identically shaped keyids. That is why they are
+disambiguated by trust anchor uniqueness instead. The motivation does not carry over
+either: prefixes exist to bound socket calls from an unauthenticated caller, and
+selecting a certificate authenticator costs a string comparison. Hoisting the field
+would have given an operator something to write that could never do anything, which
+is worse than a rule that rejects it.
+
+There is a version that would work: change the keyid form to
+`<prefix>/x509-sha256:<digest>`. It buys prefix dispatch for certificates at the cost
+of a wire format change and a keyid that is no longer purely content-derived, and
+anchor uniqueness already provides determinism for nothing.
+
+#### Clock skew is the server's own, so it moved up a level
+
+`tolerance` was per authenticator and is now `maxClockSkew` on the section. The test
+that decides this is whether the field has one true value per process. It does: a
+verifier cannot measure a client's clock, so what is being set is a risk budget, and
+the budget's justification is this server's own time synchronisation. Two
+authenticators holding different values would be two answers to one question.
+
+The argument the other way is not silly and is worth recording rather than skipping.
+Skew is pairwise, so one could hold that the budget is a property of the client
+population: resolver-backed clients being well-managed workloads while certificate
+clients are edge devices with unreliable NTP is not a fantasy. It is rejected because
+the server has no way to tell those populations apart at the point the comparison is
+made, and picking a number per population would be asserting knowledge it does not
+have.
+
+The rename carries the reason. Nobody reads a field called `maxClockSkew` and wonders
+whether it should be per authenticator, which is the naming and the placement agreeing.
+
+**Rejected: collapsing `maxAge` and `maxClockSkew` into one window.** The two are
+added together in one of the three time comparisons, which makes them look like one
+value stated twice. They are not. Skew appears in all three comparisons because it is
+grace on every clock reading; `maxAge` appears in one because it is a lifetime. Using
+the sum everywhere would extend honouring an explicit `expires` by `maxAge`, and would
+let a client pre-mint a signature `maxAge` into the future and hold it, which the
+future-skew check exists to prevent. The only collapse that preserves behaviour keeps
+skew in two of the comparisons and the sum in the third, which is a rename rather than
+a simplification.
+
+The resolver protocol is the second reason. A resolver may narrow `maxAge`, per
+resolver or per key, and there is no field with which it can narrow skew. A single
+field would have no coherent narrowing semantics, and honouring a narrowing on it
+would let a backend shrink an allowance for a clock it knows nothing about.
+
+Skew stays in the staleness comparison, where it reads like double-counting and is
+not: the future bound constrains `created` from above only, so the staleness bound
+needs its own grace for a signer whose clock is behind.
+
+### D17: a certificate selects one authenticator by its issuer's key identifier
+
+Every certificate authenticator used to claim every certificate-form keyid, and the
+chain build was what told them apart: "the first whose anchors validate the
+certificate wins". Selection was therefore emergent from failure rather than stated.
+
+With N certificate authenticators configured, one request paid for N header reads, N
+digests, N certificate parses, N signature verifications and N chain builds, all but
+one of them failing. The signature verifications all succeeded, since it is the same
+leaf key and the same signature every time; the chain build was the first step in the
+pipeline that could distinguish them, and it was the last to run.
+
+A leaf's `authorityKeyIdentifier` names the `subjectKeyIdentifier` of whatever issued
+it. Indexing every certificate in each authenticator's bundle by SKI at load turns
+selection into one map lookup. The leaf is parsed once per request, before any
+authenticator is chosen, which is what makes the cost independent of how many are
+configured. Anchor uniqueness is now checked by SKI collision rather than by
+comparing DER, which is also stricter: two authenticators holding differently encoded
+certificates for one authority key used to pass, and they are one trust decision.
+
+**Both are required, and the RFC 5280 exemption does not reach either.** An anchor
+without a `subjectKeyIdentifier` is refused at load, and a presented leaf without an
+`authorityKeyIdentifier` is refused at request. §4.2.1.2 requires SKI on every
+conforming certificate authority certificate and grants no exception. §4.2.1.1
+requires AKI on every certificate a conforming issuer produces, excepting a
+self-signed one, and this only ever reads the AKI of a leaf, which is not
+self-signed. So the exemption covers exactly the case that is never consulted: a
+self-signed root's own AKI. What is excluded is a non-conforming issuer, and the
+alternative was a fallback to trying every authenticator, which would have kept the
+fan-out for their sake.
+
+**Rejected: a fast path with a fallback.** AKI selects when present, otherwise try
+all. It keeps the cost win and gives up the rest, because the fallback still needs
+the outcome buffering below and a second dispatch path to test. Requiring the
+extension is the version that deletes something.
+
+**Rejected: checking the AKI again against the built chain.** This looked necessary
+while the AKI was described as unverified input that chooses an authenticator. The
+property that makes it unnecessary is better stated positively:
+
+> the trust decision is the chain build against exactly one operator-configured
+> bundle, and bundles are disjoint, so at most one authenticator can ever validate a
+> given leaf and misrouting only ever fails closed.
+
+The first draft of this argument leaned on a leaf's AKI naming its real issuer, which
+is what a conforming issuer produces. That premise is worthless here, because the
+party that chose the certificate is the party being authenticated. The invariant above
+holds for any leaf, conforming or not: a forged AKI reaches an authenticator whose
+anchors cannot verify the leaf's signature, and reaching a second authenticator that
+would accept it requires that authenticator's bundle to already trust the real issuer,
+which is the operator having said so.
+
+So the deletion rests on disjointness, which is enforced twice, at configuration
+validation and at construction, and on two things rather than one: no two
+authenticators may hold anchors with the same subjectKeyIdentifier, and none may hold
+anchors with the same public key. The second is not redundant. A subjectKeyIdentifier
+is whatever the issuer stamped, so one authority key can be certified twice under two
+different identifiers; both bundles would then validate the same certificate, and
+which authenticator's rules ran would be decided by whichever identifier the authority
+put in the leaf rather than by the operator.
+
+Identity never depends on which chain was built. The expression environment is the
+leaf alone, and the built chain is read only to clamp the validation cache's lifetime,
+so chain selection cannot change what a certificate authenticates as.
+
+**The bundle must hold the direct issuer, not only the root.** Intermediates are never
+read from the request, so a two-tier authority already required both certificates in
+the bundle to build a chain at all. What changed is the symptom: a missing intermediate
+is now reported as an unknown issuer at dispatch rather than as a chain failure, since
+the leaf's AKI names the intermediate. That is stated in the API documentation in those
+words, because two-tier is the ordinary case and the new error would otherwise send a
+reader looking at the wrong thing.
+
+#### Dispatch and refusal became different facts
+
+The outcome counter used to buffer every authenticator's verdict and discard the lot
+on success. Its comment said why: recording them as they happened "would make a
+correct configuration report a rejection on every request, which is a metric nobody
+could read". That was the fan-out above, plus a resolver saying it does not serve a
+keyid, both recorded as refusals.
+
+They are not refusals. An authenticator that was never asked, or that was asked and
+said the keyid is not its, has decided nothing. With certificates dispatching to one
+authenticator and `ErrKeyNotFound` treated as what it is, every remaining outcome is a
+decision by an authenticator that owned the credential, so it is recorded when it
+happens and the buffering is gone.
+
+What that would have lost is visibility into requests no authenticator claimed, which
+went from being one authenticator's `rejected_identity` to being counted nowhere. So
+those get their own counter, `apiserver_httpsig_unclaimed_signatures_total`.
+
+It has no authenticator label, and that is the reason it is a second counter rather
+than a sentinel value on the existing one. A sentinel would be a lie in the label
+dimension: every `sum by (authenticator)` would grow a permanent authenticator that
+does not exist. The two also measure different stages, dispatch and verification.
+
+Its reasons partition by who has to act, because that is what the label is read for:
+
+| reason | who acts | what happened |
+| --- | --- | --- |
+| `unparseable_signature` | client | the signature fields were present and unreadable, or there were too many |
+| `unknown_keyid` | operator | no resolver's prefixes admitted the keyid, so nothing was asked |
+| `unserved_keyid` | client | a resolver was asked and answered that it does not serve it |
+| `unreadable_certificate` | client | the header was absent, duplicated, oversized, not a certificate, or not usable for signing |
+| `certificate_without_authority_key_id` | client | a well-formed certificate this server cannot route |
+| `unknown_certificate_issuer` | operator | no bundle holds the trust anchor the certificate names |
+
+`unknown_keyid` and `unserved_keyid` were one value at first. They send an operator to
+different places, this server's configuration file against the resolver's key
+inventory, so they are two.
+
+The `unparseable_signature` and malformed-certificate cases were previously counted
+nowhere at all, which is a gap this counter closes rather than creates: attributing
+only the dispatch misses this change introduced would have been half a fix.
+
+No reason carries a value a peer chooses, so none is a cardinality risk. That leaves
+`unknown_certificate_issuer` unable to say *which* authority is missing, which is the
+one thing an operator needs to fix it, so the key identifier is in the error message
+instead.
+
+#### One mechanism for what an authenticator may claim
+
+The `system:` prefix was refused two different ways. On the resolver path it was
+banned in Go, unconditionally. On the certificate path the same invariant was a
+`userValidationRules` expression an operator writes, and `userValidationRules` was
+*rejected* on a resolver authenticator. So the concern had two mechanisms and the
+configurable one was refused on the side that used the hardcoded one.
+
+Both paths now use the rule. `userValidationRules` applies whichever backend
+produced the identity, the prefix ban in `validateResolvedUser` is gone, and the
+three names the server asserts itself are refused on both paths instead of only on
+the certificate path. What stays resolver-specific in `validateResolvedUser` is
+protocol hygiene, an empty username or group name, which is a malformed answer
+rather than a policy question.
+
+The rules are evaluated after the signature verifies, matching the certificate path,
+so an unauthenticated caller cannot drive CEL. They run before the nonce is
+recorded: a request refused for its identity that had already burned a nonce would
+fail differently on a retry, which reads as a flake rather than a rejection. They
+therefore run per accepted request rather than once per cached key. The certificate
+path caches its mapped identity because chain building is expensive; nothing here is.
+
+**This loosens the resolver default and that is deliberate.** A resolver-backed
+authenticator with no rules stated can now claim `system:masters`, where before it
+could not. Three shapes were considered:
+
+1. Symmetric, with the guidance in prose. Chosen.
+2. A built-in default rule applied when `userValidationRules` is unset. It preserves
+   safe-by-omission, but an operator who then writes one narrow rule silently loses
+   the prefix ban, which is a worse footgun than the thing it fixes.
+3. An unconditional ban on both paths, additive to the rules. It forbids mapping a
+   node's certificate to `system:node:<name>`, which is a documented legitimate use.
+
+The reason (1) is a correction rather than a concession is where the trust boundary
+sits. The resolver's socket is documented as the whole trust boundary: nothing
+authenticates the peer at either end, so whoever can serve on it can vend an
+identity. A hardcoded ban there was defending against a *buggy* resolver, not a
+hostile one, and a hostile one was never in scope. The certificate population is
+broader and less controlled, which is why the operator's say is the mechanism there,
+and it is the right mechanism for a resolver for the same reason.
+
+What keeps the loosening from being silent is that the reference configuration and
+the demo now both state the rule, and the example test requires it on every
+authenticator rather than only on certificate ones. An operator copying either gets
+it.
+
+**Reviewed against the sibling authenticator, which settles it.** The JWT
+authenticator in this same `AuthenticationConfiguration` has no hardcoded `system:`
+bound of any kind, and its `userValidationRules` documentation says what this one now
+says: the rules are where an invariant such as refusing the prefix belongs. So
+symmetric-prose-only is consistent with the object this field lives in, and adding a
+per-authenticator ban here would have been the divergence.
+
+It would also have contradicted a decision recorded above: the guard exists on the
+static key list and not on the JWT authenticator, the class is the defect rather than
+any one instance, and what is unresolved is which layer should enforce it. A third
+parallel copy is what that section declined, and it is what a `system:masters` ban
+here would have been.
 
 
 ## 5. Open questions
@@ -1328,7 +1615,7 @@ on the rate:
 
 What is not bounded is a caller cycling through *distinct* key IDs. Each one is a cache miss, a
 singleflight group of one, and a resolver call. `maxKeyIDPrefixes` narrows which resolvers see it and
-`keyIDPrefixes` can reduce the fan-out to one, but nothing caps the rate.
+`resolver.keyIDPrefixes` can reduce the fan-out to one, but nothing caps the rate.
 
 Two places could hold the limit and it is not obvious which. The resolver is the party that knows its
 own capacity, and it is already reachable only over a socket an administrator controls. The API server
@@ -1369,6 +1656,44 @@ One thing this section assumed that turned out not to hold. It expected the stor
 become the API server's availability, full stop. It is narrower than that: a resolver outage rejects
 requests bearing the keys that resolver serves, and nothing else. Another resolver's keys keep working,
 and so does every other authenticator.
+
+### Q8: which layer bounds what an authenticator may claim, and this feature now depends on it
+
+D16's subsection on the `system:` prefix deleted the last per-authenticator prefix ban in this feature,
+on the grounds recorded under D15: the guard existed on the old static key list and not on the JWT
+authenticator, the class is the defect rather than any one instance, and a third parallel copy is what
+that finding declined. That reasoning holds, and it leaves this feature depending on a decision nobody
+has made.
+
+**What this authenticator relies on.** Nothing prevents a configured resolver or certificate authority
+from asserting a `system:` identity, including `system:masters`, unless an operator writes a
+`userValidationRules` expression refusing it. That matches the JWT authenticator in the same
+`AuthenticationConfiguration`, which has no such bound either, so the two are consistent and an
+operator's expectation carries between them. It is stated here rather than left as an absence because
+promotion review reads this and a missing default is invisible in a diff.
+
+**Where the positions currently differ, which is the part to resolve.** Three authenticators in one
+configuration object, three answers:
+
+| | `system:` prefix | the three names the server asserts itself |
+| --- | --- | --- |
+| static key list (removed) | refused at configuration time | not checked |
+| JWT authenticator | not checked | not checked |
+| httpSignature, both backends | not checked, left to `userValidationRules` | refused unconditionally |
+
+The floor on the three names is not drift, and the reason matters for whoever resolves this. Those three
+are assigned by the authentication machinery itself: two according to whether authentication succeeded,
+and one by the anonymous authenticator about a request that carried no credential. A backend claiming one
+is a layer confusion rather than a privilege grant, which is a different and stronger justification than
+the `system:masters` ban had, and it is why the floor is unconditional where the prefix is not.
+
+That also answers where it belongs. A check on values the machinery assigns belongs in the machinery,
+not in a per-authenticator list, so if the framework grows it this copy goes. What should not happen is
+the floor being harmonised away as though it were the same kind of rule as the prefix ban.
+
+Deciding it needs a fact nobody has gathered: whether anyone maps a JWT identity to a `system:` name
+today. That is what decides whether the framework can enforce a bound at all without breaking existing
+clusters.
 
 ## 6. How the two paths were compared
 
@@ -1582,8 +1907,8 @@ Built and covered by tests:
   files are checked for being a pair, because reading them mid-rotation is what produces a
   mismatch, and the error names that rather than the key.
 - A `kubernetes.Certificate` CEL type whose declared fields and runtime value are generated from
-  one table, with `certificateValidationRules`, `claimMappings`, and `userValidationRules`
-  evaluated in that order.
+  one table, with `x509.certificateValidationRules`, `x509.claimMappings`, and
+  `userValidationRules` evaluated in that order.
 - A validation cache holding successful chain builds and their mapped identities, keyed on the
   digest the server computed, with entry lifetime clamped to the shortest remaining life in the
   validated chain.

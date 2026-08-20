@@ -116,16 +116,17 @@ kind: AuthenticationConfiguration
 httpSignature:
   authenticators:
   - name: corp-resolver
-    endpoint: unix:///var/run/httpsig/resolver.sock
     # Checked against the created timestamp in the signature, so a stale request is
     # refused and the resolver knows how long to remember its nonce.
     maxAge: 1m
-    # Only key IDs whose first segment matches reach this resolver. Omitting this
-    # means it is asked about every key ID.
-    keyIDPrefixes: [corp]
-    # A value the client covers with its signature and this server passes on, for a
-    # resolver that decides identity from a session token rather than from a key ID.
-    relayedHeaders: [X-Session-Token]
+    resolver:
+      endpoint: unix:///var/run/httpsig/resolver.sock
+      # Only key IDs whose first segment matches reach this resolver. Omitting this
+      # means it is asked about every key ID.
+      keyIDPrefixes: [corp]
+      # A value the client covers with its signature and this server passes on, for a
+      # resolver that decides identity from a session token rather than from a key ID.
+      relayedHeaders: [X-Session-Token]
 ```
 
 No key material and no identity appears in this file. The resolver on that socket answers two
@@ -138,7 +139,7 @@ questions, and the API server does all of the cryptography itself:
   why nonces left the API server: a per-process cache lets a captured request be replayed once against
   every API server that has not seen it.
 
-A resolver with no nonce store is a real case, so `nonceHandling: Ignore` on an entry turns the second
+A resolver with no nonce store is a real case, so `resolver.nonceHandling: Ignore` turns the second
 question off and the API server stops asking it. The replay window is then the maximum signature age.
 That is stated in configuration rather than faked with a resolver that always answers yes, because the
 latter costs a round trip and leaves nothing an operator can audit. Unset means on, a misspelling is an
@@ -149,15 +150,23 @@ The protocol is `k8s.io/externalhttpsig`, a small gRPC API in the shape the KMS 
 external JWT signer already use. A resolver holds key material and never sees a request; the API server
 verifies signatures and never holds a key for longer than its cache says.
 
-What a resolver returns is a claim, not a conclusion. The API server refuses a username or group under
-the `system:` prefix, because whoever holds the resolver's socket can vend an identity to the cluster
-and claiming a name Kubernetes issues would be a larger grant than vending a key.
+What a resolver returns is a claim, not a conclusion. The API server refuses the three names it
+asserts itself, and `userValidationRules` on the authenticator is where a cluster states what else a
+resolver may not claim. That is the same field and the same wording a certificate authenticator uses,
+because both produce an identity nobody wrote down in this file. Whoever holds the resolver's socket
+chooses the identity outright, so a cluster that does not operate its own resolver wants the rule
+refusing the `system:` prefix.
 
 ## Identity from a certificate instead
 
 A resolver answers over a socket, which means the server depends on a process being reachable to
 authenticate anything. The alternative is for the client to carry an X.509 certificate and for the
-server to hold only the authority that issued it, and then it depends on nothing at request time:
+server to hold only the authority that issued it, and then it depends on nothing at request time.
+
+The certificate names its issuer in its `authorityKeyIdentifier`, and that is what selects the
+authenticator to validate it, so configuring several authorities costs one map lookup rather than a
+chain build per authority. Both that extension and a `subjectKeyIdentifier` on every configured
+anchor are required, which RFC 5280 already requires of conforming issuers.
 
 ```yaml
 apiVersion: apiserver.config.k8s.io/v1
@@ -173,16 +182,16 @@ httpSignature:
         -----BEGIN CERTIFICATE-----
         ...
         -----END CERTIFICATE-----
-    # Rules run before the mappings, so a mapping never reads a certificate no
-    # rule has vetted.
-    certificateValidationRules:
-    - expression: cert.notAfter - cert.notBefore <= duration('24h')
-      message: certificate lifetime must not exceed 24 hours
-    claimMappings:
-      username:
-        expression: '"cert:" + cert.uriSANs[0]'
-      groups:
-        expression: cert.subject.organization
+      # Rules run before the mappings, so a mapping never reads a certificate no
+      # rule has vetted.
+      certificateValidationRules:
+      - expression: cert.notAfter - cert.notBefore <= duration('24h')
+        message: certificate lifetime must not exceed 24 hours
+      claimMappings:
+        username:
+          expression: '"cert:" + cert.uriSANs[0]'
+        groups:
+          expression: cert.subject.organization
     # The mapping above derives groups from the certificate's subject, which hands
     # the choice of group to whoever can request one. Without this rule a requester
     # naming system:masters in their organization would receive cluster administrator.
@@ -234,9 +243,9 @@ and by whatever lifetime rule the configuration states. For pods, kube-apiserver
 
 **Replay, for a certificate.** Recording nonces requires somewhere to record them that every API
 server shares, and the only such place here is a resolver. A certificate authenticator has none, so
-`maxAge` plus `tolerance` is the whole replay window there, and the configuration says so rather than
-leaving it to be inferred: `nonceHandling` is rejected on an x509 authenticator instead of being
-accepted and ignored.
+`maxAge` plus `maxClockSkew` is the whole replay window there, and the configuration says so rather than
+leaving it to be inferred: `nonceHandling` lives inside `resolver`, so there is no field on an x509
+authenticator to set and no rule needed to reject one.
 
 The nonce parameter is still required on the wire and still covered by the signature, so recording it
 can begin later without a change at any client. What it needs is a design rather than a constant. A

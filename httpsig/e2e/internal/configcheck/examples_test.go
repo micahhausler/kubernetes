@@ -75,22 +75,25 @@ func TestExamplesAreAccepted(t *testing.T) {
 			}
 			var resolvers, certs int
 			for _, a := range config.HTTPSignature.Authenticators {
-				if len(a.Endpoint) > 0 {
+				if a.Resolver != nil {
 					resolvers++
 				}
-				if a.X509 == nil {
-					continue
+				if a.X509 != nil {
+					certs++
 				}
-				certs++
-				// The escalation this closes is reachable and was demonstrated
-				// against a live cluster: a mapping deriving groups from the
-				// certificate's subject lets whoever can request a certificate name
-				// system:masters and receive cluster administrator. An example
-				// missing the rule is an example that teaches that.
+				// Required on both backends, because the server has no default rule
+				// and neither backend states its identities in this file.
+				//
+				// The escalation is reachable and was demonstrated against a live
+				// cluster: a mapping deriving groups from the certificate's subject
+				// lets whoever can request a certificate name system:masters and
+				// receive cluster administrator. A resolver is more direct still,
+				// since whoever serves on the socket names the identity outright. An
+				// example missing the rule is an example that teaches that.
 				if !mentionsSystemPrefixRule(a) {
-					t.Errorf("authenticator %q maps an identity from a certificate but states no userValidationRules "+
-						"refusing the system: prefix; an operator copying this would let whoever can request a "+
-						"certificate choose their own groups", a.Name)
+					t.Errorf("authenticator %q states no userValidationRules refusing the system: prefix; "+
+						"there is no default rule, so an operator copying this would let %s choose their own groups",
+						a.Name, whoChoosesTheIdentity(a))
 				}
 			}
 			if resolvers == 0 || certs == 0 {
@@ -115,4 +118,13 @@ func mentionsSystemPrefixRule(a apiserver.HTTPSignatureAuthenticator) bool {
 		}
 	}
 	return false
+}
+
+// whoChoosesTheIdentity names the party a missing rule hands the choice to, so the
+// failure says who is being trusted rather than only which field is absent.
+func whoChoosesTheIdentity(a apiserver.HTTPSignatureAuthenticator) string {
+	if a.Resolver != nil {
+		return "whoever can serve on the resolver's socket"
+	}
+	return "whoever can request a certificate"
 }

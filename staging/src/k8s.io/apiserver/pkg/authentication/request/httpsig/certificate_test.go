@@ -17,6 +17,7 @@ limitations under the License.
 package httpsig
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -32,6 +33,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +62,18 @@ type authority struct {
 
 func newAuthority(t *testing.T, commonName string, lifetime time.Duration) *authority {
 	t.Helper()
+	return newAuthorityWithSKI(t, commonName, lifetime, nil)
+}
+
+// newAuthorityWithSKI builds an authority with a chosen subjectKeyIdentifier.
+//
+// It exists for one case: an authority that claims a configured authority's SKI,
+// so that the leaves it issues carry an authorityKeyIdentifier naming the
+// configured one. CreateCertificate always takes a leaf's AKI from its parent's
+// SKI, so this is the only way to produce a certificate that dispatches to an
+// authenticator that did not issue it.
+func newAuthorityWithSKI(t *testing.T, commonName string, lifetime time.Duration, subjectKeyID []byte) *authority {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generating authority key: %v", err)
@@ -72,6 +86,7 @@ func newAuthority(t *testing.T, commonName string, lifetime time.Duration) *auth
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
+		SubjectKeyId:          subjectKeyID,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
 	if err != nil {
@@ -214,11 +229,19 @@ func (l *leaf) bundle(t *testing.T) string {
 // parsing in the loop.
 type stubSignature struct {
 	keyID string
+	// created overrides the created parameter, for the cases about the accepted time
+	// window. The zero value means 1, which is comfortably stale and is what the
+	// cases that reject before reaching a clock want.
+	created time.Time
 }
 
 func (s *stubSignature) parse(t *testing.T, req *http.Request) *httpsig.Signature {
 	t.Helper()
-	req.Header.Set("Signature-Input", `sig1=("@method");keyid="`+s.keyID+`";created=1;nonce="n";alg="ed25519"`)
+	created := int64(1)
+	if !s.created.IsZero() {
+		created = s.created.Unix()
+	}
+	req.Header.Set("Signature-Input", `sig1=("@method");keyid="`+s.keyID+`";created=`+strconv.FormatInt(created, 10)+`;nonce="n";alg="ed25519"`)
 	req.Header.Set("Signature", `sig1=:AAAA:`)
 	sigs, err := httpsig.ParseSignatures(req, nil)
 	if err != nil {
@@ -235,9 +258,11 @@ func certAuthenticator(t *testing.T, a *authority, mutate func(*apiserver.HTTPSi
 	t.Helper()
 	c := apiserver.HTTPSignatureAuthenticator{
 		Name: "certs",
-		X509: &apiserver.HTTPSignatureX509{CertificateAuthority: a.pem},
-		ClaimMappings: &apiserver.HTTPSignatureClaimMappings{
-			Username: apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`},
+		X509: &apiserver.HTTPSignatureX509{
+			CertificateAuthority: a.pem,
+			ClaimMappings: &apiserver.HTTPSignatureClaimMappings{
+				Username: apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`},
+			},
 		},
 	}
 	if mutate != nil {
@@ -283,10 +308,10 @@ func TestCertificateAuthenticatesSignedRequest(t *testing.T) {
 		uris:         []string{"spiffe://cluster.local/ns/default/sa/builder"},
 	})
 	auth := certAuthenticator(t, ca, func(c *apiserver.HTTPSignatureAuthenticator) {
-		c.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `"cert:" + cert.subject.commonName`}
-		c.ClaimMappings.Groups = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.organization`}
-		c.ClaimMappings.UID = apiserver.HTTPSignatureClaimExpression{Expression: `cert.sha256Thumbprint`}
-		c.ClaimMappings.Extra = []apiserver.ExtraMapping{{
+		c.X509.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `"cert:" + cert.subject.commonName`}
+		c.X509.ClaimMappings.Groups = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.organization`}
+		c.X509.ClaimMappings.UID = apiserver.HTTPSignatureClaimExpression{Expression: `cert.sha256Thumbprint`}
+		c.X509.ClaimMappings.Extra = []apiserver.ExtraMapping{{
 			Key:             "example.org/spiffe-id",
 			ValueExpression: `cert.uriSANs`,
 		}}
@@ -420,6 +445,12 @@ func TestCertificateRequiresOneHeader(t *testing.T) {
 
 // TestCertificateRequiresTrustAnchor is the trust boundary: holding the key of a
 // well-formed certificate proves possession and nothing else.
+//
+// A certificate from an unconfigured authority is now refused at dispatch rather
+// than by a chain build. Its authorityKeyIdentifier names an anchor no configured
+// bundle holds, so no authenticator claims it and nothing is parsed twice or
+// verified. The error says that rather than reporting a chain failure, because the
+// keyid is correct and the authority is what is absent.
 func TestCertificateRequiresTrustAnchor(t *testing.T) {
 	configured := newAuthority(t, "configured-ca", time.Hour)
 	other := newAuthority(t, "other-ca", time.Hour)
@@ -433,13 +464,49 @@ func TestCertificateRequiresTrustAnchor(t *testing.T) {
 	if ok {
 		t.Fatal("a certificate from an unconfigured authority was accepted")
 	}
-	if err == nil || !strings.Contains(err.Error(), "does not chain to this authenticator's trust anchors") {
-		t.Errorf("want a chain error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "no configured authenticator holds the trust anchor that issued") {
+		t.Errorf("want an unknown-issuer error, got %v", err)
 	}
 	// The error names the certificate so an operator can find it, and does not
 	// echo its bytes.
 	if err != nil && !strings.Contains(err.Error(), "builder") {
 		t.Errorf("the error should name the certificate's subject, got %v", err)
+	}
+}
+
+// TestForgedAuthorityKeyIDStillNeedsTheChain is why dispatching on an unverified
+// extension is safe.
+//
+// The authorityKeyIdentifier selects the authenticator and comes from a header
+// nobody has verified. Here a rogue authority claims the configured authority's
+// subjectKeyIdentifier, so the leaves it issues name the configured authenticator
+// and reach it. The chain build then refuses them, because the leaf's signature has
+// to verify against an anchor in that authenticator's bundle and it does not.
+//
+// So a forged AKI can route a caller to an authenticator that will turn them away,
+// and to nothing else. That is what makes a second check of the AKI against the
+// built chain unnecessary rather than merely cheap: there is no reachable state
+// where the chain builds and the claimed issuer was a lie.
+func TestForgedAuthorityKeyIDStillNeedsTheChain(t *testing.T) {
+	configured := newAuthority(t, "configured-ca", time.Hour)
+	rogue := newAuthorityWithSKI(t, "rogue-ca", time.Hour, configured.cert.SubjectKeyId)
+	l := rogue.issue(t, leafOptions{commonName: "impostor"})
+	auth := certAuthenticator(t, configured, nil)
+
+	if !bytes.Equal(l.cert.AuthorityKeyId, configured.cert.SubjectKeyId) {
+		t.Fatalf("this test needs a leaf whose AKI names the configured authority; got %x, want %x",
+			l.cert.AuthorityKeyId, configured.cert.SubjectKeyId)
+	}
+
+	rt, c := certSigner(t, l)
+	_, ok, err := auth.AuthenticateRequest(certRequest(t, rt, c))
+	if ok {
+		t.Fatal("a certificate claiming the configured authority's key identifier was accepted")
+	}
+	// Reached the authenticator, which is the point, and was refused by the chain
+	// rather than by dispatch.
+	if err == nil || !strings.Contains(err.Error(), "does not chain to this authenticator's trust anchors") {
+		t.Errorf("want a chain error, which is what proves dispatch admitted it and validation refused it, got %v", err)
 	}
 }
 
@@ -476,14 +543,14 @@ func TestCertificateValidationRules(t *testing.T) {
 	}{{
 		name: "rule passes",
 		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.CertificateValidationRules = []apiserver.CertificateValidationRule{{
+			c.X509.CertificateValidationRules = []apiserver.CertificateValidationRule{{
 				Expression: `cert.subject.organization.exists(o, o == "platform")`,
 			}}
 		},
 	}, {
 		name: "rule fails with its message",
 		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.CertificateValidationRules = []apiserver.CertificateValidationRule{{
+			c.X509.CertificateValidationRules = []apiserver.CertificateValidationRule{{
 				Expression: `cert.subject.organization.exists(o, o == "other")`,
 				Message:    "certificate must be issued to the other organization",
 			}}
@@ -495,7 +562,7 @@ func TestCertificateValidationRules(t *testing.T) {
 		// maximum lifetime field.
 		name: "lifetime rule fails",
 		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.CertificateValidationRules = []apiserver.CertificateValidationRule{{
+			c.X509.CertificateValidationRules = []apiserver.CertificateValidationRule{{
 				Expression: `cert.notAfter - cert.notBefore <= duration("1m")`,
 				Message:    "certificate lifetime must not exceed one minute",
 			}}
@@ -507,17 +574,17 @@ func TestCertificateValidationRules(t *testing.T) {
 		// mapping instead.
 		name: "rules run before mappings",
 		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.CertificateValidationRules = []apiserver.CertificateValidationRule{{
+			c.X509.CertificateValidationRules = []apiserver.CertificateValidationRule{{
 				Expression: `cert.dnsSANs.size() > 0`,
 				Message:    "certificate must carry a DNS name",
 			}}
-			c.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `cert.dnsSANs[0]`}
+			c.X509.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `cert.dnsSANs[0]`}
 		},
 		want: "certificate must carry a DNS name",
 	}, {
 		name: "user rule rejects the mapped identity",
 		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `"system:" + cert.subject.commonName`}
+			c.X509.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `"system:" + cert.subject.commonName`}
 			c.UserValidationRules = []apiserver.UserValidationRule{{
 				Expression: `!user.username.startsWith("system:")`,
 				Message:    "username must not use the system: prefix",
@@ -572,7 +639,7 @@ func TestCertificateValidationIsCached(t *testing.T) {
 	ca := newAuthority(t, "test-ca", time.Hour)
 	l := ca.issue(t, leafOptions{commonName: "builder"})
 	auth := certAuthenticator(t, ca, nil)
-	r := auth.resolvers[0].(*certificateResolver)
+	r := auth.backends[0].(*x509Backend)
 
 	rt, c := certSigner(t, l)
 	for i := 0; i < 3; i++ {
@@ -598,7 +665,7 @@ func TestCertificateFailuresAreNotCached(t *testing.T) {
 	configured := newAuthority(t, "configured-ca", time.Hour)
 	other := newAuthority(t, "other-ca", time.Hour)
 	auth := certAuthenticator(t, configured, nil)
-	r := auth.resolvers[0].(*certificateResolver)
+	r := auth.backends[0].(*x509Backend)
 
 	for i := 0; i < 5; i++ {
 		l := other.issue(t, leafOptions{commonName: fmt.Sprintf("attacker-%d", i)})
@@ -625,11 +692,11 @@ func TestCertificateCacheTTLIsClampedByTheChain(t *testing.T) {
 	ca := newAuthority(t, "short-lived-ca", 2*time.Minute)
 	l := ca.issue(t, leafOptions{commonName: "builder", notAfter: time.Now().Add(24 * time.Hour)})
 	auth := certAuthenticator(t, ca, func(c *apiserver.HTTPSignatureAuthenticator) {
-		c.X509.CertificateCache = &apiserver.HTTPSignatureCertificateCache{
+		c.X509.Cache = &apiserver.HTTPSignatureX509Cache{
 			TTL: &metav1.Duration{Duration: time.Hour},
 		}
 	})
-	r := auth.resolvers[0].(*certificateResolver)
+	r := auth.backends[0].(*x509Backend)
 
 	chains, err := l.cert.Verify(x509.VerifyOptions{
 		Roots:     r.roots,
@@ -752,15 +819,22 @@ func TestCertificateAlgorithmsPerKeyType(t *testing.T) {
 // in the configuration file, and a resolver willing to vend a key for that keyid
 // could take over an identity the certificate authority is supposed to name.
 func TestCertificateKeyIDPrefixIsReservedForCertificates(t *testing.T) {
-	catchAll := &endpointResolver{resolverName: "catch-all"}
+	catchAll := &resolverBackend{authenticatorName: "catch-all"}
 	if len(catchAll.prefixes) != 0 {
 		t.Fatal("this test is about a resolver with no prefixes")
 	}
-	if !catchAll.handles("some-other-key") {
+	signatureFor := func(keyID string) *httpsig.Signature {
+		req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return (&stubSignature{keyID: keyID}).parse(t, req)
+	}
+	if !catchAll.handles(signatureFor("some-other-key"), nil) {
 		t.Fatal("a resolver with no prefixes should be asked about an ordinary keyID")
 	}
 	certKeyID := transporthttpsig.CertificateKeyIDPrefix + "deadbeef"
-	if catchAll.handles(certKeyID) {
+	if catchAll.handles(signatureFor(certKeyID), nil) {
 		t.Errorf("a resolver was asked about the certificate keyID %q", certKeyID)
 	}
 }
@@ -786,9 +860,11 @@ func TestCertificateAndEndpointCoexist(t *testing.T) {
 			}(),
 			{
 				Name: "certs",
-				X509: &apiserver.HTTPSignatureX509{CertificateAuthority: ca.pem},
-				ClaimMappings: &apiserver.HTTPSignatureClaimMappings{
-					Username: apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`},
+				X509: &apiserver.HTTPSignatureX509{
+					CertificateAuthority: ca.pem,
+					ClaimMappings: &apiserver.HTTPSignatureClaimMappings{
+						Username: apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`},
+					},
 				},
 			},
 		},
@@ -819,6 +895,114 @@ func TestCertificateAndEndpointCoexist(t *testing.T) {
 	}
 }
 
+// TestTwoAuthenticatorsMayNotShareAnAuthorityKey is checked at construction as well
+// as in configuration validation, because a caller building the struct directly has
+// run no validation and the failure it prevents is silent: a certificate names its
+// issuer by key identifier, so both authenticators would be selected and which
+// identity the certificate received would depend on the order they are configured.
+func TestTwoAuthenticatorsMayNotShareAnAuthorityKey(t *testing.T) {
+	shared := newAuthority(t, "shared-ca", time.Hour)
+	// A second certificate for the same key, which is what a certificate authority
+	// that reissued without rotating its key produces.
+	reissued := newAuthorityWithSKI(t, "shared-ca-reissued", 2*time.Hour, shared.cert.SubjectKeyId)
+
+	mapping := func(pem, name string) apiserver.HTTPSignatureAuthenticator {
+		return apiserver.HTTPSignatureAuthenticator{
+			Name: name,
+			X509: &apiserver.HTTPSignatureX509{
+				CertificateAuthority: pem,
+				ClaimMappings: &apiserver.HTTPSignatureClaimMappings{
+					Username: apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`},
+				},
+			},
+		}
+	}
+
+	_, err := newAuthenticator(t, &apiserver.HTTPSignatureConfig{
+		Authenticators: []apiserver.HTTPSignatureAuthenticator{
+			mapping(shared.pem, "first"),
+			mapping(reissued.pem, "second"),
+		},
+	})
+	if err == nil {
+		t.Fatal("two authenticators holding one authority key were accepted")
+	}
+	if !strings.Contains(err.Error(), "same subjectKeyIdentifier") {
+		t.Errorf("want an error naming the shared key identifier, got %v", err)
+	}
+
+	// One authenticator holding both is a rollover, not a conflict.
+	if _, err := newAuthenticator(t, &apiserver.HTTPSignatureConfig{
+		Authenticators: []apiserver.HTTPSignatureAuthenticator{mapping(shared.pem+reissued.pem, "rolling")},
+	}); err != nil {
+		t.Errorf("one authenticator holding two certificates for one authority key should be accepted: %v", err)
+	}
+}
+
+// TestTwoAuthenticatorsMayNotShareAnAuthorityKeyUnderDifferentIdentifiers is the
+// same invariant where the identifiers do not collide.
+//
+// A subjectKeyIdentifier is whatever the issuer stamped, so one authority key can be
+// certified twice under two different ones. Checking identifiers alone would admit
+// that, and both bundles would then validate the same certificate: which
+// authenticator's rules ran would be decided by whichever identifier the authority
+// put in the leaf rather than by the operator.
+func TestTwoAuthenticatorsMayNotShareAnAuthorityKeyUnderDifferentIdentifiers(t *testing.T) {
+	first := newAuthorityWithSKI(t, "shared-key-ca", time.Hour, []byte("identifier-one"))
+	// Same key, deliberately different identifier.
+	second := &authority{key: first.key}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(99),
+		Subject:               pkix.Name{CommonName: "shared-key-ca-restamped"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		SubjectKeyId:          []byte("identifier-two"),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, first.key.Public(), first.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.cert, err = x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.pem = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+
+	if bytes.Equal(first.cert.SubjectKeyId, second.cert.SubjectKeyId) {
+		t.Fatal("this test needs two different subjectKeyIdentifiers")
+	}
+	if !bytes.Equal(first.cert.RawSubjectPublicKeyInfo, second.cert.RawSubjectPublicKeyInfo) {
+		t.Fatal("this test needs one shared public key")
+	}
+
+	mapping := func(pemBytes, name string) apiserver.HTTPSignatureAuthenticator {
+		return apiserver.HTTPSignatureAuthenticator{
+			Name: name,
+			X509: &apiserver.HTTPSignatureX509{
+				CertificateAuthority: pemBytes,
+				ClaimMappings: &apiserver.HTTPSignatureClaimMappings{
+					Username: apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`},
+				},
+			},
+		}
+	}
+	_, err = newAuthenticator(t, &apiserver.HTTPSignatureConfig{
+		Authenticators: []apiserver.HTTPSignatureAuthenticator{
+			mapping(first.pem, "first"),
+			mapping(second.pem, "second"),
+		},
+	})
+	if err == nil {
+		t.Fatal("two authenticators holding one authority key under different identifiers were accepted")
+	}
+	if !strings.Contains(err.Error(), "same public key") {
+		t.Errorf("want an error naming the shared key, got %v", err)
+	}
+}
+
 // TestCertificateAuthenticatorConfigErrors covers the configurations refused at
 // construction, which is where a mistake should surface rather than on a request.
 func TestCertificateAuthenticatorConfigErrors(t *testing.T) {
@@ -826,9 +1010,11 @@ func TestCertificateAuthenticatorConfigErrors(t *testing.T) {
 	base := func() apiserver.HTTPSignatureAuthenticator {
 		return apiserver.HTTPSignatureAuthenticator{
 			Name: "certs",
-			X509: &apiserver.HTTPSignatureX509{CertificateAuthority: ca.pem},
-			ClaimMappings: &apiserver.HTTPSignatureClaimMappings{
-				Username: apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`},
+			X509: &apiserver.HTTPSignatureX509{
+				CertificateAuthority: ca.pem,
+				ClaimMappings: &apiserver.HTTPSignatureClaimMappings{
+					Username: apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`},
+				},
 			},
 		}
 	}
@@ -838,14 +1024,39 @@ func TestCertificateAuthenticatorConfigErrors(t *testing.T) {
 		want   string
 	}{{
 		name:   "no claim mappings",
-		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.ClaimMappings = nil },
+		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.X509.ClaimMappings = nil },
 		want:   "claimMappings is required",
 	}, {
-		name: "both endpoint and x509",
+		name: "both resolver and x509",
 		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.Endpoint = "unix:///var/run/httpsig-resolver.sock"
+			c.Resolver = &apiserver.HTTPSignatureResolver{Endpoint: "unix:///var/run/httpsig-resolver.sock"}
 		},
-		want: "endpoint and x509 are alternatives",
+		want: "resolver and x509 are alternatives",
+	}, {
+		// Nothing for a presented certificate's authorityKeyIdentifier to name, so
+		// no certificate this anchor issued could ever select this authenticator.
+		// Refused at construction rather than becoming a silently unreachable
+		// authenticator.
+		name: "trust anchor without a subjectKeyIdentifier",
+		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
+			key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmpl := &x509.Certificate{
+				SerialNumber: big.NewInt(7),
+				Subject:      pkix.Name{CommonName: "no-ski-authority"},
+				NotBefore:    time.Now().Add(-time.Hour),
+				NotAfter:     time.Now().Add(time.Hour),
+				KeyUsage:     x509.KeyUsageDigitalSignature,
+			}
+			der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.X509.CertificateAuthority = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+		},
+		want: "no subjectKeyIdentifier extension",
 	}, {
 		name:   "unparseable trust anchors",
 		mutate: func(c *apiserver.HTTPSignatureAuthenticator) { c.X509.CertificateAuthority = "not a certificate" },
@@ -853,13 +1064,13 @@ func TestCertificateAuthenticatorConfigErrors(t *testing.T) {
 	}, {
 		name: "expression that does not compile",
 		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `cert.noSuchField`}
+			c.X509.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `cert.noSuchField`}
 		},
 		want: "claimMappings.username.expression",
 	}, {
 		name: "certificate rule that is not a boolean",
 		mutate: func(c *apiserver.HTTPSignatureAuthenticator) {
-			c.CertificateValidationRules = []apiserver.CertificateValidationRule{{Expression: `cert.subject.commonName`}}
+			c.X509.CertificateValidationRules = []apiserver.CertificateValidationRule{{Expression: `cert.subject.commonName`}}
 		},
 		want: "certificateValidationRules[0].expression",
 	}} {
@@ -879,24 +1090,35 @@ func TestCertificateAuthenticatorConfigErrors(t *testing.T) {
 	}
 }
 
-// TestCertificateFailedAttemptsAreNotCountedWhenAnotherSucceeds is about the
-// metric being readable. A signature is offered to every authenticator whose keyid
-// form it matches, so with two certificate authorities configured a client's
-// certificate chains to one and fails against the other. Counting that failure
-// would make a correct configuration report a rejection on every single request.
-func TestCertificateFailedAttemptsAreNotCountedWhenAnotherSucceeds(t *testing.T) {
+// TestOnlyTheIssuingAuthenticatorIsAsked is the dispatch.
+//
+// Two certificate authorities are configured and a client presents a certificate
+// from the second. The first is not tried and fails: it is never asked. Its
+// authorityKeyIdentifier names the second authority's key, and that selects one
+// authenticator.
+//
+// Before, every certificate authenticator claimed every certificate-form keyid, so
+// a request paid for a header read, a digest, a parse, a signature verification and
+// a chain build once per configured authenticator, all but one of them failing. The
+// failures were real enough that the outcome counter had to buffer them and discard
+// them on success, because otherwise a correct two-authority configuration reported
+// a rejection on every request. Both the work and the buffering are gone.
+//
+// The first authenticator's validation cache is what proves it: a lookup is the
+// first thing its resolve does, so zero lookups means resolve was never called.
+func TestOnlyTheIssuingAuthenticatorIsAsked(t *testing.T) {
 	first := newAuthority(t, "first-ca", time.Hour)
 	second := newAuthority(t, "second-ca", time.Hour)
-	// Issued by the second authority, so the first authenticator is tried and
-	// fails before the second one succeeds.
 	l := second.issue(t, leafOptions{commonName: "builder"})
 
 	mapping := func(ca *authority, name string) apiserver.HTTPSignatureAuthenticator {
 		return apiserver.HTTPSignatureAuthenticator{
 			Name: name,
-			X509: &apiserver.HTTPSignatureX509{CertificateAuthority: ca.pem},
-			ClaimMappings: &apiserver.HTTPSignatureClaimMappings{
-				Username: apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`},
+			X509: &apiserver.HTTPSignatureX509{
+				CertificateAuthority: ca.pem,
+				ClaimMappings: &apiserver.HTTPSignatureClaimMappings{
+					Username: apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`},
+				},
 			},
 		}
 	}
@@ -910,7 +1132,7 @@ func TestCertificateFailedAttemptsAreNotCountedWhenAnotherSucceeds(t *testing.T)
 		t.Fatalf("building authenticator: %v", err)
 	}
 
-	before := outcomeCounts(t)
+	beforeOutcomes, beforeLookups := outcomeCounts(t), certificateCacheLookups(t)
 	rt, c := certSigner(t, l)
 	req := certRequest(t, rt, c)
 	resp, ok, err := auth.AuthenticateRequest(req)
@@ -920,28 +1142,35 @@ func TestCertificateFailedAttemptsAreNotCountedWhenAnotherSucceeds(t *testing.T)
 	if got := resp.User.GetName(); got != "builder" {
 		t.Errorf("username = %q, want %q", got, "builder")
 	}
-	after := outcomeCounts(t)
+	afterOutcomes, afterLookups := outcomeCounts(t), certificateCacheLookups(t)
 
-	if got := after["second/"+metrics.OutcomeAuthenticated] - before["second/"+metrics.OutcomeAuthenticated]; got != 1 {
+	if got := afterOutcomes["second/"+metrics.OutcomeAuthenticated] - beforeOutcomes["second/"+metrics.OutcomeAuthenticated]; got != 1 {
 		t.Errorf("authenticated count for the second authenticator rose by %d, want 1", got)
 	}
-	// The first authenticator was tried and could not validate the certificate.
-	// That is the configuration working, so nothing about it is counted.
+	if got := afterLookups["first"] - beforeLookups["first"]; got != 0 {
+		t.Errorf("the first authenticator did %d validation cache lookups for a certificate it did not issue; "+
+			"the authorityKeyIdentifier should have kept it out of the dispatch entirely", got)
+	}
+	if got := afterLookups["second"] - beforeLookups["second"]; got != 1 {
+		t.Errorf("the issuing authenticator did %d validation cache lookups, want 1", got)
+	}
 	for _, outcome := range []string{metrics.OutcomeRejectedIdentity, metrics.OutcomeUnresolved, metrics.OutcomeBadSignature} {
-		if got := after["first/"+outcome] - before["first/"+outcome]; got != 0 {
-			t.Errorf("the first authenticator counted %d %s for a request another authenticator authenticated; "+
-				"a correct two-authority configuration would report a rejection on every request", got, outcome)
+		if got := afterOutcomes["first/"+outcome] - beforeOutcomes["first/"+outcome]; got != 0 {
+			t.Errorf("the first authenticator counted %d %s for a signature it was never asked about", got, outcome)
 		}
 	}
 }
 
-// TestCertificateFailedAttemptsAreCountedWhenNothingSucceeds is the other half:
-// when the request really is refused, the attempts are what says why, so they are
-// recorded.
-func TestCertificateFailedAttemptsAreCountedWhenNothingSucceeds(t *testing.T) {
+// TestRefusalByAnAuthenticatorIsCounted covers the half of the split where an
+// authenticator did decide: it claimed the signature and refused it, which is a
+// configuration question worth a counter.
+//
+// The rogue authority claims the configured authority's subjectKeyIdentifier, so the
+// leaf reaches the authenticator and is refused by the chain build.
+func TestRefusalByAnAuthenticatorIsCounted(t *testing.T) {
 	configured := newAuthority(t, "configured-ca", time.Hour)
-	other := newAuthority(t, "other-ca", time.Hour)
-	l := other.issue(t, leafOptions{commonName: "builder"})
+	rogue := newAuthorityWithSKI(t, "rogue-ca", time.Hour, configured.cert.SubjectKeyId)
+	l := rogue.issue(t, leafOptions{commonName: "impostor"})
 	auth := certAuthenticator(t, configured, func(c *apiserver.HTTPSignatureAuthenticator) {
 		c.Name = "only"
 	})
@@ -949,12 +1178,44 @@ func TestCertificateFailedAttemptsAreCountedWhenNothingSucceeds(t *testing.T) {
 	before := outcomeCounts(t)
 	rt, c := certSigner(t, l)
 	if _, ok, _ := auth.AuthenticateRequest(certRequest(t, rt, c)); ok {
-		t.Fatal("a certificate from an unconfigured authority was authenticated")
+		t.Fatal("a certificate claiming the configured authority's key identifier was authenticated")
 	}
 	after := outcomeCounts(t)
 
 	if got := after["only/"+metrics.OutcomeRejectedIdentity] - before["only/"+metrics.OutcomeRejectedIdentity]; got != 1 {
-		t.Errorf("rejected_identity rose by %d, want 1: a refused request is what the counter is for", got)
+		t.Errorf("rejected_identity rose by %d, want 1: an authenticator that claimed and refused a signature is what the counter is for", got)
+	}
+}
+
+// TestUnknownIssuerIsCountedAsUnclaimed covers the other half: no authenticator
+// claimed the signature, so none of them decided anything.
+//
+// This used to be one authenticator's rejected_identity, because every certificate
+// authenticator was offered every certificate. Counting it there now would name an
+// authenticator that was never asked, and would make an authority rotation that has
+// not reached this server look like that authenticator refusing valid clients.
+func TestUnknownIssuerIsCountedAsUnclaimed(t *testing.T) {
+	configured := newAuthority(t, "configured-ca", time.Hour)
+	other := newAuthority(t, "other-ca", time.Hour)
+	l := other.issue(t, leafOptions{commonName: "builder"})
+	auth := certAuthenticator(t, configured, func(c *apiserver.HTTPSignatureAuthenticator) {
+		c.Name = "only"
+	})
+
+	beforeOutcomes, beforeUnclaimed := outcomeCounts(t), unclaimedCounts(t)
+	rt, c := certSigner(t, l)
+	if _, ok, _ := auth.AuthenticateRequest(certRequest(t, rt, c)); ok {
+		t.Fatal("a certificate from an unconfigured authority was authenticated")
+	}
+	afterOutcomes, afterUnclaimed := outcomeCounts(t), unclaimedCounts(t)
+
+	if got := afterUnclaimed[metrics.UnclaimedUnknownCertificateIssuer] - beforeUnclaimed[metrics.UnclaimedUnknownCertificateIssuer]; got != 1 {
+		t.Errorf("unknown_certificate_issuer rose by %d, want 1", got)
+	}
+	for _, outcome := range []string{metrics.OutcomeRejectedIdentity, metrics.OutcomeUnresolved, metrics.OutcomeBadSignature} {
+		if got := afterOutcomes["only/"+outcome] - beforeOutcomes["only/"+outcome]; got != 0 {
+			t.Errorf("the authenticator counted %d %s for a signature it was never asked about", got, outcome)
+		}
 	}
 }
 
@@ -989,6 +1250,59 @@ func outcomeCounts(t *testing.T) map[string]int {
 	return counts
 }
 
+// certificateCacheLookups reads the validation cache lookup counter, keyed by
+// authenticator and summed over hit and miss. A lookup is the first thing a
+// certificate authenticator's resolve does, so this counts how many of them were
+// asked about a request.
+func certificateCacheLookups(t *testing.T) map[string]int {
+	t.Helper()
+	metrics.RegisterMetrics()
+	families, err := legacyregistry.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	counts := map[string]int{}
+	for _, family := range families {
+		if family.GetName() != "apiserver_httpsig_certificate_validation_cache_lookups_total" {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			for _, label := range m.GetLabel() {
+				if label.GetName() == "authenticator" {
+					counts[label.GetValue()] += int(m.GetCounter().GetValue())
+				}
+			}
+		}
+	}
+	return counts
+}
+
+// unclaimedCounts reads the unclaimed-signature counter, keyed by reason. It has no
+// authenticator label, because a signature nothing claimed has no authenticator to
+// attribute it to, which is the whole reason it is a separate counter.
+func unclaimedCounts(t *testing.T) map[string]int {
+	t.Helper()
+	metrics.RegisterMetrics()
+	families, err := legacyregistry.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	counts := map[string]int{}
+	for _, family := range families {
+		if family.GetName() != "apiserver_httpsig_unclaimed_signatures_total" {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			for _, label := range m.GetLabel() {
+				if label.GetName() == "reason" {
+					counts[label.GetValue()] = int(m.GetCounter().GetValue())
+				}
+			}
+		}
+	}
+	return counts
+}
+
 // TestCertificateBoundsVerificationCost is the bound on what an unauthenticated
 // caller can make the verifier spend.
 //
@@ -1002,7 +1316,7 @@ func outcomeCounts(t *testing.T) map[string]int {
 func TestCertificateBoundsVerificationCost(t *testing.T) {
 	ca := newAuthority(t, "test-ca", time.Hour)
 	auth := certAuthenticator(t, ca, nil)
-	r := auth.resolvers[0].(*certificateResolver)
+	r := auth.backends[0].(*x509Backend)
 
 	// A modulus no one generated: an odd integer of the requested width, which the
 	// parser accepts and which crypto/rsa will happily exponentiate against.
@@ -1056,7 +1370,11 @@ func TestCertificateBoundsVerificationCost(t *testing.T) {
 	}
 	req.Header.Set(transporthttpsig.CertificateHeader, transporthttpsig.CertificateHeaderValue(oversized.cert.Raw))
 	sig := &stubSignature{keyID: transporthttpsig.CertificateKeyID(oversized.cert.Raw)}
-	if _, err := r.resolve(req, sig.parse(t, req)); err == nil {
+	presented, err := parsePresentedCertificate(req)
+	if err != nil {
+		t.Fatalf("parsing the presented certificate: %v", err)
+	}
+	if _, err := r.resolve(req, sig.parse(t, req), presented); err == nil {
 		t.Error("an oversized key was resolved to a verifier; the cost bound has to be checked before the verifier exists")
 	} else if !strings.Contains(err.Error(), "outside the accepted") {
 		t.Errorf("want a size error, got %v", err)
@@ -1072,7 +1390,7 @@ func TestCertificateCacheHitStillVerifies(t *testing.T) {
 	ca := newAuthority(t, "test-ca", time.Hour)
 	l := ca.issue(t, leafOptions{commonName: "builder"})
 	auth := certAuthenticator(t, ca, nil)
-	r := auth.resolvers[0].(*certificateResolver)
+	r := auth.backends[0].(*x509Backend)
 
 	// Populate the cache with a legitimate request.
 	rt, c := certSigner(t, l)
@@ -1157,8 +1475,8 @@ func TestCachedIdentityIsNotShared(t *testing.T) {
 	ca := newAuthority(t, "test-ca", time.Hour)
 	l := ca.issue(t, leafOptions{commonName: "builder", organization: []string{"platform"}})
 	auth := certAuthenticator(t, ca, func(c *apiserver.HTTPSignatureAuthenticator) {
-		c.ClaimMappings.Groups = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.organization`}
-		c.ClaimMappings.Extra = []apiserver.ExtraMapping{{Key: "example.org/id", ValueExpression: `cert.subject.commonName`}}
+		c.X509.ClaimMappings.Groups = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.organization`}
+		c.X509.ClaimMappings.Extra = []apiserver.ExtraMapping{{Key: "example.org/id", ValueExpression: `cert.subject.commonName`}}
 	})
 	rt, c := certSigner(t, l)
 
@@ -1230,8 +1548,8 @@ func TestCertificateCannotMapToReservedIdentity(t *testing.T) {
 
 	// The mapping an operator would plausibly write: identity from the subject.
 	subjectMapping := func(c *apiserver.HTTPSignatureAuthenticator) {
-		c.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`}
-		c.ClaimMappings.Groups = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.organization`}
+		c.X509.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`}
+		c.X509.ClaimMappings.Groups = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.organization`}
 	}
 
 	for _, tc := range []struct {
@@ -1289,8 +1607,8 @@ func TestCertificateCannotMapToReservedIdentity(t *testing.T) {
 func TestCertificateReservedNamesByRule(t *testing.T) {
 	ca := newAuthority(t, "test-ca", time.Hour)
 	withRule := func(c *apiserver.HTTPSignatureAuthenticator) {
-		c.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`}
-		c.ClaimMappings.Groups = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.organization`}
+		c.X509.ClaimMappings.Username = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.commonName`}
+		c.X509.ClaimMappings.Groups = apiserver.HTTPSignatureClaimExpression{Expression: `cert.subject.organization`}
 		// The rule shipped in the example configuration, verbatim.
 		c.UserValidationRules = []apiserver.UserValidationRule{{
 			Expression: `!user.username.startsWith("system:") && !user.groups.exists(g, g.startsWith("system:"))`,
@@ -1353,4 +1671,139 @@ func TestCertificateKeyIDCommitsToTheLeafBytes(t *testing.T) {
 	if base != strings.ToLower(base) {
 		t.Errorf("keyid %q is not lowercase, so a certificate would have more than one spelling", base)
 	}
+}
+
+// TestEveryUnclaimedReasonIsReachable exercises each value of the reason label.
+//
+// The partition exists so an operator can tell their own configuration error from a
+// client's credential error without reading logs. A value nothing can produce is a
+// dashboard row that never fills and a distinction nobody can rely on, so each one
+// gets an input that produces it and only it.
+func TestEveryUnclaimedReasonIsReachable(t *testing.T) {
+	ca := newAuthority(t, "reason-ca", time.Hour)
+	other := newAuthority(t, "other-ca", time.Hour)
+	otherLeaf := other.issue(t, leafOptions{commonName: "outsider"})
+
+	// A leaf with no authorityKeyIdentifier: self-signed and not a CA, so Go neither
+	// copies one from a parent nor generates a subject identifier.
+	noAKIKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noAKITmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(11),
+		Subject:      pkix.Name{CommonName: "no-aki"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	noAKIDER, err := x509.CreateCertificate(rand.Reader, noAKITmpl, noAKITmpl, &noAKIKey.PublicKey, noAKIKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noAKI, err := x509.ParseCertificate(noAKIDER); err != nil {
+		t.Fatal(err)
+	} else if len(noAKI.AuthorityKeyId) != 0 {
+		t.Fatal("this case needs a certificate with no authorityKeyIdentifier")
+	}
+
+	for _, tc := range []struct {
+		reason string
+		// build produces a request that should reach no authenticator.
+		build func(t *testing.T, auth *Authenticator) *http.Request
+	}{{
+		reason: metrics.UnclaimedUnparseableSignature,
+		build: func(t *testing.T, _ *Authenticator) *http.Request {
+			req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Signature-Input", "this is not a signature input")
+			req.Header.Set("Signature", "nor is this")
+			return req
+		},
+	}, {
+		reason: metrics.UnclaimedUnknownKeyID,
+		build: func(t *testing.T, _ *Authenticator) *http.Request {
+			req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// No resolver is configured at all, so nothing's prefixes admit this.
+			(&stubSignature{keyID: "some-key-nobody-serves"}).parse(t, req)
+			return req
+		},
+	}, {
+		reason: metrics.UnclaimedUnreadableCertificate,
+		build: func(t *testing.T, _ *Authenticator) *http.Request {
+			req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A certificate keyid with no certificate header to back it.
+			(&stubSignature{keyID: transporthttpsig.CertificateKeyIDPrefix + "deadbeef"}).parse(t, req)
+			return req
+		},
+	}, {
+		reason: metrics.UnclaimedCertificateWithoutAuthorityKeyID,
+		build: func(t *testing.T, _ *Authenticator) *http.Request {
+			req, err := http.NewRequest("GET", "https://"+testAuthort+"/api/v1/pods", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set(transporthttpsig.CertificateHeader, transporthttpsig.CertificateHeaderValue(noAKIDER))
+			(&stubSignature{keyID: transporthttpsig.CertificateKeyID(noAKIDER)}).parse(t, req)
+			return req
+		},
+	}, {
+		reason: metrics.UnclaimedUnknownCertificateIssuer,
+		build: func(t *testing.T, _ *Authenticator) *http.Request {
+			rt, c := certSigner(t, otherLeaf)
+			return certRequest(t, rt, c)
+		},
+	}} {
+		t.Run(tc.reason, func(t *testing.T) {
+			auth := certAuthenticator(t, ca, nil)
+			before := unclaimedCounts(t)
+			req := tc.build(t, auth)
+			if _, ok, _ := auth.AuthenticateRequest(req); ok {
+				t.Fatal("expected the request to reach no authenticator")
+			}
+			after := unclaimedCounts(t)
+			if got := after[tc.reason] - before[tc.reason]; got != 1 {
+				t.Errorf("%s rose by %d, want 1", tc.reason, got)
+			}
+			for reason, count := range after {
+				if reason == tc.reason {
+					continue
+				}
+				if got := count - before[reason]; got != 0 {
+					t.Errorf("%s also rose by %d; the reasons are meant to partition", reason, got)
+				}
+			}
+		})
+	}
+
+	// The remaining reason needs a resolver, which has to answer that it does not
+	// serve the keyID rather than never being asked about it.
+	t.Run(metrics.UnclaimedUnservedKeyID, func(t *testing.T) {
+		rt, c, _ := ed25519Client(t, testKeyID)
+		r := newTestResolver(t, "empty")
+		auth := authenticatorFor(t, apiserver.HTTPSignatureAuthenticator{
+			Resolver: &apiserver.HTTPSignatureResolver{Endpoint: r.Endpoint()},
+		})
+
+		before := unclaimedCounts(t)
+		req := signedRequest(t, rt, c, "GET", "https://"+testAuthort+"/api/v1/pods", nil)
+		if _, ok, _ := auth.AuthenticateRequest(req); ok {
+			t.Fatal("a keyID the resolver does not serve should not authenticate")
+		}
+		after := unclaimedCounts(t)
+		if got := after[metrics.UnclaimedUnservedKeyID] - before[metrics.UnclaimedUnservedKeyID]; got != 1 {
+			t.Errorf("%s rose by %d, want 1", metrics.UnclaimedUnservedKeyID, got)
+		}
+		if got := after[metrics.UnclaimedUnknownKeyID] - before[metrics.UnclaimedUnknownKeyID]; got != 0 {
+			t.Errorf("unknown_keyid also rose by %d; a resolver that was asked and said no is not the same as one that was never asked", got)
+		}
+	})
 }

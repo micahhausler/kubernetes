@@ -19,6 +19,7 @@ package httpsig
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -77,16 +78,44 @@ const (
 	defaultCacheTTL = 5 * time.Minute
 )
 
-// certificateResolver resolves a signature against a certificate the request
+// errNoAuthorityKeyID reports a certificate that parsed and carries no
+// authorityKeyIdentifier. Distinguished from every other read failure because the
+// certificate is well formed and merely unroutable, which is a different thing for
+// an operator to act on and is counted separately.
+var errNoAuthorityKeyID = errors.New("the certificate the request carries has no authorityKeyIdentifier extension")
+
+// x509Backend resolves a signature against a certificate the request
 // carries, validated against configured trust anchors.
-type certificateResolver struct {
-	resolverName string
-	policy       httpsig.Policy
+type x509Backend struct {
+	authenticatorName string
+	policy            httpsig.Policy
 
 	// roots are the trust anchors, and the source of intermediates. Nothing in
 	// the chain comes from the request: the leaf is the only certificate read
 	// from it, which is what bounds the chain build to a fixed pool.
 	roots *x509.CertPool
+
+	// anchorSKIs are the subjectKeyIdentifiers of every certificate in the bundle,
+	// intermediates included. A leaf's authorityKeyIdentifier names the SKI of
+	// whatever issued it, which may be an intermediate, so the whole bundle is
+	// indexed rather than only the self-signed entries.
+	//
+	// This is how the authenticator for a signature is chosen, and it is also
+	// checked again after the chain builds, against the anchor the chain actually
+	// terminated at.
+	// Each maps the value to the subject of a certificate carrying it, so an error
+	// about a collision can name a certificate rather than print bytes.
+	anchorSKIs map[string]anchorClaim
+
+	// anchorKeys are the public keys of the same certificates.
+	//
+	// Disjointness between authenticators has to hold on the key and not only on its
+	// identifier. A subjectKeyIdentifier is whatever the issuer stamped, so one
+	// authority key can appear under two of them, which would pass a check on
+	// identifiers alone: both bundles would then validate the same leaf, and which
+	// authenticator's rules ran would be decided by whichever identifier the
+	// authority happened to put in the leaf rather than by the operator.
+	anchorKeys map[string]anchorClaim
 
 	mapper authenticationcel.CertificateCELMapper
 
@@ -96,7 +125,7 @@ type certificateResolver struct {
 	cacheTTL time.Duration
 }
 
-var _ resolver = &certificateResolver{}
+var _ backend = &x509Backend{}
 
 // validated is a certificate that chained to the trust anchors and satisfied the
 // configured rules: its verification key and the identity it maps to.
@@ -133,14 +162,34 @@ func (v *validated) identity() *user.DefaultInfo {
 	return info
 }
 
-func newCertificateResolver(c apiserver.HTTPSignatureAuthenticator, policy httpsig.Policy, compiler authenticationcel.Compiler) (*certificateResolver, error) {
-	if c.ClaimMappings == nil {
-		return nil, fmt.Errorf("claimMappings is required with x509, because the identity comes from the certificate rather than from this file")
+func newX509Backend(c apiserver.HTTPSignatureAuthenticator, policy httpsig.Policy, compiler authenticationcel.Compiler) (*x509Backend, error) {
+	if c.X509.ClaimMappings == nil {
+		return nil, fmt.Errorf("x509.claimMappings is required, because the identity comes from the certificate rather than from this file")
 	}
 
-	roots, err := certutil.NewPoolFromBytes([]byte(c.X509.CertificateAuthority))
+	// Parsed rather than only pooled, because every certificate's
+	// subjectKeyIdentifier is needed to index this authenticator.
+	anchors, err := certutil.ParseCertsPEM([]byte(c.X509.CertificateAuthority))
 	if err != nil {
 		return nil, fmt.Errorf("x509.certificateAuthority: %w", err)
+	}
+	roots := x509.NewCertPool()
+	anchorSKIs := map[string]anchorClaim{}
+	anchorKeys := map[string]anchorClaim{}
+	for _, anchor := range anchors {
+		if len(anchor.SubjectKeyId) == 0 {
+			// Without it there is nothing for a leaf's authorityKeyIdentifier to
+			// match, so no signature could ever select this authenticator. Refused
+			// at startup rather than becoming a certificate that mysteriously never
+			// authenticates.
+			return nil, fmt.Errorf("x509.certificateAuthority: %s has no subjectKeyIdentifier extension, "+
+				"which is what a presented certificate's authorityKeyIdentifier names; RFC 5280 requires it on "+
+				"conforming certificate authority certificates", anchor.Subject)
+		}
+		roots.AddCert(anchor)
+		claim := anchorClaim{subject: anchor.Subject.String(), subjectKeyID: string(anchor.SubjectKeyId)}
+		anchorSKIs[string(anchor.SubjectKeyId)] = claim
+		anchorKeys[string(anchor.RawSubjectPublicKeyInfo)] = claim
 	}
 
 	mapper, err := CompileCertificateAuthenticator(compiler, c)
@@ -150,7 +199,7 @@ func newCertificateResolver(c apiserver.HTTPSignatureAuthenticator, policy https
 
 	maxEntries := defaultCacheMaxEntries
 	ttl := defaultCacheTTL
-	if cc := c.X509.CertificateCache; cc != nil {
+	if cc := c.X509.Cache; cc != nil {
 		if cc.MaxEntries != nil {
 			maxEntries = int(*cc.MaxEntries)
 		}
@@ -159,51 +208,79 @@ func newCertificateResolver(c apiserver.HTTPSignatureAuthenticator, policy https
 		}
 	}
 
-	return &certificateResolver{
-		resolverName: c.Name,
-		policy:       policy,
-		roots:        roots,
-		mapper:       mapper,
-		cache:        cache.NewLRUExpireCache(maxEntries),
-		cacheTTL:     ttl,
+	return &x509Backend{
+		authenticatorName: c.Name,
+		policy:            policy,
+		roots:             roots,
+		anchorSKIs:        anchorSKIs,
+		anchorKeys:        anchorKeys,
+		mapper:            mapper,
+		cache:             cache.NewLRUExpireCache(maxEntries),
+		cacheTTL:          ttl,
 	}, nil
 }
 
-func (r *certificateResolver) name() string { return r.resolverName }
+func (r *x509Backend) name() string { return r.authenticatorName }
 
 // handles claims every signature whose keyid is in the certificate form.
 //
-// Several certificate resolvers may claim the same signature, each with its own
-// trust anchors, and the first whose anchors validate the certificate wins.
-// Configuration validation refuses two whose anchors overlap, so that ordering
-// does not decide an identity.
-func (r *certificateResolver) handles(keyID string) bool {
-	return strings.HasPrefix(keyID, transporthttpsig.CertificateKeyIDPrefix)
+// handles reports whether this authenticator holds the anchor that issued the
+// presented leaf, judged by the leaf's authorityKeyIdentifier.
+//
+// This is an exact selection rather than a scan. Before, every certificate
+// authenticator claimed every certificate-form keyid and the chain build was what
+// told them apart, which meant a client's certificate was parsed, its signature
+// verified, and a chain built once per configured authenticator, all but one of
+// those failing. Configuration validation still refuses two authenticators sharing
+// an anchor, now by SKI collision rather than by comparing DER.
+//
+// The AKI is untrusted input and this is routing, not a trust decision. Nothing
+// here assumes the certificate is conforming or that its AKI is honest, because the
+// party that chose both is the party being authenticated. The property that makes it
+// safe is stated positively:
+//
+//	the trust decision is the chain build against exactly one operator-configured
+//	bundle, and bundles are disjoint, so at most one authenticator can ever validate
+//	a given leaf and misrouting only ever fails closed.
+//
+// Disjointness is what carries that, and it is enforced twice: configuration
+// validation and checkAnchorsAreNotShared refuse two authenticators holding anchors
+// with one subjectKeyIdentifier or one public key. A forged AKI therefore reaches an
+// authenticator whose anchors cannot verify the leaf's signature, and is refused. It
+// cannot reach a second authenticator that would accept the leaf, because accepting
+// it would mean that authenticator's bundle already trusts the real issuer, which is
+// the operator having said so.
+//
+// Identity never depends on which chain was built: the expression environment is the
+// leaf alone. The built chain is read only to clamp the validation cache's lifetime.
+func (r *x509Backend) handles(sig *httpsig.Signature, presented *presentedCertificate) bool {
+	if presented == nil {
+		return false
+	}
+	_, held := r.anchorSKIs[presented.authorityKeyID]
+	return held
 }
 
-func (r *certificateResolver) resolve(req *http.Request, sig *httpsig.Signature) (*resolution, error) {
-	der, err := transporthttpsig.ParseCertificateHeader(req.Header.Values(transporthttpsig.CertificateHeader))
-	if err != nil {
-		return nil, err
+func (r *x509Backend) resolve(req *http.Request, sig *httpsig.Signature, presented *presentedCertificate) (*resolution, error) {
+	if presented == nil {
+		// Unreachable through handles, which returns false without one.
+		return nil, fmt.Errorf("the request carries no certificate")
 	}
 
-	// The keyid is covered by the signature and the digest is computed here, so
-	// this comparison is what binds the certificate to the signature. It is also
-	// the cheapest possible rejection: one hash, before any parse.
+	// The keyid is covered by the signature and the digest was computed from the
+	// bytes received, so this comparison is what binds the certificate to the
+	// signature. It is also the cheapest possible rejection.
 	claimed := sig.KeyID()
-	computed := transporthttpsig.CertificateKeyID(der)
-	if claimed != computed {
+	if claimed != presented.keyID {
 		return nil, fmt.Errorf("the signature's keyid names a different certificate than the one the request carries: keyid says %s, the %s header digests to %s",
-			claimed, transporthttpsig.CertificateHeader, computed)
+			claimed, transporthttpsig.CertificateHeader, presented.keyID)
 	}
-	// The digest is already in hand, so the expression environment is handed it
-	// rather than hashing the certificate a second time.
-	thumbprint := strings.TrimPrefix(computed, transporthttpsig.CertificateKeyIDPrefix)
+	leaf := presented.leaf
 
 	// A hit answers with the key and the identity together, so a client's second
 	// request repeats neither the chain build nor the expressions.
 	if entry, ok := r.cache.Get(claimed); ok {
-		metrics.RecordCertificateCacheLookup(r.resolverName, true)
+		metrics.RecordCertificateCacheLookup(r.authenticatorName, true)
 		v := entry.(*validated)
 		// The verifier still runs: a hit supplies the key and the identity, and
 		// never the conclusion that the caller holds the key. Anyone who has
@@ -213,15 +290,8 @@ func (r *certificateResolver) resolve(req *http.Request, sig *httpsig.Signature)
 			return &authenticator.Response{User: v.identity()}, nil
 		}), nil
 	}
-	metrics.RecordCertificateCacheLookup(r.resolverName, false)
+	metrics.RecordCertificateCacheLookup(r.authenticatorName, false)
 
-	leaf, err := x509.ParseCertificate(der)
-	if err != nil {
-		return nil, fmt.Errorf("parsing the certificate the request carries: %w", err)
-	}
-	if err := checkUsableForSigning(leaf); err != nil {
-		return nil, err
-	}
 	// The algorithm is a fixed function of the key type, so there is nothing for
 	// an algorithm confusion attack to confuse. Verify also rejects a signature
 	// whose alg parameter disagrees with this. This call is also the bound on how
@@ -239,8 +309,68 @@ func (r *certificateResolver) resolve(req *http.Request, sig *httpsig.Signature)
 	// Everything from here is deferred: it runs only once the signature has
 	// verified against this key, which proves the caller holds it.
 	return r.resolutionFor(verifier, func(ctx context.Context) (*authenticator.Response, error) {
-		return r.admit(ctx, leaf, verifier, claimed, thumbprint)
+		return r.admit(ctx, presented, verifier, claimed)
 	}), nil
+}
+
+// presentedCertificate is the leaf a request carries, read once.
+//
+// It is parsed before an authenticator is chosen, because which one answers is
+// decided by the leaf's authorityKeyIdentifier. That ordering is also what makes
+// the cost independent of how many certificate authenticators are configured: one
+// header read, one digest, one parse, and one usability check per request rather
+// than per authenticator.
+type presentedCertificate struct {
+	// keyID is what a signature's keyid has to equal, computed from the bytes
+	// received rather than taken from the signature.
+	keyID string
+
+	// thumbprint is keyID without its prefix, for the expression environment, so
+	// nothing hashes the certificate a second time.
+	thumbprint string
+
+	leaf *x509.Certificate
+
+	// authorityKeyID is the leaf's authorityKeyIdentifier, which names the
+	// subjectKeyIdentifier of the certificate that issued it.
+	authorityKeyID string
+}
+
+// parsePresentedCertificate reads the certificate a request carries.
+//
+// Everything here is reachable by a caller who has authenticated nothing, so it is
+// bounded: one header of at most MaxCertificateHeaderBytes, one hash, one parse,
+// and comparisons against the leaf's own extensions.
+func parsePresentedCertificate(req *http.Request) (*presentedCertificate, error) {
+	der, err := transporthttpsig.ParseCertificateHeader(req.Header.Values(transporthttpsig.CertificateHeader))
+	if err != nil {
+		return nil, err
+	}
+	keyID := transporthttpsig.CertificateKeyID(der)
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, fmt.Errorf("parsing the certificate the request carries: %w", err)
+	}
+	if err := checkUsableForSigning(leaf); err != nil {
+		return nil, err
+	}
+	if len(leaf.AuthorityKeyId) == 0 {
+		// Required, because it is what selects the authenticator whose anchors are
+		// asked to validate this leaf. RFC 5280 4.2.1.1 makes it a MUST for
+		// conforming issuers on every certificate they issue, excepting a
+		// self-signed one, and a leaf is not self-signed here. The alternative was
+		// to fall back to trying every certificate authenticator, which would keep
+		// the fan-out this replaces for the sake of non-conforming issuers.
+		return nil, fmt.Errorf("%w: it names the trust anchor that issued the certificate and so selects the "+
+			"authenticator to validate it; reissue from an authority that sets the extension, as RFC 5280 requires (%s)",
+			errNoAuthorityKeyID, certificateIdentifier(leaf))
+	}
+	return &presentedCertificate{
+		keyID:          keyID,
+		thumbprint:     strings.TrimPrefix(keyID, transporthttpsig.CertificateKeyIDPrefix),
+		leaf:           leaf,
+		authorityKeyID: string(leaf.AuthorityKeyId),
+	}, nil
 }
 
 // checkUsableForSigning rejects a certificate whose own extensions say it is not
@@ -272,7 +402,7 @@ func checkUsableForSigning(leaf *x509.Certificate) error {
 	return nil
 }
 
-func (r *certificateResolver) resolutionFor(v httpsig.Verifier, identify func(context.Context) (*authenticator.Response, error)) *resolution {
+func (r *x509Backend) resolutionFor(v httpsig.Verifier, identify func(context.Context) (*authenticator.Response, error)) *resolution {
 	return &resolution{
 		verifier: v,
 		policy:   r.policy,
@@ -283,7 +413,8 @@ func (r *certificateResolver) resolutionFor(v httpsig.Verifier, identify func(co
 // admit turns a certificate whose key the caller has proved possession of into an
 // identity: chain validation, then the rules, then the mappings, then the rules
 // over the result.
-func (r *certificateResolver) admit(ctx context.Context, leaf *x509.Certificate, verifier httpsig.Verifier, cacheKey, thumbprint string) (*authenticator.Response, error) {
+func (r *x509Backend) admit(ctx context.Context, presented *presentedCertificate, verifier httpsig.Verifier, cacheKey string) (*authenticator.Response, error) {
+	leaf := presented.leaf
 	chains, err := leaf.Verify(x509.VerifyOptions{
 		Roots: r.roots,
 		// Intermediates deliberately absent: they come from the configured
@@ -305,7 +436,7 @@ func (r *certificateResolver) admit(ctx context.Context, leaf *x509.Certificate,
 			certificateIdentifier(leaf), err)
 	}
 
-	certValue := authenticationcel.CertificateValue(leaf, thumbprint)
+	certValue := authenticationcel.CertificateValue(leaf, presented.thumbprint)
 
 	// Rules run before mappings, so a mapping expression never reads a
 	// certificate no rule has vetted. The JWT authenticator maps first and pays
@@ -324,7 +455,7 @@ func (r *certificateResolver) admit(ctx context.Context, leaf *x509.Certificate,
 	// component's decision depends on is refused whether or not a rule was written
 	// against it. A mapping can derive from the certificate's subject, which puts
 	// the choice in the hands of whoever requests a certificate.
-	if err := checkReservedIdentity(info); err != nil {
+	if err := checkReservedIdentity(info, "claimMappings"); err != nil {
 		return nil, err
 	}
 
@@ -349,7 +480,7 @@ func (r *certificateResolver) admit(ctx context.Context, leaf *x509.Certificate,
 // The chain bound is not decoration. A TTL longer than a trust anchor's remaining
 // life would keep admitting requests after the anchor expired, which is the one
 // case where the cache would be granting something the uncached path would refuse.
-func (r *certificateResolver) entryTTL(leaf *x509.Certificate, chains [][]*x509.Certificate) time.Duration {
+func (r *x509Backend) entryTTL(leaf *x509.Certificate, chains [][]*x509.Certificate) time.Duration {
 	ttl := r.cacheTTL
 	clamp := func(notAfter time.Time) {
 		if remaining := time.Until(notAfter); remaining < ttl {

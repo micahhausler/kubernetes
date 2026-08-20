@@ -28,12 +28,13 @@ import (
 
 	"k8s.io/apiserver/pkg/apis/apiserver"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
+	authenticationcel "k8s.io/apiserver/pkg/authentication/cel"
 	"k8s.io/apiserver/pkg/authentication/request/httpsig/metrics"
 	transporthttpsig "k8s.io/client-go/transport/httpsig"
 	"k8s.io/klog/v2"
 )
 
-// endpointResolver resolves a signature through a resolver process reached over a
+// resolverBackend resolves a signature through a resolver process reached over a
 // local socket. The resolver holds the key material and the nonce state; this
 // server holds neither, and does all of the cryptography itself.
 //
@@ -42,10 +43,10 @@ import (
 // value. They are lookup input and never authorization. The one call that happens
 // after verification, recording the nonce, is therefore the only one an
 // unauthenticated caller cannot reach.
-type endpointResolver struct {
-	// resolverName is the configured authenticator name, used in errors and as a
+type resolverBackend struct {
+	// authenticatorName is the configured authenticator name, used in errors and as a
 	// metric label. It never appears on the wire.
-	resolverName string
+	authenticatorName string
 
 	// prefixes admit a keyID by the segment before its first slash. Empty means
 	// every keyID.
@@ -65,20 +66,29 @@ type endpointResolver struct {
 	// policy is the coverage, age, and skew policy from configuration. A resolver
 	// may narrow the age, per resolver or per key; nothing widens it.
 	policy httpsig.Policy
+
+	// userRules are the cluster's say over what this resolver may claim, nil when
+	// configuration states none. They run after the signature has verified, so an
+	// unauthenticated caller cannot drive CEL evaluation, which also means they run
+	// per accepted request rather than once per cached key. That is the same order
+	// the certificate path uses and the cost is bounded by the authenticated
+	// request rate.
+	userRules authenticationcel.UserMapper
 }
 
-var _ resolver = &endpointResolver{}
+var _ backend = &resolverBackend{}
 
-// newEndpointResolver dials the resolver and fetches its metadata, so a resolver
+// newResolverBackend dials the resolver and fetches its metadata, so a resolver
 // that is absent or unusable fails at server start rather than on a request.
-func newEndpointResolver(lifecycle context.Context, c apiserver.HTTPSignatureAuthenticator, policy httpsig.Policy, apiServerID string, dialTimeout time.Duration) (*endpointResolver, error) {
-	remote, err := newRemote(lifecycle, c.Endpoint, apiServerID, dialTimeout)
+func newResolverBackend(lifecycle context.Context, c apiserver.HTTPSignatureAuthenticator, policy httpsig.Policy, compiler authenticationcel.Compiler, apiServerID string, dialTimeout time.Duration) (*resolverBackend, error) {
+	cfg := c.Resolver
+	remote, err := newRemote(lifecycle, cfg.Endpoint, apiServerID, dialTimeout)
 	if err != nil {
 		return nil, err
 	}
 
-	relayed := make([]string, 0, len(c.RelayedHeaders))
-	for _, name := range c.RelayedHeaders {
+	relayed := make([]string, 0, len(cfg.RelayedHeaders))
+	for _, name := range cfg.RelayedHeaders {
 		relayed = append(relayed, strings.ToLower(name))
 	}
 
@@ -86,44 +96,52 @@ func newEndpointResolver(lifecycle context.Context, c apiserver.HTTPSignatureAut
 	// turns it off in so many words. This does not rely on a defaulting pass having
 	// run, because AuthenticationConfiguration has none and a caller building this
 	// struct directly should still get the safe behavior.
-	consumeNonces := c.NonceHandling != apiserver.NonceHandlingIgnore
+	userRules, err := CompileUserValidationRules(compiler, c.UserValidationRules)
+	if err != nil {
+		return nil, err
+	}
+
+	consumeNonces := cfg.NonceHandling != apiserver.NonceHandlingIgnore
 	if !consumeNonces {
 		// Logged at default verbosity, and named, because a cluster running without
 		// replay protection should be discoverable without reading a configuration
 		// file off a control plane node.
 		klog.InfoS("HTTP signature nonces will not be recorded; a captured request can be replayed within the maximum signature age",
-			"authenticator", c.Name, "resolver", c.Endpoint, "maxAge", policy.MaxAge, "tolerance", policy.Tolerance)
+			"authenticator", c.Name, "resolver", cfg.Endpoint, "maxAge", policy.MaxAge, "tolerance", policy.Tolerance)
 	}
-	metrics.RecordNonceHandling(c.Endpoint, consumeNonces)
+	metrics.RecordNonceHandling(cfg.Endpoint, consumeNonces)
 
-	return &endpointResolver{
-		resolverName:   c.Name,
-		prefixes:       c.KeyIDPrefixes,
-		relayedHeaders: relayed,
-		keys:           newKeyCache(remote, c.Cache),
-		consumeNonces:  consumeNonces,
-		policy:         policy,
+	return &resolverBackend{
+		authenticatorName: c.Name,
+		prefixes:          cfg.KeyIDPrefixes,
+		relayedHeaders:    relayed,
+		keys:              newKeyCache(remote, cfg.Cache),
+		consumeNonces:     consumeNonces,
+		policy:            policy,
+		userRules:         userRules,
 	}, nil
 }
 
-func (r *endpointResolver) name() string { return r.resolverName }
+func (r *resolverBackend) name() string { return r.authenticatorName }
 
 // handles reports whether this resolver is asked about a keyID. The keyID is
 // bounded here, before it becomes a cache key or a resolver argument, because it
 // is chosen by a caller who has authenticated nothing.
 //
-// The certificate keyID form is refused outright, whatever the configured
-// prefixes. Without that, a resolver configured with no prefixes is asked about
+// The presented certificate is ignored: a resolver answers for keyIDs, and the
+// certificate keyID form is refused below whatever the configured prefixes are.
+// Without that refusal, a resolver configured with no prefixes would be asked about
 // every keyID including a certificate's, and which of it and a certificate
-// authenticator answered a certificate-signed request would depend on the order
-// the two appear in the configuration file. The reservation used to be enforced
-// against the static key list; the resolver is where it has to live now, because a
+// authenticator answered a certificate-signed request would depend on the order the
+// two appear in the configuration file. The reservation used to be enforced against
+// the static key list; the resolver is where it has to live now, because a
 // resolver's keyIDs are not in the file to be checked.
 //
 // A derived key's keyID carries its claimed scope after the name, joined by
 // slashes. Selection uses the name; the claimed scope is checked against the key
 // the resolver returns, not here.
-func (r *endpointResolver) handles(keyID string) bool {
+func (r *resolverBackend) handles(sig *httpsig.Signature, _ *presentedCertificate) bool {
+	keyID := sig.KeyID()
 	if keyID == "" || len(keyID) > maxKeyIDLen {
 		return false
 	}
@@ -149,7 +167,7 @@ func (r *endpointResolver) handles(keyID string) bool {
 // point of the first is to keep an unauthenticated caller from driving a network
 // call with an ancient or future timestamp. The second is the authoritative one,
 // because it applies the bound the resolver may have narrowed.
-func (r *endpointResolver) resolve(req *http.Request, sig *httpsig.Signature) (*resolution, error) {
+func (r *resolverBackend) resolve(req *http.Request, sig *httpsig.Signature, _ *presentedCertificate) (*resolution, error) {
 	if err := checkAge(sig, r.policy.MaxAge, r.policy.Tolerance); err != nil {
 		return nil, err
 	}
@@ -182,6 +200,14 @@ func (r *endpointResolver) resolve(req *http.Request, sig *httpsig.Signature) (*
 		verifier: verifier,
 		policy:   r.policyFor(key),
 		identify: func(ctx context.Context) (*authenticator.Response, error) {
+			// Before the nonce is recorded, so an identity the cluster refuses does
+			// not consume one. A rejected request that burned a nonce would make the
+			// same request fail differently on a retry.
+			if r.userRules != nil {
+				if err := evaluateUserRules(ctx, r.userRules, key.info); err != nil {
+					return nil, err
+				}
+			}
 			if err := r.consumeNonce(ctx, sig, key); err != nil {
 				return nil, err
 			}
@@ -193,7 +219,7 @@ func (r *endpointResolver) resolve(req *http.Request, sig *httpsig.Signature) (*
 // policyFor returns the verification policy for one resolved key. The effective
 // maximum age is the smallest of the configured bound and whatever the resolver
 // narrowed it to, so a resolver can tighten the window and never widen it.
-func (r *endpointResolver) policyFor(k *verifierKey) httpsig.Policy {
+func (r *resolverBackend) policyFor(k *verifierKey) httpsig.Policy {
 	policy := r.policy
 	if k.maxAge > 0 && k.maxAge < policy.MaxAge {
 		policy.MaxAge = k.maxAge
@@ -211,7 +237,7 @@ func (r *endpointResolver) policyFor(k *verifierKey) httpsig.Policy {
 // The nonce is required whether or not it is recorded. Requiring it costs a client
 // nothing, it is covered by the signature either way, and it means turning recording
 // on is a change to this server alone rather than to every client.
-func (r *endpointResolver) consumeNonce(ctx context.Context, sig *httpsig.Signature, key *verifierKey) error {
+func (r *resolverBackend) consumeNonce(ctx context.Context, sig *httpsig.Signature, key *verifierKey) error {
 	nonce := sig.Nonce()
 	if nonce == "" {
 		return errors.New("signature carries no nonce")
@@ -238,11 +264,16 @@ func checkAge(sig *httpsig.Signature, maxAge, tolerance time.Duration) error {
 		return errors.New("signature carries no created parameter, so its age cannot be bounded")
 	}
 	now := time.Now()
+	// The library's sentinels, so this pre-lookup check and the authoritative one
+	// inside Verify classify the same way. Two vocabularies for one condition would
+	// mean the metric depended on which check happened to reject first.
 	if created.After(now.Add(tolerance)) {
-		return fmt.Errorf("signature was created at %v, which is in the future", created)
+		return fmt.Errorf("%w: signature was created at %v, which is in the future by more than the %v clock skew allowance",
+			httpsig.ErrCreatedInFuture, created, tolerance)
 	}
 	if now.After(created.Add(maxAge + tolerance)) {
-		return fmt.Errorf("signature was created at %v, older than the %v maximum age", created, maxAge)
+		return fmt.Errorf("%w: signature was created at %v, older than the %v maximum age",
+			httpsig.ErrExpired, created, maxAge)
 	}
 	return nil
 }

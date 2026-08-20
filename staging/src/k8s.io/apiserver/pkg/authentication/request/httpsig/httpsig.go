@@ -42,25 +42,28 @@ limitations under the License.
 // resolver seam rather than inline. A resolver takes a signature and returns a
 // verifier plus a way to name the signer.
 //
-// Two are built in, and neither states an identity in configuration. The endpoint
-// resolver asks a resolver process, over a local socket, which answers for a keyID
+// Two backends are built in, and neither states an identity in configuration. The
+// resolver backend asks a process, over a local socket, which answers for a keyID
 // with a key and the identity it authenticates as, and which records the nonces
-// accepted signatures carry. The certificate resolver takes key and identity from
-// an X.509 certificate the request carries, which the configured trust anchors have
-// to validate.
+// accepted signatures carry. The certificate backend takes key and identity from an
+// X.509 certificate the request carries, which the configured trust anchors have to
+// validate.
 //
 // The difference that matters is what the server depends on at request time. The
-// endpoint resolver depends on a resolver being reachable, and gets revocation and
-// replay protection across API servers from it. The certificate resolver depends on
+// resolver backend depends on a process being reachable, and gets revocation and
+// replay protection across API servers from it. The certificate backend depends on
 // nothing beyond a trust anchor bundle, and gets neither: a certificate's lifetime
 // is the withdrawal window, and nothing records nonces.
 //
-// Which resolver handles a signature is decided by its keyid, never by whether an
-// unsigned header happens to be present. A signature's parameters are always the
-// last line of its signature base, so a keyid is covered by every signature that
-// carries one. That is also what binds a certificate to the signature made with
-// it, and it is why the certificate header's own coverage is belt and braces
-// rather than the mechanism.
+// Which backend handles a signature is decided before any work is done for it,
+// never by whether an unsigned header happens to be present. For a resolver it is
+// the keyid, and a signature's parameters are always the last line of its signature
+// base, so a keyid is covered by every signature that carries one. That is also what
+// binds a certificate to the signature made with it, and it is why the certificate
+// header's own coverage is belt and braces rather than the mechanism. For a
+// certificate it is the presented leaf's authorityKeyIdentifier, which names the
+// trust anchor that issued it and so names the one backend configured to validate
+// it.
 package httpsig
 
 import (
@@ -116,30 +119,42 @@ const (
 // authenticator moves on, so this never reaches a client.
 var errNoSignature = errors.New("request carries no HTTP message signature")
 
-// A resolver decides whose signature a signature is: it produces a verifier to
-// check it with, and a way to name the signer once it has checked out.
+// A backend decides whose signature a signature is: it produces a verifier to check
+// it with, and a way to name the signer once it has checked out.
 //
-// This is the seam a remote resolution scheme plugs into. It exists as an
-// interface rather than as branches through one function because a certificate
-// authority and a key broker differ only here, and everything around them, the
-// coverage rules, the digest check, the replay window, is the same either way.
-type resolver interface {
-	// name identifies this resolver in errors and metrics. It never appears on
-	// the wire.
+// One per way of doing that, which is what the API's resolver and x509 select
+// between. "backend" rather than "resolver" because resolver is one of the two, and
+// the word cannot mean both the pair and one of the pair.
+//
+// This is the seam a remote resolution scheme plugs into. It exists as an interface
+// rather than as branches through one function because a certificate authority and a
+// key broker differ only here, and everything around them, the coverage rules, the
+// digest check, the replay window, is the same either way.
+type backend interface {
+	// name is the configured authenticator name, used in errors and as a metric
+	// label. It never appears on the wire.
 	name() string
 
-	// handles reports whether this resolver claims a signature, judged by its
-	// keyid alone. The keyid is covered by the signature, so this decision is
-	// made on signed input, and it is made before any work.
+	// handles reports whether this backend claims a signature, and it is asked
+	// before any work is done for it.
 	//
-	// More than one resolver may claim the same keyid, which is how several
-	// certificate authorities coexist: each is tried until one resolves.
-	handles(keyID string) bool
+	// presented is the certificate the request carries, nil when it carries none. A
+	// resolver decides on the keyid alone, which is covered by the signature. A
+	// certificate backend decides on the presented leaf's authorityKeyIdentifier,
+	// which is not covered, but that is a routing hint rather than a trust decision:
+	// the chain build still has to succeed against this backend's own anchors.
+	//
+	// At most one certificate backend claims a signature. More than one resolver
+	// may: keyid prefixes are unique across resolvers, but one may omit them and be
+	// asked about every keyid.
+	handles(sig *httpsig.Signature, presented *presentedCertificate) bool
 
 	// resolve returns what is needed to check the signature and name its signer.
 	// It runs before the signature has been checked, so anything expensive
 	// belongs in the returned resolution's identify rather than here.
-	resolve(req *http.Request, sig *httpsig.Signature) (*resolution, error)
+	//
+	// It is called only for a signature this backend claimed.
+	resolve(req *http.Request, sig *httpsig.Signature, presented *presentedCertificate) (*resolution, error)
 }
 
 // A resolution is one resolver's answer for one signature.
@@ -158,7 +173,7 @@ type resolution struct {
 
 // Authenticator verifies HTTP message signatures on incoming requests.
 type Authenticator struct {
-	resolvers []resolver
+	backends  []backend
 	parseOpts *httpsig.ParseOptions
 }
 
@@ -171,7 +186,7 @@ var _ authenticator.Request = &Authenticator{}
 //
 // The connections and each resolver's metadata refresh live for as long as
 // lifecycle. dialTimeout bounds the first metadata call to each resolver.
-// Endpoint authenticators are built concurrently, so it bounds this function
+// Backends are built concurrently, so it bounds this function
 // rather than being multiplied by the number of them: built sequentially, a list
 // of resolvers that were all absent would take the dial budget times the length of
 // the list to report, which at server start reads as a hang rather than an error.
@@ -192,6 +207,13 @@ func New(lifecycle context.Context, config *apiserver.HTTPSignatureConfig, compi
 		a.parseOpts = &httpsig.ParseOptions{Scheme: config.Scheme, Authority: config.Authority}
 	}
 
+	// Read once, for the same reason as authority and scheme: it describes this
+	// server rather than any one authenticator.
+	var maxClockSkew time.Duration
+	if config.MaxClockSkew != nil {
+		maxClockSkew = config.MaxClockSkew.Duration
+	}
+
 	seen := map[string]bool{}
 	for i, c := range config.Authenticators {
 		if seen[c.Name] {
@@ -200,19 +222,19 @@ func New(lifecycle context.Context, config *apiserver.HTTPSignatureConfig, compi
 		seen[c.Name] = true
 	}
 
-	a.resolvers = make([]resolver, len(config.Authenticators))
+	a.backends = make([]backend, len(config.Authenticators))
 	errs := make([]error, len(config.Authenticators))
 	var wg sync.WaitGroup
 	for i, c := range config.Authenticators {
 		wg.Add(1)
 		go func(i int, c apiserver.HTTPSignatureAuthenticator) {
 			defer wg.Done()
-			r, err := newResolver(lifecycle, c, compiler, apiServerID, dialTimeout)
+			r, err := newBackend(lifecycle, c, maxClockSkew, compiler, apiServerID, dialTimeout)
 			if err != nil {
 				errs[i] = fmt.Errorf("authenticators[%d] (%s): %w", i, c.Name, err)
 				return
 			}
-			a.resolvers[i] = r
+			a.backends[i] = r
 		}(i, c)
 	}
 	wg.Wait()
@@ -220,18 +242,75 @@ func New(lifecycle context.Context, config *apiserver.HTTPSignatureConfig, compi
 		return nil, fmt.Errorf("httpsig: %w", err)
 	}
 
-	if len(a.resolvers) == 0 {
+	if len(a.backends) == 0 {
 		return nil, fmt.Errorf("httpsig: at least one authenticator is required for this authenticator to authenticate anything")
 	}
+	if err := checkAnchorsAreNotShared(a.backends); err != nil {
+		return nil, fmt.Errorf("httpsig: %w", err)
+	}
 	return a, nil
+}
+
+// checkAnchorsAreNotShared refuses two certificate authenticators holding one
+// authority key.
+//
+// A presented certificate names its issuer by key identifier and that is what
+// selects an authenticator, so two holding the same one would both be selected and
+// which identity the certificate received would depend on list order. Configuration
+// validation refuses this too. It is checked again here for the same reason
+// duplicate names are: a caller building this struct directly has run no validation,
+// and the failure this prevents is a silent, order-dependent choice of identity
+// rather than an error.
+func checkAnchorsAreNotShared(backends []backend) error {
+	// Each records who claimed a value and which of their certificates carried it,
+	// so a collision names both sides rather than only the one found second.
+	byIdentifier := map[string]anchorClaim{}
+	byKey := map[string]anchorClaim{}
+	for _, b := range backends {
+		c, ok := b.(*x509Backend)
+		if !ok {
+			continue
+		}
+		// Two certificates for one key held by one authenticator is a certificate
+		// authority mid-rollover, which is one trust decision, so a repeat under the
+		// same name is not a conflict.
+		for _, shared := range []struct {
+			owners map[string]anchorClaim
+			claims map[string]anchorClaim
+			what   string
+			why    string
+		}{
+			{byIdentifier, c.anchorSKIs, "the same subjectKeyIdentifier",
+				"a presented certificate names its issuer by that identifier, so both would be selected by the same certificate"},
+			{byKey, c.anchorKeys, "the same public key",
+				"one authority key can be stamped with two different subjectKeyIdentifiers, so both bundles would validate the same certificate"},
+		} {
+			for value, claim := range shared.claims {
+				claim.authenticator = c.authenticatorName
+				if held, taken := shared.owners[value]; taken && held.authenticator != c.authenticatorName {
+					// Both sides are named, because naming one sends the operator to
+					// whichever bundle happened to be enumerated first. The likeliest
+					// cause is one organizational root left in both, so the error
+					// names the way out rather than only the collision.
+					return fmt.Errorf("authenticators %q and %q hold trust anchors with %s: %s and %s; %s, and which "+
+						"identity it received would depend on the order they are configured. If they share an organizational "+
+						"root, put each intermediate in its own bundle and leave the root out: an entry in a bundle is a "+
+						"trust anchor whether or not something above it signed it",
+						held.authenticator, c.authenticatorName, shared.what, held, claim, shared.why)
+				}
+				shared.owners[value] = claim
+			}
+		}
+	}
+	return nil
 }
 
 // HealthChecks returns one checker per configured resolver process. A certificate
 // authenticator contributes none: it calls nothing that could be unhealthy.
 func (a *Authenticator) HealthChecks() []func() error {
 	var checks []func() error
-	for _, r := range a.resolvers {
-		if e, ok := r.(*endpointResolver); ok {
+	for _, r := range a.backends {
+		if e, ok := r.(*resolverBackend); ok {
 			checks = append(checks, e.keys.resolver.Check)
 		}
 	}
@@ -239,29 +318,30 @@ func (a *Authenticator) HealthChecks() []func() error {
 }
 
 // newResolver builds the one resolver an authenticator configuration names.
-func newResolver(lifecycle context.Context, c apiserver.HTTPSignatureAuthenticator, compiler authenticationcel.Compiler, apiServerID string, dialTimeout time.Duration) (resolver, error) {
+//
+// maxClockSkew comes from the section rather than from c: it is this server's
+// allowance for its own clock, so every authenticator is held to the same one.
+func newBackend(lifecycle context.Context, c apiserver.HTTPSignatureAuthenticator, maxClockSkew time.Duration, compiler authenticationcel.Compiler, apiServerID string, dialTimeout time.Duration) (backend, error) {
 	policy := httpsig.Policy{
 		// The floor is stated here, by this verifier, and not taken from the
 		// signature.
 		RequiredComponents: transporthttpsig.FloorComponents,
 		MaxAge:             defaultMaxAge,
+		Tolerance:          maxClockSkew,
 	}
 	if c.MaxAge != nil {
 		policy.MaxAge = c.MaxAge.Duration
 	}
-	if c.Tolerance != nil {
-		policy.Tolerance = c.Tolerance.Duration
-	}
 
 	switch {
-	case c.X509 != nil && len(c.Endpoint) > 0:
-		return nil, fmt.Errorf("endpoint and x509 are alternatives: a resolver states the identity with each answer, x509 takes it from a certificate")
+	case c.Resolver != nil && c.X509 != nil:
+		return nil, fmt.Errorf("resolver and x509 are alternatives: a resolver states the identity with each answer, x509 takes it from a certificate")
 	case c.X509 != nil:
-		return newCertificateResolver(c, policy, compiler)
-	case len(c.Endpoint) > 0:
-		return newEndpointResolver(lifecycle, c, policy, apiServerID, dialTimeout)
+		return newX509Backend(c, policy, compiler)
+	case c.Resolver != nil:
+		return newResolverBackend(lifecycle, c, policy, compiler, apiServerID, dialTimeout)
 	default:
-		return nil, fmt.Errorf("one of endpoint or x509 is required")
+		return nil, fmt.Errorf("one of resolver or x509 is required")
 	}
 }
 
@@ -278,55 +358,66 @@ func (a *Authenticator) AuthenticateRequest(req *http.Request) (*authenticator.R
 
 	sigs, err := httpsig.ParseSignatures(req, a.parseOpts)
 	if err != nil {
+		metrics.RecordUnclaimedSignature(metrics.UnclaimedUnparseableSignature)
 		return nil, false, fmt.Errorf("parsing HTTP message signature: %w", err)
 	}
 	if len(sigs) == 0 {
 		// The fields were present but held no signature. Still an error rather
 		// than no opinion: something set them, and silently ignoring that would
 		// let a malformed client look like an anonymous one.
+		metrics.RecordUnclaimedSignature(metrics.UnclaimedUnparseableSignature)
 		return nil, false, errNoSignature
 	}
 	if len(sigs) > maxSignatures {
 		// Refused rather than truncated. Considering the first few would let a
 		// sender bury the signature they meant behind ones they did not, and the
 		// request would fail for a reason nothing explains.
+		metrics.RecordUnclaimedSignature(metrics.UnclaimedUnparseableSignature)
 		return nil, false, fmt.Errorf("request carries %d signatures, more than the %d this server considers",
 			len(sigs), maxSignatures)
 	}
 
-	var errs []error
-	// Outcomes are buffered and recorded only if nothing authenticates the
-	// request. A signature is offered to every authenticator whose keyid form it
-	// matches, so with more than one certificate authenticator configured, a
-	// client's certificate chains to one and fails against the rest. Recording
-	// those attempts as they happen would make a correct configuration report a
-	// rejection on every request, which is a metric nobody could read.
-	var rejected []rejection
-	authenticated := false
-	defer func() {
-		if authenticated {
-			return
+	// The certificate a request carries is read once, before any authenticator is
+	// chosen, because which one answers is decided by the leaf's
+	// authorityKeyIdentifier. A request whose signatures name no certificate never
+	// touches the header.
+	var presented *presentedCertificate
+	if namesACertificate(sigs) {
+		var err error
+		if presented, err = parsePresentedCertificate(req); err != nil {
+			reason := metrics.UnclaimedUnreadableCertificate
+			if errors.Is(err, errNoAuthorityKeyID) {
+				// A well-formed certificate this server cannot route, which is a
+				// different thing to fix from a malformed one.
+				reason = metrics.UnclaimedCertificateWithoutAuthorityKeyID
+			}
+			metrics.RecordUnclaimedSignature(reason)
+			return nil, false, fmt.Errorf("the request's signature names a certificate: %w", err)
 		}
-		for _, r := range rejected {
-			metrics.RecordOutcome(r.authenticator, r.outcome)
-		}
-	}()
+	}
 
+	var errs []error
 	for _, sig := range sigs {
-		for _, r := range a.resolvers {
-			// The keyid decides which resolvers even look at this signature, so
-			// a signature naming a key one resolver holds is never offered to
-			// another.
-			if !r.handles(sig.KeyID()) {
+		for _, r := range a.backends {
+			// Dispatch. At most one certificate authenticator claims a signature,
+			// and a keyid a resolver holds is never offered to another, so an
+			// outcome recorded below is a decision by an authenticator that owned
+			// the credential rather than one that was merely asked.
+			if !r.handles(sig, presented) {
 				continue
 			}
-			resp, outcome, err := a.authenticateSignature(req, sig, r)
+			resp, outcome, err := a.authenticateSignature(req, sig, r, presented)
 			if err != nil {
-				rejected = append(rejected, rejection{r.name(), outcome})
+				// A resolver that does not serve this keyid has decided nothing.
+				// Recording it as a refusal would make a correct configuration
+				// report one on every request, and it is already visible as a
+				// negative cache hit for that resolver.
+				if !errors.Is(err, ErrKeyNotFound) {
+					metrics.RecordOutcome(r.name(), outcome)
+				}
 				errs = append(errs, fmt.Errorf("%s: %w", r.name(), err))
 				continue
 			}
-			authenticated = true
 			metrics.RecordOutcome(r.name(), metrics.OutcomeAuthenticated)
 			// The signature fields and the asserted certificate have served
 			// their purpose. Clearing them keeps anything downstream from
@@ -339,11 +430,28 @@ func (a *Authenticator) AuthenticateRequest(req *http.Request) (*authenticator.R
 		}
 	}
 	if len(errs) == 0 {
-		// Signatures were present, but no authenticator claimed any of them. The
-		// keyids are named because the answer is nearly always that one is
-		// misspelled, or that the authenticator holding it is not configured on
-		// this server. Reporting this as "no signature" would send the reader
-		// looking at the client's signing code instead.
+		// Signatures were present, but no authenticator claimed any of them.
+		// Reporting this as "no signature" would send the reader looking at the
+		// client's signing code instead.
+		if presented != nil {
+			// A certificate is selected by the anchor its authorityKeyIdentifier
+			// names, so "no authenticator claimed it" means no configured bundle
+			// holds that anchor. Said that way rather than as a keyid mismatch,
+			// because the keyid is correct and the authority is what is missing:
+			// most often a certificate authority rotation that has not reached this
+			// server's configuration.
+			metrics.RecordUnclaimedSignature(metrics.UnclaimedUnknownCertificateIssuer)
+			// The key identifier is in the error because it is what an operator adds
+			// to a bundle to fix this, and it cannot be a metric label: a peer
+			// chooses it, so it is unbounded cardinality.
+			return nil, false, fmt.Errorf("no configured authenticator holds the trust anchor that issued the certificate "+
+				"the request carries, so nothing here can validate it: no bundle contains a certificate with "+
+				"subjectKeyIdentifier %x (%s)", presented.authorityKeyID, certificateIdentifier(presented.leaf))
+		}
+		// No backend's prefixes admitted the keyid, so nothing was asked. That is
+		// this server's configuration rather than the client's keyid, which is why
+		// it is counted apart from a resolver answering that it does not serve one.
+		metrics.RecordUnclaimedSignature(metrics.UnclaimedUnknownKeyID)
 		keyIDs := make([]string, 0, len(sigs))
 		for _, sig := range sigs {
 			keyIDs = append(keyIDs, fmt.Sprintf("%q", sig.KeyID()))
@@ -351,31 +459,82 @@ func (a *Authenticator) AuthenticateRequest(req *http.Request) (*authenticator.R
 		return nil, false, fmt.Errorf("no configured authenticator handles the keyid of any signature on this request: %s",
 			strings.Join(keyIDs, ", "))
 	}
+	// Every error here is a resolver that was asked and answered that it does not
+	// serve the keyID, since anything else was recorded as an outcome above.
+	if allKeysNotFound(errs) {
+		metrics.RecordUnclaimedSignature(metrics.UnclaimedUnservedKeyID)
+	}
 	return nil, false, fmt.Errorf("no valid HTTP message signature: %w", errors.Join(errs...))
 }
 
-// rejection is one authenticator's refusal of one signature, held until the
-// request's fate is known.
-type rejection struct {
-	authenticator string
-	outcome       string
+// allKeysNotFound reports whether every failure was a resolver saying it does not
+// serve the keyID, as opposed to any authenticator refusing the signature.
+func allKeysNotFound(errs []error) bool {
+	for _, err := range errs {
+		if !errors.Is(err, ErrKeyNotFound) {
+			return false
+		}
+	}
+	return len(errs) > 0
 }
 
-// authenticateSignature checks one signature against one resolver. It returns the
-// outcome alongside the error so the caller can decide whether the attempt is
-// worth recording: a failure against one of several certificate authenticators is
-// the ordinary case, not a signal.
-func (a *Authenticator) authenticateSignature(req *http.Request, sig *httpsig.Signature, r resolver) (*authenticator.Response, string, error) {
-	res, err := r.resolve(req, sig)
+// timeAwareOutcome separates the two ways a signature can fall outside its accepted
+// window from whatever else went wrong, returning otherwise for anything that is not
+// a time failure.
+func timeAwareOutcome(err error, otherwise string) string {
+	switch {
+	case errors.Is(err, httpsig.ErrCreatedInFuture):
+		return metrics.OutcomeClockSkew
+	case errors.Is(err, httpsig.ErrExpired):
+		return metrics.OutcomeExpired
+	default:
+		return otherwise
+	}
+}
+
+// anchorClaim is one certificate an authenticator holds, for naming both sides of a
+// collision. The subjectKeyIdentifier is included because two certificates for one
+// reissued authority usually share a subject, so the subject alone would not tell an
+// operator which file to open.
+type anchorClaim struct {
+	authenticator string
+	subject       string
+	subjectKeyID  string
+}
+
+func (a anchorClaim) String() string {
+	return fmt.Sprintf("%q (subjectKeyIdentifier %x)", a.subject, a.subjectKeyID)
+}
+
+// namesACertificate reports whether any signature's keyid is in the certificate
+// form, which is what makes the certificate header worth reading.
+func namesACertificate(sigs []*httpsig.Signature) bool {
+	for _, sig := range sigs {
+		if strings.HasPrefix(sig.KeyID(), transporthttpsig.CertificateKeyIDPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// authenticateSignature checks one signature against one backend that claimed it.
+// It returns the outcome alongside the error so the caller can record it, which is
+// always worth doing now that a backend is only asked about a credential it owns.
+func (a *Authenticator) authenticateSignature(req *http.Request, sig *httpsig.Signature, b backend, presented *presentedCertificate) (*authenticator.Response, string, error) {
+	res, err := b.resolve(req, sig, presented)
 	if err != nil {
-		return nil, metrics.OutcomeUnresolved, fmt.Errorf("signature %q: %w", sig.Label(), err)
+		// resolve applies the age window before looking a key up, to keep an
+		// unauthenticated caller from driving a network call with an ancient or
+		// future timestamp, so a time failure can surface here as well as from
+		// Verify. It is the same condition either way and counted the same way.
+		return nil, timeAwareOutcome(err, metrics.OutcomeUnresolved), fmt.Errorf("signature %q: %w", sig.Label(), err)
 	}
 
 	// Verify before anything that costs work: the signature base is built from
 	// headers alone, so an unauthenticated caller cannot make this server read a
 	// body, build a certificate chain, or evaluate an expression.
 	if err := sig.Verify(res.verifier, res.policy); err != nil {
-		return nil, metrics.OutcomeBadSignature, fmt.Errorf("signature %q: %w", sig.Label(), err)
+		return nil, timeAwareOutcome(err, metrics.OutcomeBadSignature), fmt.Errorf("signature %q: %w", sig.Label(), err)
 	}
 
 	if err := checkProtectedHeaders(req, sig); err != nil {
@@ -393,7 +552,7 @@ func (a *Authenticator) authenticateSignature(req *http.Request, sig *httpsig.Si
 	}
 
 	klog.V(4).InfoS("Authenticated request by HTTP message signature",
-		"authenticator", r.name(), "keyID", sig.KeyID(), "username", resp.User.GetName(),
+		"authenticator", b.name(), "keyID", sig.KeyID(), "username", resp.User.GetName(),
 		"components", len(sig.Components()))
 	return resp, metrics.OutcomeAuthenticated, nil
 }
